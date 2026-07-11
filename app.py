@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from database import (
     challenge_count,
     database_configured,
+    database_diagnostics,
     get_daily_challenge,
     get_submission,
     list_gallery,
@@ -136,7 +137,7 @@ MAP_PATTERN = re.compile(
 
 app = FastAPI(
     title="osu!rankguess",
-    version="3.0.0",
+    version="3.0.1",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -969,9 +970,10 @@ async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "model": MODEL_PATH.name,
-        "version": "3.0.0",
+        "version": "3.0.1",
         "inputs": {value.name: value.shape for value in session.get_inputs()},
         "databaseConfigured": database_configured(),
+        "database": database_diagnostics(),
         "rankPopulation": OSU_RANK_POPULATION,
         "ordrApiKeyConfigured": bool(os.getenv("ORDR_API_KEY")),
         "osuApiConfigured": bool(os.getenv("OSU_CLIENT_ID") and os.getenv("OSU_CLIENT_SECRET")),

@@ -6,6 +6,7 @@ import os
 import threading
 from datetime import date
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 try:
     import psycopg
@@ -15,13 +16,92 @@ except ImportError:  # Local tooling may inspect the project before dependencies
     dict_row = None
 
 
-_DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+_RAW_DATABASE_URL = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+_DATABASE_URL_SOURCE = (
+    "POSTGRES_URL"
+    if os.getenv("POSTGRES_URL")
+    else "DATABASE_URL"
+    if os.getenv("DATABASE_URL")
+    else None
+)
+
+# Supabase's Vercel integration may append provider metadata such as
+# `supa=...` to POSTGRES_URL. libpq/psycopg rejects unknown URI
+# parameters, so preserve only parameters that PostgreSQL understands.
+_ALLOWED_LIBPQ_QUERY_PARAMETERS = {
+    "application_name",
+    "channel_binding",
+    "connect_timeout",
+    "gssencmode",
+    "keepalives",
+    "keepalives_count",
+    "keepalives_idle",
+    "keepalives_interval",
+    "load_balance_hosts",
+    "options",
+    "passfile",
+    "requirepeer",
+    "service",
+    "servicefile",
+    "sslcert",
+    "sslcrl",
+    "sslkey",
+    "sslmode",
+    "sslpassword",
+    "sslrootcert",
+    "target_session_attrs",
+}
+
+
+def _sanitize_database_url(value: str | None) -> tuple[str | None, tuple[str, ...]]:
+    if not value:
+        return None, ()
+
+    parts = urlsplit(value.strip())
+    kept: list[tuple[str, str]] = []
+    removed: list[str] = []
+
+    for key, parameter_value in parse_qsl(parts.query, keep_blank_values=True):
+        if key in _ALLOWED_LIBPQ_QUERY_PARAMETERS:
+            kept.append((key, parameter_value))
+        else:
+            removed.append(key)
+
+    # Supabase requires TLS for hosted database connections. Add the
+    # standard libpq parameter when the integration URL omitted it.
+    if parts.hostname and "supabase" in parts.hostname.lower():
+        if not any(key == "sslmode" for key, _ in kept):
+            kept.append(("sslmode", "require"))
+
+    sanitized = urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urlencode(kept),
+            parts.fragment,
+        )
+    )
+    return sanitized, tuple(sorted(set(removed)))
+
+
+_DATABASE_URL, _REMOVED_DATABASE_URL_PARAMETERS = _sanitize_database_url(
+    _RAW_DATABASE_URL
+)
 _schema_ready = False
 _schema_lock = threading.Lock()
 
 
 def database_configured() -> bool:
     return bool(_DATABASE_URL)
+
+
+def database_diagnostics() -> dict[str, Any]:
+    return {
+        "configured": database_configured(),
+        "source": _DATABASE_URL_SOURCE,
+        "removedQueryParameters": list(_REMOVED_DATABASE_URL_PARAMETERS),
+    }
 
 
 def _connect():

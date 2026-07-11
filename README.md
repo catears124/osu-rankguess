@@ -61,3 +61,11 @@ uvicorn app:app --reload
 ```
 
 Static files are in `public/`; on Vercel they are served directly.
+
+
+## Supabase / psycopg URI compatibility
+
+Version 3.0.1 sanitizes provider-only query parameters (including `supa`)
+from the Vercel-injected `POSTGRES_URL` before passing it to psycopg. The
+application prefers the integration-managed `POSTGRES_URL` over a manually
+created `DATABASE_URL`.
