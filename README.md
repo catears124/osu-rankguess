@@ -14,10 +14,8 @@ ensemble.
 4. The browser polls `GET /api/ordr/status?renderID=...` until o!rdr returns a
    description and video URL.
 5. `POST /api/predict` sends the replay hash, signed cache token, o!rdr
-   description, and video URL. The backend accepts both o!rdr description
-   formats, parses star/map metadata, uses exact hit-count accuracy from the
-   `.osr`, and falls back to cached replay duration when the compact description
-   omits song length.
+   description, and video URL. The backend parses star rating, song length, and
+   accuracy from the description and runs the ONNX model.
 
 The signed token matters on Vercel because sequential requests are not
 promised to land on the same warm function instance.
@@ -86,7 +84,7 @@ JSON body:
   "replayHash": "...",
   "cacheToken": "...",
   "renderID": 123,
-  "description": "[7.27 ⭐] player | Artist - Title [Difficulty] +HDDT 74.23%",
+  "description": "Player: ...",
   "videoURL": "https://...issou.best/...mp4"
 }
 ```
@@ -113,15 +111,7 @@ and a valid HTTPS `issou.best` video URL are available. Transient values such as
 `Waiting for client...`, an empty URL, a protocol-relative URL, or an HTTP URL
 no longer advance the pipeline prematurely.
 
-## v5 description parser fix
 
-o!rdr currently returns both the documented verbose form and a newer compact
-title-style form. Both are accepted:
+## v6 metadata hardening
 
-- `Player: ..., Map: ..., song length is 1:36 (6.99 ⭐) | Accuracy: 89.26%`
-- `[7.27 ⭐] player | Artist - Title [Difficulty] +HDDT 74.23%`
-
-The compact form has no song length. In that case the model receives the replay
-duration already computed by the exact training feature pipeline. Accuracy is
-always recomputed from the `.osr` hit counts so o!rdr display rounding cannot
-change inference.
+Prediction no longer requires an exact human-readable o!rdr description format. The status endpoint forwards structured render fields (`mapLength`, `mapTitle`, `replayDifficulty`, `replayMods`, `mapID`) and prediction independently extracts the star token from either o!rdr `title` or `description`. This specifically supports render `4663424`, whose verbose description inserts `+HDHR` between the star rating and accuracy separator.

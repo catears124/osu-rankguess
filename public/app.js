@@ -166,12 +166,7 @@ const waitForRender = async (renderID, runID) => {
 
     // Be defensive against stale deployments or transient o!rdr responses:
     // never advance to /api/predict until the URL is genuinely usable.
-    if (
-      payload.ready &&
-      typeof payload.description === "string" &&
-      payload.description.trim() &&
-      isValidHttpsVideoURL(payload.videoURL)
-    ) {
+    if (payload.ready && isValidHttpsVideoURL(payload.videoURL)) {
       return payload;
     }
 
@@ -181,7 +176,7 @@ const waitForRender = async (renderID, runID) => {
   throw new Error("o!rdr did not finish within 15 minutes.");
 };
 
-const runPrediction = async ({ replayHash, cacheToken, renderID, description, videoURL }) => {
+const runPrediction = async ({ replayHash, cacheToken, renderID, description, renderMetadata, videoURL }) => {
   const response = await fetch("/api/predict", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -190,6 +185,7 @@ const runPrediction = async ({ replayHash, cacheToken, renderID, description, vi
       cacheToken,
       renderID,
       description,
+      renderMetadata,
       videoURL,
     }),
   });
@@ -262,18 +258,19 @@ const analyze = async () => {
     if (runID !== activeRun) return;
     setStep(2, "done", "Description and render are ready");
 
-    setStep(3, "active", "Parsing star rating, length, and accuracy");
-    if (!rendered.description || !isValidHttpsVideoURL(rendered.videoURL)) {
+    setStep(3, "active", "Reading structured o!rdr render metadata");
+    if (!isValidHttpsVideoURL(rendered.videoURL)) {
       throw new Error("o!rdr has not produced a usable HTTPS video URL yet.");
     }
-    setStep(3, "done", "Recovered model metadata from o!rdr");
+    setStep(3, "done", "Recovered star, length, map, and render metadata");
 
     setStep(4, "active", "Running five-fold ONNX ensemble");
     const prediction = await runPrediction({
       replayHash,
       cacheToken: cached.cacheToken,
       renderID: render.renderID,
-      description: rendered.description,
+      description: rendered.description || rendered.title || "",
+      renderMetadata: rendered.renderMetadata || {},
       videoURL: rendered.videoURL,
     });
     if (runID !== activeRun) return;

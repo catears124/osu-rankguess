@@ -79,23 +79,34 @@ MODEL_MOD_TOKENS = [
 
 HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
-# o!rdr has used two public description formats.  The older verbose
-# form includes the song length; newer renders can expose the compact title
-# form instead.  Accept both rather than depending on the documentation sample.
-VERBOSE_DESCRIPTION_PATTERN = re.compile(
-    r"^\s*Player:\s*(?P<player>.*?),\s*"
-    r"Map:\s*(?P<map>.*),\s*"
-    r"song length is\s*(?P<length>\d+(?::\d{2}){1,2})\s*"
-    r"\((?P<star>\d+(?:\.\d+)?)\s*(?:⭐|★|\*)\)\s*"
-    r"\|\s*Accuracy:\s*(?P<accuracy>\d+(?:\.\d+)?)%\s*$",
+# o!rdr's human-readable strings are not a stable API.  Current render
+# responses expose useful structured fields (mapLength, mapTitle,
+# replayDifficulty, replayMods, replayUsername) plus both a description and a
+# compact title.  We accept all of them and only require a star token from
+# either text field.
+STAR_TOKEN_PATTERN = re.compile(
+    r"[\[(]\s*(?P<star>\d+(?:\.\d+)?)\s*(?:⭐|★|\*)\s*[\])]",
     re.IGNORECASE,
 )
-
-COMPACT_DESCRIPTION_PATTERN = re.compile(
-    r"^\s*\[(?P<star>\d+(?:\.\d+)?)\s*(?:⭐|★|\*)\]\s*"
-    r"(?P<player>.*?)\s*\|\s*"
-    r"(?P<map>.*?)"
-    r"(?:\s+\+(?P<mods>[A-Z0-9]+))?"
+GENERIC_STAR_PATTERN = re.compile(
+    r"(?<![\d.])(?P<star>\d+(?:\.\d+)?)\s*(?:⭐|★|stars?)",
+    re.IGNORECASE,
+)
+ACCURACY_TOKEN_PATTERN = re.compile(
+    r"(?P<accuracy>\d+(?:\.\d+)?)\s*%",
+    re.IGNORECASE,
+)
+LENGTH_TOKEN_PATTERN = re.compile(
+    r"song\s+length\s+is\s+(?P<length>\d+(?::\d{2}){1,2})",
+    re.IGNORECASE,
+)
+VERBOSE_MAP_TEXT_PATTERN = re.compile(
+    r"Player:\s*(?P<player>.*?),\s*Map:\s*(?P<map>.*?),\s*song\s+length\s+is",
+    re.IGNORECASE,
+)
+COMPACT_TITLE_PATTERN = re.compile(
+    r"^\s*\[[^\]]+\]\s*(?P<player>.*?)\s*\|\s*"
+    r"(?P<map>.*?)(?:\s+\+(?P<mods>[A-Z0-9]+))?"
     r"\s+(?P<accuracy>\d+(?:\.\d+)?)%\s*$",
     re.IGNORECASE,
 )
@@ -108,7 +119,7 @@ MAP_PATTERN = re.compile(
 
 app = FastAPI(
     title="osu!rankguess",
-    version="2.2.0",
+    version="2.3.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -139,8 +150,9 @@ _replay_cache: dict[str, CachedReplay] = {}
 
 class PredictPayload(BaseModel):
     replay_hash: str = Field(alias="replayHash")
-    description: str
     video_url: str = Field(alias="videoURL")
+    description: str | None = None
+    render_metadata: dict[str, Any] | None = Field(default=None, alias="renderMetadata")
     cache_token: str | None = Field(default=None, alias="cacheToken")
     render_id: int | None = Field(default=None, alias="renderID")
 
@@ -466,88 +478,202 @@ def replay_duration_from_summary(cached: CachedReplay) -> float:
     return value
 
 
-def parse_ordr_description(
-    description: str,
+def _clean_text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _extract_star(*texts: Any) -> float | None:
+    for value in texts:
+        text = _clean_text(value)
+        if not text:
+            continue
+        match = STAR_TOKEN_PATTERN.search(text) or GENERIC_STAR_PATTERN.search(text)
+        if match:
+            star = float(match.group("star"))
+            if 0.1 <= star <= 30.0:
+                return star
+    return None
+
+
+def _extract_accuracy_percent(*texts: Any) -> float | None:
+    for value in texts:
+        text = _clean_text(value)
+        if not text:
+            continue
+        matches = list(ACCURACY_TOKEN_PATTERN.finditer(text))
+        if matches:
+            accuracy = float(matches[-1].group("accuracy"))
+            if 0.0 <= accuracy <= 100.0:
+                return accuracy
+    return None
+
+
+def _parse_map_text(map_text: str) -> dict[str, Any]:
+    map_text = map_text.strip()
+    map_match = MAP_PATTERN.fullmatch(map_text)
+    if map_match:
+        creator_group = map_match.group("creator")
+        return {
+            "title": map_match.group("title").strip(),
+            "artist": map_match.group("artist").strip(),
+            "version": map_match.group("version").strip(),
+            "creator": creator_group.strip() if creator_group else None,
+            "descriptionText": map_text,
+        }
+    return {
+        "title": map_text or "Unknown map",
+        "artist": "",
+        "version": "",
+        "creator": None,
+        "descriptionText": map_text,
+    }
+
+
+def parse_ordr_metadata(
     *,
+    description: str | None,
+    title: str | None,
+    render_metadata: dict[str, Any] | None,
     fallback_length_seconds: float,
     fallback_accuracy: float,
+    fallback_player: str,
 ) -> dict[str, Any]:
-    text = description.strip()
-    verbose_match = VERBOSE_DESCRIPTION_PATTERN.fullmatch(text)
-    compact_match = COMPACT_DESCRIPTION_PATTERN.fullmatch(text)
+    """Convert o!rdr's unstable display strings + structured render fields.
 
-    if verbose_match:
-        match = verbose_match
-        description_format = "verbose"
-        length_seconds = parse_duration(match.group("length"))
-        accuracy_percent = float(match.group("accuracy"))
-        parsed_mods = None
-    elif compact_match:
-        match = compact_match
-        description_format = "compact"
-        # Compact o!rdr descriptions omit song length.  Replay telemetry is
-        # already cached and was generated by the exact training feature code,
-        # so its duration is the deterministic fallback used for inference.
-        length_seconds = float(fallback_length_seconds)
-        accuracy_percent = float(match.group("accuracy"))
-        parsed_mods = (match.group("mods") or "").upper() or None
+    The model only needs star rating, length, accuracy and mods. Accuracy and
+    mods are authoritative from the cached .osr. Length prefers o!rdr's
+    structured mapLength. The only value that must be recovered from display
+    text is star rating, and it is extracted independently from either title or
+    description rather than requiring a complete sentence format.
+    """
+
+    metadata = dict(render_metadata or {})
+    description_text = _clean_text(description or metadata.get("description"))
+    title_text = _clean_text(title or metadata.get("title"))
+
+    structured_star = _finite_number(metadata.get("star"))
+    if structured_star is not None and 0.1 <= structured_star <= 30.0:
+        star = structured_star
     else:
+        star = _extract_star(title_text, description_text)
+    if star is None:
         raise HTTPException(
             status_code=422,
             detail={
-                "code": "description_parse_failed",
-                "message": "Could not parse either known o!rdr description format.",
-                "description": description,
+                "code": "star_parse_failed",
+                "message": "Could not find an o!rdr star rating in the render title or description.",
+                "description": description_text,
+                "title": title_text,
+                "renderMetadata": {
+                    key: metadata.get(key)
+                    for key in (
+                        "star",
+                        "mapLength",
+                        "mapTitle",
+                        "replayDifficulty",
+                        "replayMods",
+                        "replayUsername",
+                        "username",
+                        "mapID",
+                    )
+                },
             },
         )
 
-    star = float(match.group("star"))
-    if not (0.1 <= star <= 30.0):
-        raise HTTPException(status_code=422, detail={"code": "invalid_star", "message": "o!rdr star rating is out of range."})
-    if not (0.0 <= accuracy_percent <= 100.0):
-        # The .osr header is authoritative for score accuracy even if the
-        # display description is malformed.
-        accuracy_percent = 100.0 * float(fallback_accuracy)
-    if not (1.0 <= length_seconds <= 7200.0):
-        raise HTTPException(status_code=422, detail={"code": "invalid_length", "message": "Replay length is out of range."})
-
-    map_text = match.group("map").strip()
-    map_match = MAP_PATTERN.fullmatch(map_text)
-    if map_match:
-        artist = map_match.group("artist").strip()
-        title = map_match.group("title").strip()
-        version = map_match.group("version").strip()
-        creator_group = map_match.group("creator")
-        creator = creator_group.strip() if creator_group else None
+    structured_length = _finite_number(metadata.get("mapLength"))
+    length_match = LENGTH_TOKEN_PATTERN.search(description_text)
+    if structured_length is not None and 1.0 <= structured_length <= 7200.0:
+        length_seconds = structured_length
+        length_source = "ordr_mapLength"
+    elif length_match:
+        length_seconds = parse_duration(length_match.group("length"))
+        length_source = "ordr_description"
     else:
-        artist = ""
-        title = map_text
-        version = ""
-        creator = None
+        length_seconds = float(fallback_length_seconds)
+        length_source = "replay_telemetry"
+
+    if not 1.0 <= length_seconds <= 7200.0:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_length", "message": "Replay length is out of range."},
+        )
+
+    display_accuracy = _extract_accuracy_percent(title_text, description_text)
+    if display_accuracy is None:
+        display_accuracy = 100.0 * float(fallback_accuracy)
+
+    verbose_match = VERBOSE_MAP_TEXT_PATTERN.search(description_text)
+    compact_match = COMPACT_TITLE_PATTERN.fullmatch(title_text)
+
+    structured_player = _clean_text(
+        metadata.get("replayUsername") or metadata.get("username")
+    )
+    player = structured_player or fallback_player
+    map_text = ""
+    description_format = "structured"
+
+    if verbose_match:
+        player = _clean_text(verbose_match.group("player")) or player
+        map_text = _clean_text(verbose_match.group("map"))
+        description_format = "verbose"
+    elif compact_match:
+        player = _clean_text(compact_match.group("player")) or player
+        map_text = _clean_text(compact_match.group("map"))
+        description_format = "compact"
+
+    map_title = _clean_text(metadata.get("mapTitle"))
+    difficulty = _clean_text(metadata.get("replayDifficulty"))
+    if not map_text:
+        map_text = map_title
+        if difficulty:
+            map_text = f"{map_text} [{difficulty}]" if map_text else f"[{difficulty}]"
+
+    parsed_map = _parse_map_text(map_text)
+    if map_title and (not parsed_map["title"] or parsed_map["title"] == "Unknown map"):
+        parsed_map["title"] = map_title
+    if difficulty and not parsed_map["version"]:
+        parsed_map["version"] = difficulty
+
+    parsed_mods = _clean_text(metadata.get("replayMods")).upper() or None
+    if parsed_mods is None and compact_match:
+        parsed_mods = _clean_text(compact_match.group("mods")).upper() or None
+
+    map_id_value = metadata.get("mapID")
+    try:
+        map_id = int(map_id_value) if map_id_value is not None else None
+    except (TypeError, ValueError):
+        map_id = None
+
+    parsed_map.update(
+        {
+            "id": map_id,
+            "beatmapsetId": None,
+            "star": star,
+            "lengthSeconds": length_seconds,
+            "url": _clean_text(metadata.get("mapLink")) or None,
+            "cover": None,
+            "source": "ordr_structured_render",
+            "lengthSource": length_source,
+        }
+    )
 
     return {
-        "player": match.group("player").strip(),
-        "accuracy": accuracy_percent / 100.0,
-        "accuracyPercent": accuracy_percent,
+        "player": player,
+        "accuracy": display_accuracy / 100.0,
+        "accuracyPercent": display_accuracy,
         "star": star,
         "lengthSeconds": length_seconds,
         "descriptionFormat": description_format,
         "parsedMods": parsed_mods,
-        "map": {
-            "id": None,
-            "beatmapsetId": None,
-            "star": star,
-            "lengthSeconds": length_seconds,
-            "title": title,
-            "artist": artist,
-            "version": version,
-            "creator": creator,
-            "url": None,
-            "cover": None,
-            "descriptionText": map_text,
-            "source": f"ordr_{description_format}_description",
-            "lengthSource": "ordr_description" if description_format == "verbose" else "replay_telemetry",
-        },
+        "map": parsed_map,
     }
 
 
@@ -625,7 +751,7 @@ async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "model": MODEL_PATH.name,
-        "version": "2.2.0",
+        "version": "2.3.0",
         "inputs": {value.name: value.shape for value in session.get_inputs()},
         "ordrApiKeyConfigured": bool(os.getenv("ORDR_API_KEY")),
         "cacheSigningConfigured": bool(
@@ -870,10 +996,50 @@ async def get_ordr_status(render_id: int = Query(..., ge=1, alias="renderID")) -
             None,
         )
 
-    ready = bool(description and video_url)
+        render_title = render.get("title")
+        render_star = _extract_star(render_title, description)
+        render_metadata = {
+            "description": description,
+            "title": render_title,
+            "star": render_star,
+            "username": render.get("username"),
+            "replayUsername": render.get("replayUsername"),
+            "replayMods": render.get("replayMods"),
+            "mapTitle": render.get("mapTitle"),
+            "mapLength": render.get("mapLength"),
+            "drainTime": render.get("drainTime"),
+            "replayDifficulty": render.get("replayDifficulty"),
+            "mapID": render.get("mapID"),
+            "mapLink": render.get("mapLink"),
+        }
+
+    metadata_ready = render_metadata.get("star") is not None
+    ready = bool(metadata_ready and video_url)
     client_progress = progress
-    if description and not video_url:
+    if metadata_ready and not video_url:
         client_progress = "Finalizing video link"
+
+    print(
+        json.dumps(
+            {
+                "event": "ordr_status",
+                "renderID": render_id,
+                "progress": progress,
+                "ready": ready,
+                "description": description,
+                "title": render_metadata.get("title"),
+                "star": render_metadata.get("star"),
+                "mapLength": render_metadata.get("mapLength"),
+                "mapTitle": render_metadata.get("mapTitle"),
+                "replayDifficulty": render_metadata.get("replayDifficulty"),
+                "replayMods": render_metadata.get("replayMods"),
+                "videoURL": video_url,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
 
     return JSONResponse(
         {
@@ -887,6 +1053,7 @@ async def get_ordr_status(render_id: int = Query(..., ge=1, alias="renderID")) -
             "videoURL": video_url,
             "replayUsername": render.get("replayUsername"),
             "title": render.get("title"),
+            "renderMetadata": render_metadata,
         }
     )
 
@@ -909,10 +1076,37 @@ async def predict(payload: PredictPayload) -> JSONResponse:
 
     replay_accuracy = replay_accuracy_from_header(cached.header)
     replay_duration = replay_duration_from_summary(cached)
-    parsed_description = parse_ordr_description(
-        payload.description,
+    render_metadata = dict(payload.render_metadata or {})
+    description_text = _clean_text(payload.description or render_metadata.get("description"))
+    title_text = _clean_text(render_metadata.get("title"))
+
+    parsed_description = parse_ordr_metadata(
+        description=description_text,
+        title=title_text,
+        render_metadata=render_metadata,
         fallback_length_seconds=replay_duration,
         fallback_accuracy=replay_accuracy,
+        fallback_player=cached.player,
+    )
+
+    print(
+        json.dumps(
+            {
+                "event": "predict_metadata",
+                "renderID": payload.render_id,
+                "descriptionFormat": parsed_description["descriptionFormat"],
+                "star": parsed_description["star"],
+                "lengthSeconds": parsed_description["lengthSeconds"],
+                "player": parsed_description["player"],
+                "description": description_text,
+                "title": title_text,
+                "mapLength": render_metadata.get("mapLength"),
+                "replayMods": render_metadata.get("replayMods"),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        flush=True,
     )
     # Use the replay header for accuracy because it is exact and does not
     # depend on o!rdr's human-readable formatting or rounding.
@@ -996,7 +1190,7 @@ async def predict(payload: PredictPayload) -> JSONResponse:
             "beatmapHash": header["beatmap_hash"],
             "beatmap": metadata,
             "renderID": payload.render_id,
-            "renderDescription": payload.description,
+            "renderDescription": description_text or title_text,
             "descriptionFormat": parsed_description["descriptionFormat"],
             "videoURL": video_url,
         }

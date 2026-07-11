@@ -26,6 +26,15 @@
           "value": "no-store"
         }
       ]
+    },
+    {
+      "source": "/(index.html|app.js|styles.css)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, max-age=0"
+        }
+      ]
     }
   ]
 }
