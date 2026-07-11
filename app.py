@@ -11,9 +11,10 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 import numpy as np
@@ -22,6 +23,18 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
+
+
+from database import (
+    challenge_count,
+    database_configured,
+    get_daily_challenge,
+    get_submission,
+    list_gallery,
+    make_public_id,
+    random_challenge_submission,
+    save_submission,
+)
 
 from replay_features import (
     ACTION_WINDOW_COUNT,
@@ -44,6 +57,10 @@ MAX_CACHE_TOKEN_BYTES = 1_500_000
 CACHE_TTL_SECONDS = int(os.getenv("REPLAY_CACHE_TTL_SECONDS", "1800"))
 ORDR_RENDER_URL = "https://apis.issou.best/ordr/renders"
 ORDR_DYNLINK_URL = "https://apis.issou.best/dynlink/ordr/gen"
+OSU_TOKEN_URL = "https://osu.ppy.sh/oauth/token"
+OSU_API_BASE = "https://osu.ppy.sh/api/v2"
+OSU_RANK_POPULATION = int(os.getenv("OSU_RANK_POPULATION", "5500000") or 5500000)
+MAX_CHALLENGE_ATTEMPTS = 5
 
 MOD_BITS: dict[str, int] = {
     "NF": 1,
@@ -119,7 +136,7 @@ MAP_PATTERN = re.compile(
 
 app = FastAPI(
     title="osu!rankguess",
-    version="2.3.0",
+    version="3.0.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -128,6 +145,10 @@ app.add_middleware(GZipMiddleware, minimum_size=1_000)
 _session: ort.InferenceSession | None = None
 _session_lock = asyncio.Lock()
 _cache_lock = asyncio.Lock()
+_osu_token_lock = asyncio.Lock()
+_osu_token: str | None = None
+_osu_token_expires_at = 0.0
+_osu_user_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
 
 @dataclass
@@ -155,6 +176,17 @@ class PredictPayload(BaseModel):
     render_metadata: dict[str, Any] | None = Field(default=None, alias="renderMetadata")
     cache_token: str | None = Field(default=None, alias="cacheToken")
     render_id: int | None = Field(default=None, alias="renderID")
+    publish: bool = True
+
+    model_config = {"populate_by_name": True}
+
+
+class ChallengeGuessPayload(BaseModel):
+    replay_id: str = Field(alias="replayID", min_length=8, max_length=64)
+    guess_rank: int = Field(alias="guessRank", ge=1, le=100_000_000)
+    attempt: int = Field(ge=1, le=MAX_CHALLENGE_ATTEMPTS)
+    mode: str = Field(default="infinite")
+    challenge_date: date | None = Field(default=None, alias="challengeDate")
 
     model_config = {"populate_by_name": True}
 
@@ -740,6 +772,192 @@ def sanitize_replay_filename(username: str, replay_hash: str) -> str:
     return f"{safe_name}-{replay_hash[:12]}.osr"
 
 
+async def get_osu_access_token() -> str | None:
+    global _osu_token, _osu_token_expires_at
+
+    client_id = os.getenv("OSU_CLIENT_ID")
+    client_secret = os.getenv("OSU_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        return None
+
+    now = time.time()
+    if _osu_token and now < _osu_token_expires_at - 60:
+        return _osu_token
+
+    async with _osu_token_lock:
+        now = time.time()
+        if _osu_token and now < _osu_token_expires_at - 60:
+            return _osu_token
+
+        timeout = httpx.Timeout(15.0, connect=8.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                OSU_TOKEN_URL,
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "grant_type": "client_credentials",
+                    "scope": "public",
+                },
+                headers={"Accept": "application/json"},
+            )
+        if response.status_code != 200:
+            print(
+                json.dumps(
+                    {
+                        "event": "osu_token_failed",
+                        "status": response.status_code,
+                        "body": response.text[:300],
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+            return None
+
+        payload = response.json()
+        token = str(payload.get("access_token") or "")
+        if not token:
+            return None
+        _osu_token = token
+        _osu_token_expires_at = now + float(payload.get("expires_in") or 3600)
+        return token
+
+
+async def fetch_osu_user(username: str) -> dict[str, Any] | None:
+    normalized = username.strip().casefold()
+    cached = _osu_user_cache.get(normalized)
+    if cached and cached[0] > time.time():
+        return cached[1]
+
+    token = await get_osu_access_token()
+    if not token:
+        _osu_user_cache[normalized] = (time.time() + 300, None)
+        return None
+
+    encoded_user = quote("@" + username.strip(), safe="")
+    timeout = httpx.Timeout(15.0, connect=8.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                f"{OSU_API_BASE}/users/{encoded_user}/osu",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                },
+            )
+    except httpx.HTTPError as exc:
+        print(json.dumps({"event": "osu_user_failed", "error": repr(exc)}), flush=True)
+        return None
+
+    if response.status_code != 200:
+        print(
+            json.dumps(
+                {
+                    "event": "osu_user_failed",
+                    "username": username,
+                    "status": response.status_code,
+                    "body": response.text[:300],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        _osu_user_cache[normalized] = (time.time() + 300, None)
+        return None
+
+    payload = response.json()
+    statistics = payload.get("statistics") or {}
+    global_rank = statistics.get("global_rank")
+    try:
+        global_rank = int(global_rank) if global_rank is not None else None
+    except (TypeError, ValueError):
+        global_rank = None
+
+    result = {
+        "id": payload.get("id"),
+        "username": payload.get("username") or username,
+        "avatarURL": payload.get("avatar_url"),
+        "countryCode": payload.get("country_code"),
+        "globalRank": global_rank,
+    }
+    _osu_user_cache[normalized] = (time.time() + 900, result)
+    return result
+
+
+def _iso_datetime(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat()
+    return str(value)
+
+
+def gallery_item_from_row(row: dict[str, Any], *, reveal_answer: bool = True) -> dict[str, Any]:
+    item = {
+        "id": row["public_id"],
+        "renderID": row.get("render_id"),
+        "videoURL": row["video_url"],
+        "player": row.get("player"),
+        "avatarURL": row.get("avatar_url"),
+        "countryCode": row.get("country_code"),
+        "actualRank": row.get("actual_rank"),
+        "predictedRank": row.get("predicted_rank"),
+        "skill": row.get("skill"),
+        "topPercent": row.get("top_percent"),
+        "confidence": row.get("confidence"),
+        "star": row.get("star"),
+        "accuracyPercent": row.get("accuracy_percent"),
+        "mods": [token for token in str(row.get("mods") or "NM").split(",") if token],
+        "lengthSeconds": row.get("length_seconds"),
+        "mapID": row.get("map_id"),
+        "mapLink": row.get("map_link"),
+        "beatmap": {
+            "artist": row.get("artist") or "",
+            "title": row.get("title") or "Unknown map",
+            "version": row.get("version") or "",
+            "creator": row.get("creator"),
+        },
+        "createdAt": _iso_datetime(row.get("created_at")),
+    }
+    if not reveal_answer:
+        for key in (
+            "player",
+            "avatarURL",
+            "countryCode",
+            "actualRank",
+            "predictedRank",
+            "skill",
+            "topPercent",
+            "confidence",
+        ):
+            item.pop(key, None)
+    return item
+
+
+def challenge_feedback(actual_rank: int, guess_rank: int) -> tuple[bool, str, str, float]:
+    ratio = max(actual_rank, guess_rank) / max(1, min(actual_rank, guess_rank))
+    log_error = abs(math.log10(max(guess_rank, 1) / max(actual_rank, 1)))
+    correct = ratio <= 1.10
+    if correct:
+        direction = "correct"
+    elif actual_rank < guess_rank:
+        direction = "better"
+    else:
+        direction = "worse"
+
+    if correct:
+        closeness = "exact"
+    elif ratio <= 1.35:
+        closeness = "very_close"
+    elif ratio <= 2.0:
+        closeness = "close"
+    else:
+        closeness = "far"
+    return correct, direction, closeness, log_error
+
+
 @app.get("/", include_in_schema=False)
 async def index() -> RedirectResponse:
     return RedirectResponse(url="/index.html", status_code=307)
@@ -751,9 +969,12 @@ async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "model": MODEL_PATH.name,
-        "version": "2.3.0",
+        "version": "3.0.0",
         "inputs": {value.name: value.shape for value in session.get_inputs()},
+        "databaseConfigured": database_configured(),
+        "rankPopulation": OSU_RANK_POPULATION,
         "ordrApiKeyConfigured": bool(os.getenv("ORDR_API_KEY")),
+        "osuApiConfigured": bool(os.getenv("OSU_CLIENT_ID") and os.getenv("OSU_CLIENT_SECRET")),
         "cacheSigningConfigured": bool(
             os.getenv("CACHE_SIGNING_SECRET")
             or os.getenv("ORDR_API_KEY")
@@ -1058,6 +1279,106 @@ async def get_ordr_status(render_id: int = Query(..., ge=1, alias="renderID")) -
     )
 
 
+@app.get("/api/gallery")
+async def gallery(
+    limit: int = Query(24, ge=1, le=60),
+    offset: int = Query(0, ge=0),
+) -> JSONResponse:
+    if not database_configured():
+        return JSONResponse({"ok": True, "configured": False, "items": [], "total": 0})
+    try:
+        rows, total = await asyncio.to_thread(list_gallery, limit, offset)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={"code": "database_error", "message": str(exc)}) from exc
+    return JSONResponse({
+        "ok": True,
+        "configured": True,
+        "items": [gallery_item_from_row(row) for row in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })
+
+
+@app.get("/api/challenge/daily")
+async def daily_challenge_api() -> JSONResponse:
+    challenge_date = datetime.now(timezone.utc).date()
+    if not database_configured():
+        return JSONResponse({"ok": True, "available": False, "reason": "database_not_configured", "date": challenge_date.isoformat(), "replays": []})
+    try:
+        rows = await asyncio.to_thread(get_daily_challenge, challenge_date, 3)
+        count = await asyncio.to_thread(challenge_count)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={"code": "database_error", "message": str(exc)}) from exc
+    return JSONResponse({
+        "ok": True,
+        "available": len(rows) == 3,
+        "date": challenge_date.isoformat(),
+        "maxAttempts": MAX_CHALLENGE_ATTEMPTS,
+        "eligibleReplays": count,
+        "replays": [gallery_item_from_row(row, reveal_answer=False) for row in rows],
+    })
+
+
+@app.get("/api/challenge/infinite")
+async def infinite_challenge_api(exclude: str | None = Query(default=None, max_length=64)) -> JSONResponse:
+    if not database_configured():
+        return JSONResponse({"ok": True, "available": False, "reason": "database_not_configured"})
+    try:
+        row = await asyncio.to_thread(random_challenge_submission, exclude)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={"code": "database_error", "message": str(exc)}) from exc
+    return JSONResponse({
+        "ok": True,
+        "available": row is not None,
+        "maxAttempts": MAX_CHALLENGE_ATTEMPTS,
+        "replay": gallery_item_from_row(row, reveal_answer=False) if row else None,
+    })
+
+
+@app.post("/api/challenge/guess")
+async def challenge_guess(payload: ChallengeGuessPayload) -> JSONResponse:
+    if not database_configured():
+        raise HTTPException(status_code=503, detail={"code": "database_not_configured", "message": "Connect a database first."})
+    try:
+        row = await asyncio.to_thread(get_submission, payload.replay_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={"code": "database_error", "message": str(exc)}) from exc
+    if not row or not row.get("actual_rank"):
+        raise HTTPException(status_code=404, detail={"code": "challenge_missing", "message": "Challenge replay was not found."})
+
+    mode = payload.mode.strip().lower()
+    if mode == "daily":
+        challenge_date = payload.challenge_date or datetime.now(timezone.utc).date()
+        daily_rows = await asyncio.to_thread(get_daily_challenge, challenge_date, 3)
+        if payload.replay_id not in {item["public_id"] for item in daily_rows}:
+            raise HTTPException(status_code=400, detail={"code": "not_daily_replay", "message": "Replay is not part of that daily challenge."})
+    elif mode != "infinite":
+        raise HTTPException(status_code=400, detail={"code": "invalid_mode", "message": "Mode must be daily or infinite."})
+
+    actual_rank = int(row["actual_rank"])
+    correct, direction, closeness, log_error = challenge_feedback(actual_rank, payload.guess_rank)
+    reveal = correct or payload.attempt >= MAX_CHALLENGE_ATTEMPTS
+    response = {
+        "ok": True,
+        "correct": correct,
+        "direction": direction,
+        "closeness": closeness,
+        "attempt": payload.attempt,
+        "maxAttempts": MAX_CHALLENGE_ATTEMPTS,
+        "revealed": reveal,
+        "logError": log_error,
+    }
+    if reveal:
+        response.update({
+            "actualRank": actual_rank,
+            "predictedRank": int(row["predicted_rank"]),
+            "player": row["player"],
+            "avatarURL": row.get("avatar_url"),
+        })
+    return JSONResponse(response)
+
+
 @app.post("/api/predict")
 async def predict(payload: PredictPayload) -> JSONResponse:
     replay_hash = normalize_hash(payload.replay_hash)
@@ -1142,11 +1463,11 @@ async def predict(payload: PredictPayload) -> JSONResponse:
     if not all(math.isfinite(value) for value in scalar_values):
         raise RuntimeError("Model produced non-finite output")
 
-    rank_percentile = 10.0 ** (-skill)
+    rank_percentile = min(1.0, max(1.0 / OSU_RANK_POPULATION, 10.0 ** (-skill)))
     top_percent = 100.0 * rank_percentile
     one_in = max(1, int(round(1.0 / max(rank_percentile, 1e-12))))
-    population = int(os.getenv("OSU_RANK_POPULATION", "0") or 0)
-    estimated_rank = max(1, int(round(rank_percentile * population))) if population > 0 else None
+    predicted_rank = max(1, min(OSU_RANK_POPULATION, int(round(rank_percentile * OSU_RANK_POPULATION))))
+    confidence = confidence_label(uncertainty)
 
     header = cached.header
     player_warning = None
@@ -1154,18 +1475,62 @@ async def predict(payload: PredictPayload) -> JSONResponse:
     if description_player.casefold() != cached.player.casefold():
         player_warning = f"o!rdr reported {description_player}; replay header reported {cached.player}."
 
+    osu_user = await fetch_osu_user(cached.player)
+    actual_rank = int(osu_user["globalRank"]) if osu_user and osu_user.get("globalRank") else None
+    gallery_saved = False
+    gallery_id = None
+    if payload.publish and database_configured():
+        public_id = make_public_id(replay_hash)
+        record = {
+            "public_id": public_id,
+            "replay_hash": replay_hash,
+            "render_id": payload.render_id,
+            "player": cached.player,
+            "osu_user_id": osu_user.get("id") if osu_user else None,
+            "avatar_url": osu_user.get("avatarURL") if osu_user else None,
+            "country_code": osu_user.get("countryCode") if osu_user else None,
+            "actual_rank": actual_rank,
+            "predicted_rank": predicted_rank,
+            "skill": skill,
+            "top_percent": top_percent,
+            "confidence": confidence,
+            "star": float(metadata["star"]),
+            "accuracy_percent": 100.0 * accuracy,
+            "mods": ",".join(cached.display_mods or ["NM"]),
+            "artist": metadata.get("artist"),
+            "title": metadata.get("title"),
+            "version": metadata.get("version"),
+            "creator": metadata.get("creator"),
+            "length_seconds": float(metadata["lengthSeconds"]),
+            "map_id": metadata.get("id"),
+            "map_link": metadata.get("url"),
+            "video_url": video_url,
+            "published": True,
+        }
+        try:
+            saved = await asyncio.to_thread(save_submission, record)
+            gallery_saved = saved is not None
+            gallery_id = public_id if gallery_saved else None
+        except Exception as exc:
+            print(json.dumps({"event": "gallery_save_failed", "error": repr(exc)}), flush=True)
+
+
     return JSONResponse(
         {
             "skill": skill,
             "rankPercentile": rank_percentile,
             "topPercent": top_percent,
             "oneInPlayers": one_in,
-            "estimatedRank": estimated_rank,
+            "estimatedRank": predicted_rank,
+            "predictedRank": predicted_rank,
+            "rankPopulation": OSU_RANK_POPULATION,
+            "actualRank": actual_rank,
+            "rankError": (predicted_rank - actual_rank) if actual_rank else None,
             "baseSkill": base_skill,
             "replayCorrection": replay_correction,
             "replayGate": replay_gate,
             "uncertainty": uncertainty,
-            "confidence": confidence_label(uncertainty),
+            "confidence": confidence,
             "ordinalProbabilities": {
                 "gt1": float(ordinal[0]),
                 "gt2": float(ordinal[1]),
@@ -1193,5 +1558,7 @@ async def predict(payload: PredictPayload) -> JSONResponse:
             "renderDescription": description_text or title_text,
             "descriptionFormat": parsed_description["descriptionFormat"],
             "videoURL": video_url,
+            "gallerySaved": gallery_saved,
+            "galleryID": gallery_id,
         }
     )
