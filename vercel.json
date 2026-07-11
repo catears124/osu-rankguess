@@ -3,9 +3,7 @@
   "functions": {
     "app.py": {
       "maxDuration": 60,
-      "includeFiles": [
-        "model/**"
-      ]
+      "includeFiles": "model/**"
     }
   },
   "headers": [
