@@ -1,6 +1,6 @@
 [project]
 name = "osu-rankguess"
-version = "1.0.0"
+version = "1.0.1"
 description = "Whole-replay osu! rank percentile inference"
 requires-python = ">=3.12,<3.13"
 dependencies = [
