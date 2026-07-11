@@ -25,6 +25,19 @@ const formatTopPercent = (value) => {
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+const isValidHttpsVideoURL = (value) => {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      (url.hostname === "issou.best" || url.hostname.endsWith(".issou.best"))
+    );
+  } catch {
+    return false;
+  }
+};
+
 const apiError = async (response) => {
   const payload = await response.json().catch(() => ({}));
   const detail = payload.detail || payload;
@@ -150,7 +163,17 @@ const waitForRender = async (renderID, runID) => {
     if (payload.failed) {
       throw new Error(`o!rdr render failed (error ${payload.errorCode}).`);
     }
-    if (payload.ready) return payload;
+
+    // Be defensive against stale deployments or transient o!rdr responses:
+    // never advance to /api/predict until the URL is genuinely usable.
+    if (
+      payload.ready &&
+      typeof payload.description === "string" &&
+      payload.description.trim() &&
+      isValidHttpsVideoURL(payload.videoURL)
+    ) {
+      return payload;
+    }
 
     await sleep(3000);
   }
@@ -240,8 +263,8 @@ const analyze = async () => {
     setStep(2, "done", "Description and render are ready");
 
     setStep(3, "active", "Parsing star rating, length, and accuracy");
-    if (!rendered.description || !rendered.videoURL) {
-      throw new Error("o!rdr completed without a description or video URL.");
+    if (!rendered.description || !isValidHttpsVideoURL(rendered.videoURL)) {
+      throw new Error("o!rdr has not produced a usable HTTPS video URL yet.");
     }
     setStep(3, "done", "Recovered model metadata from o!rdr");
 

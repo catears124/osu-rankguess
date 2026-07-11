@@ -95,7 +95,7 @@ MAP_PATTERN = re.compile(
 
 app = FastAPI(
     title="osu!rankguess",
-    version="2.0.0",
+    version="2.1.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -478,20 +478,50 @@ def parse_ordr_description(description: str) -> dict[str, Any]:
     }
 
 
-def validate_video_url(value: str) -> str:
-    parsed = urlparse(value)
+def normalize_issou_video_url(value: Any) -> str | None:
+    """Return a canonical HTTPS issou.best URL, or None while it is unavailable.
+
+    o!rdr can briefly expose an empty, protocol-relative, or HTTP URL while the
+    render is transitioning from complete to CDN-ready.  The status endpoint
+    must not mark the render ready until a usable HTTPS URL exists.
+    """
+
+    if not isinstance(value, str):
+        return None
+
+    candidate = value.strip()
+    if not candidate or candidate.lower() in {"null", "none", "undefined"}:
+        return None
+
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    elif candidate.startswith("http://"):
+        candidate = "https://" + candidate[len("http://") :]
+    elif candidate.startswith("/"):
+        candidate = "https://apis.issou.best" + candidate
+
+    parsed = urlparse(candidate)
     if parsed.scheme != "https" or not parsed.hostname:
-        raise HTTPException(
-            status_code=422,
-            detail={"code": "invalid_video_url", "message": "Video URL must be HTTPS."},
-        )
-    hostname = parsed.hostname.lower()
+        return None
+
+    hostname = parsed.hostname.lower().rstrip(".")
     if not (hostname == "issou.best" or hostname.endswith(".issou.best")):
+        return None
+
+    return candidate
+
+
+def validate_video_url(value: str) -> str:
+    normalized = normalize_issou_video_url(value)
+    if normalized is None:
         raise HTTPException(
             status_code=422,
-            detail={"code": "invalid_video_url", "message": "Video URL must be hosted by issou.best."},
+            detail={
+                "code": "invalid_video_url",
+                "message": "o!rdr has not produced a valid HTTPS video URL yet.",
+            },
         )
-    return value
+    return normalized
 
 
 def safe_ordr_error(response: httpx.Response) -> dict[str, Any]:
@@ -522,7 +552,7 @@ async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "model": MODEL_PATH.name,
-        "version": "2.0.0",
+        "version": "2.1.0",
         "inputs": {value.name: value.shape for value in session.get_inputs()},
         "ordrApiKeyConfigured": bool(os.getenv("ORDR_API_KEY")),
         "cacheSigningConfigured": bool(
@@ -733,9 +763,12 @@ async def get_ordr_status(render_id: int = Query(..., ge=1, alias="renderID")) -
                 }
             )
 
-        done = progress.lower().startswith("done") or bool(render.get("videoUrl") and description)
-        video_url: str | None = None
-        if done:
+        # Do not infer readiness from o!rdr's progress string alone.  In
+        # particular, "Waiting for client..." can coexist with a description
+        # and a transient/non-HTTPS videoUrl value.  Ask dynlink on every poll
+        # and only report ready after we have a canonical HTTPS CDN URL.
+        dynlink_url: Any = None
+        try:
             dynlink_response = await client.get(
                 ORDR_DYNLINK_URL,
                 params={"id": render_id},
@@ -743,18 +776,40 @@ async def get_ordr_status(render_id: int = Query(..., ge=1, alias="renderID")) -
             )
             if dynlink_response.status_code == 200:
                 dynlink_payload = dynlink_response.json()
-                video_url = dynlink_payload.get("url")
-            if not video_url:
-                video_url = render.get("videoUrl")
+                if isinstance(dynlink_payload, dict):
+                    dynlink_url = dynlink_payload.get("url")
+        except (httpx.HTTPError, ValueError):
+            # A transient dynlink failure just means the client should poll again.
+            dynlink_url = None
 
-    ready = bool(done and description and video_url)
+        video_candidates = [
+            dynlink_url,
+            render.get("videoUrl"),
+            render.get("videoURL"),
+            render.get("url"),
+        ]
+        video_url = next(
+            (
+                normalized
+                for candidate in video_candidates
+                if (normalized := normalize_issou_video_url(candidate)) is not None
+            ),
+            None,
+        )
+
+    ready = bool(description and video_url)
+    client_progress = progress
+    if description and not video_url:
+        client_progress = "Finalizing video link"
+
     return JSONResponse(
         {
             "ok": True,
             "renderID": render_id,
             "ready": ready,
             "failed": False,
-            "progress": progress,
+            "progress": client_progress,
+            "ordrProgress": progress,
             "description": description,
             "videoURL": video_url,
             "replayUsername": render.get("replayUsername"),

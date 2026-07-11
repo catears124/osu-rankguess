@@ -102,3 +102,11 @@ Loads the ONNX model and reports the input contract.
 - Maximum application upload is 4 MB.
 - `model.onnx` includes the five raw fold models; the failed Ridge stacker is
   not deployed.
+
+
+## v4 render readiness fix
+
+The o!rdr polling endpoint only marks a render ready after both the description
+and a valid HTTPS `issou.best` video URL are available. Transient values such as
+`Waiting for client...`, an empty URL, a protocol-relative URL, or an HTTP URL
+no longer advance the pipeline prematurely.
