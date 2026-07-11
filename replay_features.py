@@ -15,6 +15,11 @@ from typing import BinaryIO
 
 import numpy as np
 
+try:
+    import rosu_pp_py as rosu
+except ImportError:  # The legacy model remains deployable without the optional calculator.
+    rosu = None
+
 EVENT_SEQUENCE_LENGTH = 1024
 
 ACTION_WINDOW_COUNT = 6
@@ -407,3 +412,672 @@ def build_replay_summary(parsed_replay: dict) -> np.ndarray:
     summary_dictionary = {'replay_valid': 1.0, 'duration_seconds': duration, 'event_count_log': math.log1p(len(events)), 'events_per_second': len(events) / duration, 'total_distance_log': math.log1p(total_distance), 'distance_per_second_log': math.log1p(total_distance / duration), 'path_efficiency': path_efficiency, 'speed_mean_log': math.log1p(max(safe_mean(speed), 0.0)), 'speed_std_log': math.log1p(max(safe_std(speed), 0.0)), 'speed_q50_log': math.log1p(max(safe_quantile(speed, 0.5), 0.0)), 'speed_q90_log': math.log1p(max(safe_quantile(speed, 0.9), 0.0)), 'speed_q99_log': math.log1p(max(safe_quantile(speed, 0.99), 0.0)), 'speed_max_log': math.log1p(max(float(np.max(speed)), 0.0)), 'acceleration_mean_log': math.log1p(max(safe_mean(np.abs(acceleration)), 0.0)), 'acceleration_q90_log': math.log1p(max(safe_quantile(np.abs(acceleration), 0.9), 0.0)), 'acceleration_q99_log': math.log1p(max(safe_quantile(np.abs(acceleration), 0.99), 0.0)), 'jerk_mean_log': math.log1p(max(safe_mean(np.abs(jerk)), 0.0)), 'jerk_q90_log': math.log1p(max(safe_quantile(np.abs(jerk), 0.9), 0.0)), 'jerk_q99_log': math.log1p(max(safe_quantile(np.abs(jerk), 0.99), 0.0)), 'absolute_turn_mean': safe_mean(np.abs(turn_rate)), 'absolute_turn_q90': safe_quantile(np.abs(turn_rate), 0.9), 'left_down_fraction': float(left_down.mean()), 'right_down_fraction': float(right_down.mean()), 'both_down_fraction': float(both_down.mean()), 'any_down_fraction': float(any_down.mean()), 'left_press_count_log': math.log1p(int(left_press_mask.sum())), 'right_press_count_log': math.log1p(int(right_press_mask.sum())), 'total_press_count_log': math.log1p(len(press_events)), 'presses_per_second': len(press_events) / duration, 'alternation_fraction': alternation_fraction, 'press_interval_mean': safe_mean(press_intervals), 'press_interval_std': safe_std(press_intervals), 'press_interval_q10': safe_quantile(press_intervals, 0.1), 'press_interval_q50': safe_quantile(press_intervals, 0.5), 'press_interval_q90': safe_quantile(press_intervals, 0.9), 'hold_duration_mean': safe_mean(hold_durations), 'hold_duration_std': safe_std(hold_durations), 'hold_duration_q50': safe_quantile(hold_durations, 0.5), 'hold_duration_q90': safe_quantile(hold_durations, 0.9), 'cursor_x_std': float(np.std(x)), 'cursor_y_std': float(np.std(y)), 'cursor_coverage_fraction': coverage_fraction, 'count_300_fraction': header['count_300'] / safe_total_hits, 'count_100_fraction': header['count_100'] / safe_total_hits, 'count_50_fraction': header['count_50'] / safe_total_hits, 'miss_fraction': header['count_miss'] / safe_total_hits, 'score_log': math.log1p(max(header['score'], 0)), 'max_combo_log': math.log1p(max(header['max_combo'], 0)), 'combo_to_hits_ratio': header['max_combo'] / safe_total_hits, 'total_hits_log': math.log1p(total_hits), 'perfect': float(header['perfect']), 'mode': float(header['mode']), 'game_version_scaled': header['game_version'] / 100000000.0}
     summary = np.asarray([summary_dictionary[name] for name in REPLAY_SUMMARY_NAMES], dtype=np.float32)
     return np.nan_to_num(summary, nan=0.0, posinf=1000000.0, neginf=-1000000.0).astype(np.float32)
+
+def calculate_local_score_pp(
+    beatmap_content: str | bytes | None,
+    header: dict,
+    mods: list[str] | tuple[str, ...] | set[str],
+) -> float | None:
+    """Calculate stable osu!standard PP directly from a map and replay header.
+
+    This is preferable to profile PP (which leaks rank) and more complete than
+    public-score matching because it also works for a replay that is no longer
+    exposed as a public score.  Public API PP remains a validation/fallback.
+    """
+    if rosu is None or not beatmap_content:
+        return None
+    try:
+        content = (
+            beatmap_content.decode("utf-8", errors="replace")
+            if isinstance(beatmap_content, bytes)
+            else str(beatmap_content)
+        )
+        beatmap = rosu.Beatmap(content=content)
+        if beatmap.is_suspicious():
+            return None
+        normalized_mods = [str(token).upper() for token in mods]
+        if "NC" in normalized_mods:
+            normalized_mods = [token for token in normalized_mods if token != "DT"]
+        if "PF" in normalized_mods:
+            normalized_mods = [token for token in normalized_mods if token != "SD"]
+        performance = rosu.Performance(
+            mods=normalized_mods,
+            lazer=False,
+            combo=max(0, int(header.get("max_combo", 0) or 0)),
+            n300=max(0, int(header.get("count_300", 0) or 0)),
+            n100=max(0, int(header.get("count_100", 0) or 0)),
+            n50=max(0, int(header.get("count_50", 0) or 0)),
+            misses=max(0, int(header.get("count_miss", 0) or 0)),
+            legacy_total_score=max(0, int(header.get("score", 0) or 0)),
+        )
+        attributes = performance.calculate(beatmap)
+        value = float(attributes.pp)
+        return value if math.isfinite(value) and value >= 0.0 else None
+    except Exception:
+        return None
+
+
+# ============================================================
+# V2 map-aware / score-aware static features
+# ============================================================
+
+# The legacy 19 + 53 features remain unchanged above so an existing model.onnx
+# continues to work.  The v2 trainer and serving bundle use this additional,
+# deterministic feature vector.  Everything here is derived from the replay,
+# beatmap, and the play's own public score metadata.  No player identity or
+# profile-total pp is included.
+
+MODEL_MOD_TOKENS_V2 = [
+    "NF", "EZ", "HD", "HR", "SD", "DT", "HT", "NC", "FL", "SO", "PF"
+]
+
+MAP_AWARE_FEATURE_NAMES = [
+    "beatmap_available",
+    "map_ar_base",
+    "map_od_base",
+    "map_cs_base",
+    "map_hp_base",
+    "map_ar",
+    "map_od",
+    "map_cs",
+    "map_hp",
+    "map_ar_preempt_ms",
+    "map_od_hit_window_300_ms",
+    "map_circle_radius",
+    "map_bpm_log",
+    "map_slider_multiplier",
+    "map_object_count_log",
+    "map_circle_fraction",
+    "map_slider_fraction",
+    "map_spinner_fraction",
+    "map_objects_per_second",
+    "map_interval_mean",
+    "map_interval_std",
+    "map_interval_q10",
+    "map_interval_q50",
+    "map_interval_q90",
+    "map_stream_fraction_125ms",
+    "map_stream_fraction_100ms",
+    "map_stream_fraction_80ms",
+    "map_jump_mean_log",
+    "map_jump_std_log",
+    "map_jump_q50_log",
+    "map_jump_q90_log",
+    "map_jump_q99_log",
+    "map_angle_mean",
+    "map_angle_std",
+    "map_angle_q10",
+    "map_angle_q50",
+    "map_angle_q90",
+    "map_density_star_interaction",
+    "press_object_ratio",
+    "timing_match_fraction",
+    "timing_offset_ms",
+    "timing_residual_mean_ms",
+    "timing_residual_abs_mean_ms",
+    "timing_residual_std_ms",
+    "timing_residual_q50_abs_ms",
+    "timing_residual_q90_abs_ms",
+    "timing_residual_q99_abs_ms",
+    "timing_ur_proxy_log",
+    "timing_early_fraction",
+    "timing_late_fraction",
+    "aim_match_fraction",
+    "aim_error_mean_log",
+    "aim_error_q50_log",
+    "aim_error_q90_log",
+    "aim_error_q99_log",
+    "aim_error_radius_mean",
+    "aim_error_radius_q90",
+    "aim_inside_circle_fraction",
+    "aim_bias_x",
+    "aim_bias_y",
+    "cursor_speed_at_object_q50_log",
+    "cursor_speed_at_object_q90_log",
+    "cursor_speed_at_object_q99_log",
+    "rhythm_interval_log_ratio_mean",
+    "rhythm_interval_log_ratio_std",
+    "rhythm_interval_corr",
+    "object_cursor_path_ratio_log",
+]
+
+SCORE_CONTEXT_FEATURE_NAMES = [
+    "score_pp_available",
+    "score_pp_log",
+    "score_pp_per_star",
+    "score_pp_per_hit_log",
+    "score_pp_accuracy_interaction",
+    "score_match_quality",
+    "map_ranked_status",
+    "map_max_combo_log",
+    "map_drain_seconds_log",
+]
+
+STATIC_FEATURE_NAMES_V2 = (
+    [
+        "star",
+        "map_accuracy_fraction",
+        "accuracy_gap_fraction",
+        "log_length_seconds",
+        "star_squared",
+        "star_times_accuracy",
+        "star_times_accuracy_squared",
+        "log_accuracy_gap",
+    ]
+    + [f"mod_{token}" for token in MODEL_MOD_TOKENS_V2]
+    + [f"replay_{name}" for name in REPLAY_SUMMARY_NAMES]
+    + MAP_AWARE_FEATURE_NAMES
+    + SCORE_CONTEXT_FEATURE_NAMES
+)
+
+
+def parse_osu_beatmap(text: str | bytes | None) -> dict:
+    """Parse the subset of a .osu file needed for map-aware replay features.
+
+    The parser is deliberately dependency-free and tolerant.  Hit objects are
+    returned as an ``N x 4`` float array with columns ``time_seconds, x, y,
+    type_mask``.  Timing-point BPM is based only on uninherited positive beat
+    lengths.
+    """
+    if text is None:
+        return {
+            "available": False,
+            "difficulty": {},
+            "general": {},
+            "objects": np.zeros((0, 4), dtype=np.float64),
+            "bpms": np.zeros(0, dtype=np.float64),
+        }
+    if isinstance(text, bytes):
+        decoded = text.decode("utf-8-sig", errors="replace")
+    else:
+        decoded = str(text)
+
+    section = ""
+    difficulty: dict[str, float] = {}
+    general: dict[str, str] = {}
+    objects: list[tuple[float, float, float, float]] = []
+    bpms: list[float] = []
+
+    for raw_line in decoded.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("//"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+
+        if section in {"difficulty", "general"} and ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if section == "difficulty":
+                try:
+                    difficulty[key] = float(value)
+                except ValueError:
+                    pass
+            else:
+                general[key] = value
+            continue
+
+        if section == "timingpoints":
+            fields = line.split(",")
+            if len(fields) >= 2:
+                try:
+                    beat_length = float(fields[1])
+                    uninherited = int(fields[6]) if len(fields) > 6 else 1
+                except (TypeError, ValueError):
+                    continue
+                if uninherited == 1 and beat_length > 0:
+                    bpm = 60_000.0 / beat_length
+                    if np.isfinite(bpm) and 20.0 <= bpm <= 1000.0:
+                        bpms.append(float(bpm))
+            continue
+
+        if section == "hitobjects":
+            fields = line.split(",")
+            if len(fields) < 5:
+                continue
+            try:
+                x = float(fields[0])
+                y = float(fields[1])
+                time_seconds = float(fields[2]) / 1000.0
+                type_mask = float(int(fields[3]))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if all(np.isfinite(value) for value in (x, y, time_seconds)):
+                objects.append((time_seconds, x, y, type_mask))
+
+    object_array = np.asarray(objects, dtype=np.float64)
+    if object_array.size == 0:
+        object_array = np.zeros((0, 4), dtype=np.float64)
+    else:
+        object_array = object_array[np.argsort(object_array[:, 0], kind="stable")]
+
+    return {
+        "available": bool(len(object_array)),
+        "difficulty": difficulty,
+        "general": general,
+        "objects": object_array,
+        "bpms": np.asarray(bpms, dtype=np.float64),
+    }
+
+
+def _speed_rate_from_mods(mods: list[str] | tuple[str, ...] | set[str]) -> float:
+    enabled = {str(token).upper() for token in mods}
+    if "DT" in enabled or "NC" in enabled:
+        return 1.5
+    if "HT" in enabled:
+        return 0.75
+    return 1.0
+
+
+def _effective_difficulty_values(
+    ar: float,
+    od: float,
+    cs: float,
+    hp: float,
+    mods: list[str] | tuple[str, ...] | set[str],
+) -> dict[str, float]:
+    """Apply stable's EZ/HR and clock-rate transforms to map difficulty."""
+    enabled = {str(token).upper() for token in mods}
+    multiplier = 0.5 if "EZ" in enabled else (1.4 if "HR" in enabled else 1.0)
+    ar_mod = min(10.0, max(0.0, ar * multiplier))
+    od_mod = min(10.0, max(0.0, od * multiplier))
+    hp_mod = min(10.0, max(0.0, hp * multiplier))
+    cs_multiplier = 0.5 if "EZ" in enabled else (1.3 if "HR" in enabled else 1.0)
+    cs_mod = min(10.0, max(0.0, cs * cs_multiplier))
+    rate = _speed_rate_from_mods(enabled)
+
+    ar_preempt = (1800.0 - 120.0 * ar_mod) if ar_mod < 5.0 else (1950.0 - 150.0 * ar_mod)
+    ar_preempt /= rate
+    ar_effective = (
+        (1800.0 - ar_preempt) / 120.0
+        if ar_preempt > 1200.0
+        else 5.0 + (1200.0 - ar_preempt) / 150.0
+    )
+    od_window_300 = (79.5 - 6.0 * od_mod) / rate
+    od_effective = (79.5 - od_window_300) / 6.0
+    circle_radius = max(8.0, 54.4 - 4.48 * cs_mod)
+    return {
+        "ar": float(ar_effective),
+        "od": float(od_effective),
+        "cs": float(cs_mod),
+        "hp": float(hp_mod),
+        "ar_preempt_ms": float(ar_preempt),
+        "od_window_300_ms": float(od_window_300),
+        "circle_radius": float(circle_radius),
+    }
+
+
+def _extract_press_times(events: np.ndarray) -> np.ndarray:
+    events = collapse_duplicate_timestamps(np.asarray(events, dtype=np.float64))
+    if len(events) < 2:
+        return np.zeros(0, dtype=np.float64)
+    times = events[:, 0] - events[0, 0]
+    left, right = key_states_from_masks(events[:, 3].astype(np.int64))
+    left_press = np.diff(left.astype(np.int8), prepend=0) == 1
+    right_press = np.diff(right.astype(np.int8), prepend=0) == 1
+    press_times = np.concatenate((times[left_press], times[right_press]))
+    if not len(press_times):
+        return np.zeros(0, dtype=np.float64)
+    return np.sort(press_times.astype(np.float64))
+
+
+def _nearest_values(sorted_values: np.ndarray, query: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return nearest value and source index for each query."""
+    sorted_values = np.asarray(sorted_values, dtype=np.float64)
+    query = np.asarray(query, dtype=np.float64)
+    if not len(sorted_values) or not len(query):
+        return np.zeros(len(query), dtype=np.float64), np.full(len(query), -1, dtype=np.int64)
+    right = np.searchsorted(sorted_values, query, side="left")
+    left = np.clip(right - 1, 0, len(sorted_values) - 1)
+    right = np.clip(right, 0, len(sorted_values) - 1)
+    choose_right = np.abs(sorted_values[right] - query) < np.abs(sorted_values[left] - query)
+    indices = np.where(choose_right, right, left)
+    return sorted_values[indices], indices.astype(np.int64)
+
+
+def _monotonic_press_alignment(
+    aligned_object_times: np.ndarray,
+    press_times: np.ndarray,
+    tolerance: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Uniquely align objects to presses in temporal order.
+
+    Standard replays do not carry hit-object IDs.  A monotonic one-to-one
+    assignment is a safer proxy than independently reusing the same key press
+    for several nearby objects.
+    """
+    aligned_object_times = np.asarray(aligned_object_times, dtype=np.float64)
+    press_times = np.asarray(press_times, dtype=np.float64)
+    matched_times = np.full(len(aligned_object_times), np.nan, dtype=np.float64)
+    matched_indices = np.full(len(aligned_object_times), -1, dtype=np.int64)
+    minimum_index = 0
+    for object_index, object_time in enumerate(aligned_object_times):
+        if minimum_index >= len(press_times):
+            break
+        insertion = int(np.searchsorted(press_times, object_time, side="left"))
+        candidates = {
+            max(minimum_index, insertion - 2),
+            max(minimum_index, insertion - 1),
+            max(minimum_index, insertion),
+            max(minimum_index, insertion + 1),
+        }
+        candidates = [index for index in candidates if minimum_index <= index < len(press_times)]
+        if not candidates:
+            continue
+        best = min(candidates, key=lambda index: abs(press_times[index] - object_time))
+        if abs(press_times[best] - object_time) <= tolerance:
+            matched_times[object_index] = press_times[best]
+            matched_indices[object_index] = best
+            minimum_index = best + 1
+    return matched_times, matched_indices
+
+
+def _safe_corr(left: np.ndarray, right: np.ndarray) -> float:
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    mask = np.isfinite(left) & np.isfinite(right)
+    left = left[mask]
+    right = right[mask]
+    if len(left) < 3 or np.std(left) < 1e-12 or np.std(right) < 1e-12:
+        return 0.0
+    return float(np.corrcoef(left, right)[0, 1])
+
+
+def build_map_aware_features(
+    parsed_replay: dict,
+    beatmap: dict | None,
+    *,
+    mods: list[str] | tuple[str, ...] | set[str],
+    star: float,
+    length_seconds: float,
+) -> np.ndarray:
+    """Build map/replay alignment features, including UR and aim-error proxies.
+
+    Exact hit errors are not stored directly in .osr.  The timing features are
+    therefore explicitly *proxies*: key-downs are monotonically aligned to hit
+    object start times, then robust residual statistics are computed.  This is
+    materially more informative than header accuracy alone while remaining
+    reproducible at serving time.
+    """
+    values = {name: 0.0 for name in MAP_AWARE_FEATURE_NAMES}
+    if not beatmap or not beatmap.get("available"):
+        return np.asarray([values[name] for name in MAP_AWARE_FEATURE_NAMES], dtype=np.float32)
+
+    objects = np.asarray(beatmap.get("objects"), dtype=np.float64)
+    if objects.ndim != 2 or objects.shape[1] < 4 or len(objects) < 2:
+        return np.asarray([values[name] for name in MAP_AWARE_FEATURE_NAMES], dtype=np.float32)
+
+    rate = _speed_rate_from_mods(mods)
+    object_times = objects[:, 0] / rate
+    object_times = object_times - object_times[0]
+    object_x = objects[:, 1]
+    object_y = objects[:, 2]
+    object_type = objects[:, 3].astype(np.int64)
+    duration = max(float(length_seconds), float(object_times[-1]), 1e-3)
+
+    difficulty = beatmap.get("difficulty") or {}
+    ar_base = float(difficulty.get("ApproachRate", difficulty.get("OverallDifficulty", 0.0)) or 0.0)
+    od_base = float(difficulty.get("OverallDifficulty", 0.0) or 0.0)
+    cs_base = float(difficulty.get("CircleSize", 0.0) or 0.0)
+    hp_base = float(difficulty.get("HPDrainRate", 0.0) or 0.0)
+    effective = _effective_difficulty_values(ar_base, od_base, cs_base, hp_base, mods)
+    ar = effective["ar"]
+    od = effective["od"]
+    cs = effective["cs"]
+    hp = effective["hp"]
+    slider_multiplier = float(difficulty.get("SliderMultiplier", 0.0) or 0.0)
+    bpms = np.asarray(beatmap.get("bpms", []), dtype=np.float64) * rate
+    bpm = safe_quantile(bpms, 0.5) if len(bpms) else 0.0
+
+    intervals = np.diff(object_times)
+    positive_intervals = intervals[intervals > 1e-5]
+    jumps = np.hypot(np.diff(object_x), np.diff(object_y))
+    vectors = np.column_stack((np.diff(object_x), np.diff(object_y)))
+    if len(vectors) >= 2:
+        v1 = vectors[:-1]
+        v2 = vectors[1:]
+        denom = np.linalg.norm(v1, axis=1) * np.linalg.norm(v2, axis=1)
+        cosines = np.sum(v1 * v2, axis=1) / np.maximum(denom, 1e-6)
+        angles = np.arccos(np.clip(cosines, -1.0, 1.0)) / math.pi
+    else:
+        angles = np.zeros(0, dtype=np.float64)
+
+    circles = (object_type & 1) != 0
+    sliders = (object_type & 2) != 0
+    spinners = (object_type & 8) != 0
+
+    values.update({
+        "beatmap_available": 1.0,
+        "map_ar_base": ar_base,
+        "map_od_base": od_base,
+        "map_cs_base": cs_base,
+        "map_hp_base": hp_base,
+        "map_ar": ar,
+        "map_od": od,
+        "map_cs": cs,
+        "map_hp": hp,
+        "map_ar_preempt_ms": effective["ar_preempt_ms"],
+        "map_od_hit_window_300_ms": effective["od_window_300_ms"],
+        "map_circle_radius": effective["circle_radius"],
+        "map_bpm_log": math.log1p(max(bpm, 0.0)),
+        "map_slider_multiplier": slider_multiplier,
+        "map_object_count_log": math.log1p(len(objects)),
+        "map_circle_fraction": float(circles.mean()),
+        "map_slider_fraction": float(sliders.mean()),
+        "map_spinner_fraction": float(spinners.mean()),
+        "map_objects_per_second": len(objects) / duration,
+        "map_interval_mean": safe_mean(positive_intervals),
+        "map_interval_std": safe_std(positive_intervals),
+        "map_interval_q10": safe_quantile(positive_intervals, 0.10),
+        "map_interval_q50": safe_quantile(positive_intervals, 0.50),
+        "map_interval_q90": safe_quantile(positive_intervals, 0.90),
+        "map_stream_fraction_125ms": float(np.mean(positive_intervals <= 0.125)) if len(positive_intervals) else 0.0,
+        "map_stream_fraction_100ms": float(np.mean(positive_intervals <= 0.100)) if len(positive_intervals) else 0.0,
+        "map_stream_fraction_80ms": float(np.mean(positive_intervals <= 0.080)) if len(positive_intervals) else 0.0,
+        "map_jump_mean_log": math.log1p(max(safe_mean(jumps), 0.0)),
+        "map_jump_std_log": math.log1p(max(safe_std(jumps), 0.0)),
+        "map_jump_q50_log": math.log1p(max(safe_quantile(jumps, 0.50), 0.0)),
+        "map_jump_q90_log": math.log1p(max(safe_quantile(jumps, 0.90), 0.0)),
+        "map_jump_q99_log": math.log1p(max(safe_quantile(jumps, 0.99), 0.0)),
+        "map_angle_mean": safe_mean(angles),
+        "map_angle_std": safe_std(angles),
+        "map_angle_q10": safe_quantile(angles, 0.10),
+        "map_angle_q50": safe_quantile(angles, 0.50),
+        "map_angle_q90": safe_quantile(angles, 0.90),
+        "map_density_star_interaction": (len(objects) / duration) * max(float(star), 0.0),
+    })
+
+    events = collapse_duplicate_timestamps(np.asarray(parsed_replay.get("events", []), dtype=np.float64))
+    press_times = _extract_press_times(events)
+    values["press_object_ratio"] = len(press_times) / max(len(objects), 1)
+    if len(press_times) < 2 or len(events) < 2:
+        return np.nan_to_num(
+            np.asarray([values[name] for name in MAP_AWARE_FEATURE_NAMES], dtype=np.float32),
+            nan=0.0, posinf=1e6, neginf=-1e6,
+        )
+
+    # Align the first key press to the first object, then refine by the median
+    # nearest-neighbour residual.  Two refinement rounds are enough for clock
+    # offsets while avoiding expensive dynamic programming on long maps.
+    aligned_object_times = object_times + press_times[0]
+    total_shift = 0.0
+    for _ in range(2):
+        nearest, _ = _nearest_values(press_times, aligned_object_times)
+        residual = nearest - aligned_object_times
+        good = np.abs(residual) <= 0.250
+        if not np.any(good):
+            break
+        shift = float(np.median(residual[good]))
+        aligned_object_times += shift
+        total_shift += shift
+
+    hit_window = max(0.060, min(0.200, (199.5 - 10.0 * od) / 1000.0))
+    nearest_press, nearest_indices = _monotonic_press_alignment(
+        aligned_object_times,
+        press_times,
+        tolerance=max(hit_window * 2.25, 0.150),
+    )
+    timing_residual = nearest_press - aligned_object_times
+    matched = np.isfinite(timing_residual) & (np.abs(timing_residual) <= max(hit_window * 1.8, 0.120))
+    matched_residual = timing_residual[matched]
+    matched_residual_ms = matched_residual * 1000.0
+    centered_ms = matched_residual_ms - safe_quantile(matched_residual_ms, 0.5)
+    abs_centered_ms = np.abs(centered_ms)
+
+    values.update({
+        "timing_match_fraction": float(matched.mean()),
+        "timing_offset_ms": total_shift * 1000.0,
+        "timing_residual_mean_ms": safe_mean(centered_ms),
+        "timing_residual_abs_mean_ms": safe_mean(abs_centered_ms),
+        "timing_residual_std_ms": safe_std(centered_ms),
+        "timing_residual_q50_abs_ms": safe_quantile(abs_centered_ms, 0.50),
+        "timing_residual_q90_abs_ms": safe_quantile(abs_centered_ms, 0.90),
+        "timing_residual_q99_abs_ms": safe_quantile(abs_centered_ms, 0.99),
+        "timing_ur_proxy_log": math.log1p(max(10.0 * safe_std(centered_ms), 0.0)),
+        "timing_early_fraction": float(np.mean(centered_ms < -15.0)) if len(centered_ms) else 0.0,
+        "timing_late_fraction": float(np.mean(centered_ms > 15.0)) if len(centered_ms) else 0.0,
+    })
+
+    # Cursor position and speed at each aligned object time.
+    event_times = events[:, 0] - events[0, 0]
+    x = events[:, 1]
+    y = events[:, 2]
+    event_dt = np.diff(event_times, prepend=event_times[0])
+    positive_dt = event_dt[event_dt > 1e-5]
+    event_dt[0] = float(np.median(positive_dt)) if len(positive_dt) else 1.0 / 60.0
+    event_dt = np.clip(event_dt, 1e-4, 1.0)
+    speed = np.hypot(np.diff(x, prepend=x[0]), np.diff(y, prepend=y[0])) / event_dt
+    replay_object_times = np.where(matched, nearest_press, aligned_object_times)
+    replay_object_times = np.clip(replay_object_times, event_times[0], event_times[-1])
+    cursor_x = np.interp(replay_object_times, event_times, x)
+    cursor_y = np.interp(replay_object_times, event_times, y)
+    cursor_speed = np.interp(replay_object_times, event_times, speed)
+    dx = cursor_x - object_x
+    dy = cursor_y - object_y
+    aim_error = np.hypot(dx, dy)
+    circle_radius = effective["circle_radius"]
+    aim_radius = aim_error / circle_radius
+    aim_valid = matched & (~spinners) & np.isfinite(aim_error)
+    aim_error_valid = aim_error[aim_valid]
+    aim_radius_valid = aim_radius[aim_valid]
+    speed_valid = cursor_speed[aim_valid]
+    dx_valid = dx[aim_valid]
+    dy_valid = dy[aim_valid]
+
+    values.update({
+        "aim_match_fraction": float(aim_valid.mean()),
+        "aim_error_mean_log": math.log1p(max(safe_mean(aim_error_valid), 0.0)),
+        "aim_error_q50_log": math.log1p(max(safe_quantile(aim_error_valid, 0.50), 0.0)),
+        "aim_error_q90_log": math.log1p(max(safe_quantile(aim_error_valid, 0.90), 0.0)),
+        "aim_error_q99_log": math.log1p(max(safe_quantile(aim_error_valid, 0.99), 0.0)),
+        "aim_error_radius_mean": safe_mean(aim_radius_valid),
+        "aim_error_radius_q90": safe_quantile(aim_radius_valid, 0.90),
+        "aim_inside_circle_fraction": float(np.mean(aim_radius_valid <= 1.0)) if len(aim_radius_valid) else 0.0,
+        "aim_bias_x": safe_mean(dx_valid) / 512.0,
+        "aim_bias_y": safe_mean(dy_valid) / 384.0,
+        "cursor_speed_at_object_q50_log": math.log1p(max(safe_quantile(speed_valid, 0.50), 0.0)),
+        "cursor_speed_at_object_q90_log": math.log1p(max(safe_quantile(speed_valid, 0.90), 0.0)),
+        "cursor_speed_at_object_q99_log": math.log1p(max(safe_quantile(speed_valid, 0.99), 0.0)),
+    })
+
+    if len(press_times) >= 3 and len(positive_intervals) >= 2:
+        press_intervals = np.diff(press_times)
+        sample_count = min(len(press_intervals), len(positive_intervals))
+        press_sample = press_intervals[:sample_count]
+        object_sample = positive_intervals[:sample_count]
+        log_ratio = np.log(np.maximum(press_sample, 1e-4) / np.maximum(object_sample, 1e-4))
+        values["rhythm_interval_log_ratio_mean"] = safe_mean(log_ratio)
+        values["rhythm_interval_log_ratio_std"] = safe_std(log_ratio)
+        values["rhythm_interval_corr"] = _safe_corr(press_sample, object_sample)
+
+    replay_path_length = float(np.hypot(np.diff(x), np.diff(y)).sum())
+    object_path_length = float(jumps.sum())
+    values["object_cursor_path_ratio_log"] = math.log1p(replay_path_length / max(object_path_length, 1e-6))
+
+    return np.nan_to_num(
+        np.asarray([values[name] for name in MAP_AWARE_FEATURE_NAMES], dtype=np.float32),
+        nan=0.0, posinf=1e6, neginf=-1e6,
+    )
+
+
+def build_static_features_v2(
+    parsed_replay: dict,
+    *,
+    star: float,
+    accuracy: float,
+    length_seconds: float,
+    model_mods: list[str],
+    beatmap: dict | None = None,
+    score_pp: float | None = None,
+    score_match_quality: float = 0.0,
+    map_ranked_status: float | int | None = None,
+    map_max_combo: float | int | None = None,
+    map_drain_seconds: float | int | None = None,
+) -> np.ndarray:
+    accuracy = float(np.clip(accuracy, 0.0, 1.0))
+    star = max(float(star), 0.0)
+    length_seconds = max(float(length_seconds), 0.0)
+    gap = 1.0 - accuracy
+    enabled = {str(token).upper() for token in model_mods}
+
+    base = [
+        star,
+        accuracy,
+        gap,
+        math.log1p(length_seconds),
+        star ** 2,
+        star * accuracy,
+        star * accuracy ** 2,
+        math.log1p(gap * 100.0),
+    ]
+    base.extend(1.0 if token in enabled else 0.0 for token in MODEL_MOD_TOKENS_V2)
+
+    replay_summary = build_replay_summary(parsed_replay).astype(np.float32)
+    map_features = build_map_aware_features(
+        parsed_replay,
+        beatmap,
+        mods=model_mods,
+        star=star,
+        length_seconds=length_seconds,
+    )
+
+    header = parsed_replay.get("header") or {}
+    total_hits = max(
+        1,
+        int(header.get("count_300", 0))
+        + int(header.get("count_100", 0))
+        + int(header.get("count_50", 0))
+        + int(header.get("count_miss", 0)),
+    )
+    pp_value = float(score_pp) if score_pp is not None and np.isfinite(score_pp) and score_pp >= 0 else 0.0
+    pp_available = 1.0 if pp_value > 0 else 0.0
+    score_context = np.asarray(
+        [
+            pp_available,
+            math.log1p(pp_value),
+            pp_value / max(star, 0.5) / 100.0,
+            math.log1p(pp_value / total_hits),
+            math.log1p(pp_value) * accuracy,
+            float(np.clip(score_match_quality, 0.0, 1.0)),
+            float(map_ranked_status or 0.0),
+            math.log1p(max(float(map_max_combo or 0.0), 0.0)),
+            math.log1p(max(float(map_drain_seconds or 0.0), 0.0)),
+        ],
+        dtype=np.float32,
+    )
+
+    static = np.concatenate(
+        (
+            np.asarray(base, dtype=np.float32),
+            replay_summary,
+            map_features,
+            score_context,
+        )
+    )
+    if len(static) != len(STATIC_FEATURE_NAMES_V2):
+        raise RuntimeError(
+            f"Static v2 feature mismatch: {len(static)} != {len(STATIC_FEATURE_NAMES_V2)}"
+        )
+    return np.nan_to_num(static, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)

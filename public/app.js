@@ -1,21 +1,27 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
+const DEFAULT_RANK_POPULATION = 5_500_000;
+const SOFT_LOG_SOFTNESS = 2_500;
+const SLIDER_STEPS = 10_000;
+
+let rankPopulation = DEFAULT_RANK_POPULATION;
+let selectedFile = null;
+let activeRun = 0;
+let galleryOffset = 0;
+let galleryLoaded = false;
+let galleryItems = [];
+let galleryFilter = "all";
+let dailyPayload = null;
+let dailyState = null;
+let infiniteRound = null;
+
 const replayInput = $("#replayInput");
 const dropzone = $("#dropzone");
 const runButton = $("#runButton");
 const errorBox = $("#errorBox");
 const results = $("#results");
 const renderStatus = $("#renderStatus");
-
-let selectedFile = null;
-let activeRun = 0;
-let galleryOffset = 0;
-let galleryLoaded = false;
-let dailyPayload = null;
-let dailyState = null;
-let infiniteRound = null;
-let rankPopulation = 5_500_000;
 
 const escapeHTML = (value) => String(value ?? "")
   .replaceAll("&", "&amp;")
@@ -24,68 +30,93 @@ const escapeHTML = (value) => String(value ?? "")
   .replaceAll('"', "&quot;")
   .replaceAll("'", "&#039;");
 
-const storage = {
-  get(key) {
-    try { return localStorage.getItem(key); } catch { return null; }
-  },
-  set(key, value) {
-    try { localStorage.setItem(key, value); } catch { /* in-app browser storage may be disabled */ }
-  },
-};
-
-function makeSessionID() {
-  const existing = storage.get("osu-rankguess-session-v1");
-  if (existing) return existing;
-  const value = globalThis.crypto?.randomUUID?.()
-    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-  storage.set("osu-rankguess-session-v1", value);
-  return value;
-}
-const sessionID = makeSessionID();
-
-const formatBytes = (bytes) => {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
-};
-
-const formatRank = (value) => value ? `#${Number(value).toLocaleString()}` : "—";
+const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const formatRank = (value) => Number(value) > 0 ? `#${Math.round(Number(value)).toLocaleString()}` : "—";
+const formatBytes = (bytes) => bytes < 1024
+  ? `${bytes} B`
+  : bytes < 1024 * 1024
+    ? `${(bytes / 1024).toFixed(1)} KB`
+    : `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 const formatTopPercent = (value) => {
-  const number = Number(value || 0);
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
   if (number < 0.001) return `${number.toExponential(2)}%`;
   if (number < 0.1) return `${number.toFixed(3)}%`;
   if (number < 1) return `${number.toFixed(2)}%`;
   return `${number.toFixed(1)}%`;
 };
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const smoothBehavior = matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
 
-const apiError = async (response) => {
+const memoryStorage = new Map();
+
+function storageGet(key) {
+  try {
+    return globalThis.localStorage?.getItem(key) ?? memoryStorage.get(key) ?? null;
+  } catch {
+    return memoryStorage.get(key) ?? null;
+  }
+}
+
+function storageSet(key, value) {
+  memoryStorage.set(key, value);
+  try { globalThis.localStorage?.setItem(key, value); } catch {}
+}
+
+function getVisitorID() {
+  const key = "osu-rankguess-visitor-v1";
+  let value = storageGet(key);
+  if (!value) {
+    value = globalThis.crypto?.randomUUID?.()
+      || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    storageSet(key, value);
+  }
+  return value;
+}
+const visitorID = getVisitorID();
+
+async function copyText(text) {
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand("copy");
+    area.remove();
+    return copied;
+  }
+}
+
+function softPositionToRank(position, maximum = rankPopulation) {
+  const unit = clamp(Number(position) / SLIDER_STEPS, 0, 1);
+  const scale = Math.log1p((maximum - 1) / SOFT_LOG_SOFTNESS);
+  return Math.round(1 + SOFT_LOG_SOFTNESS * Math.expm1(unit * scale));
+}
+
+function rankToSoftPosition(rank, maximum = rankPopulation) {
+  const clipped = clamp(Number(rank) || 1, 1, maximum);
+  const denominator = Math.log1p((maximum - 1) / SOFT_LOG_SOFTNESS);
+  const unit = Math.log1p((clipped - 1) / SOFT_LOG_SOFTNESS) / denominator;
+  return Math.round(clamp(unit, 0, 1) * SLIDER_STEPS);
+}
+
+async function apiError(response) {
   const payload = await response.json().catch(() => ({}));
   const detail = payload.detail || payload;
   return new Error(detail.message || `Request failed (${response.status})`);
-};
+}
 
-const requestJSON = async (url, options = {}) => {
-  const response = await fetch(url, { cache: "no-store", ...options });
+async function requestJSON(url, options = {}) {
+  const response = await fetch(url, options);
   if (!response.ok) throw await apiError(response);
   return response.json();
-};
-
-const sha256File = async (file) => {
-  if (!crypto?.subtle) throw new Error("This browser cannot hash replay files. Open the site in Safari, Chrome, or Firefox.");
-  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-};
-
-const isValidHttpsVideoURL = (value) => {
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" && (url.hostname === "issou.best" || url.hostname.endsWith(".issou.best"));
-  } catch {
-    return false;
-  }
-};
+}
 
 function showView(name) {
   $$(".view").forEach((view) => {
@@ -95,7 +126,7 @@ function showView(name) {
   });
   $$('[data-view-link]').forEach((link) => link.classList.toggle("active", link.dataset.viewLink === name));
   history.replaceState(null, "", `#${name}`);
-  window.scrollTo({ top: 0, behavior: "auto" });
+  window.scrollTo({ top: 0, behavior: "instant" });
   if (name === "gallery" && !galleryLoaded) loadGallery(true);
   if (name === "daily" && !dailyPayload) loadDaily();
 }
@@ -138,10 +169,10 @@ function failCurrentStep(message) {
 
 function setFile(file) {
   if (!file) return;
-  if (!file.name.toLowerCase().endsWith(".osr")) return showError("Select an .osr replay file.");
+  if (!file.name.toLowerCase().endsWith(".osr")) return showError("Choose a .osr replay file.");
   if (file.size > 4_000_000) return showError("Replay exceeds the 4 MB upload limit.");
   selectedFile = file;
-  $("#dropTitle").textContent = "REPLAY SELECTED";
+  $("#dropTitle").textContent = "replay selected";
   $("#dropSubtitle").textContent = "ready to analyze";
   $("#fileName").textContent = file.name;
   $("#fileSize").textContent = formatBytes(file.size);
@@ -150,6 +181,22 @@ function setFile(file) {
   results.hidden = true;
   hideError();
   resetSteps();
+}
+
+replayInput.addEventListener("change", () => setFile(replayInput.files?.[0]));
+["dragenter", "dragover"].forEach((name) => dropzone.addEventListener(name, (event) => {
+  event.preventDefault();
+  dropzone.classList.add("dragging");
+}));
+["dragleave", "drop"].forEach((name) => dropzone.addEventListener(name, (event) => {
+  event.preventDefault();
+  dropzone.classList.remove("dragging");
+}));
+dropzone.addEventListener("drop", (event) => setFile(event.dataTransfer?.files?.[0]));
+
+async function sha256File(file) {
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 async function cacheReplay(file, replayHash) {
@@ -169,234 +216,238 @@ async function createRender(file, replayHash, username) {
 
 async function waitForRender(renderID, runID) {
   for (let attempt = 0; attempt < 300; attempt += 1) {
-    if (runID !== activeRun) throw new Error("Cancelled");
+    if (runID !== activeRun) throw new Error("Analysis cancelled.");
     const payload = await requestJSON(`/api/ordr/status?renderID=${encodeURIComponent(renderID)}`);
     renderStatus.hidden = false;
     renderStatus.textContent = `o!rdr #${renderID} · ${payload.progress || "working"}`;
-    if (payload.failed) throw new Error(`o!rdr failed with code ${payload.errorCode}`);
+    if (payload.failed) throw new Error(payload.message || "o!rdr render failed.");
     if (payload.ready) return payload;
     await sleep(3000);
   }
-  throw new Error("o!rdr did not finish within 15 minutes.");
+  throw new Error("o!rdr did not finish within fifteen minutes.");
 }
 
-async function runPrediction(body) {
+async function predictReplay(cache, render, renderID) {
   return requestJSON("/api/predict", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      replayHash: cache.replayHash,
+      cacheToken: cache.cacheToken,
+      renderID,
+      description: render.description,
+      renderMetadata: render.renderMetadata,
+      videoURL: render.videoURL,
+      publish: $("#publishToggle").checked,
+    }),
   });
 }
 
-function renderResult(data) {
-  $("#resultPlayer").textContent = data.player || "PLAYER";
-  $("#predictedRank").textContent = formatRank(data.predictedRank);
-  $("#rankContext").textContent = `${formatTopPercent(data.topPercent)} of ranked osu!standard players`;
-  $("#topPercent").textContent = formatTopPercent(data.topPercent);
-  $("#accuracyValue").textContent = `${data.accuracyPercent.toFixed(2)}%`;
-  $("#modsValue").textContent = data.mods.join("");
-  $("#confidenceLabel").textContent = data.confidence;
-  $("#starValue").textContent = `${data.beatmap.star.toFixed(2)}★`;
-  $("#eventsValue").textContent = data.eventCount.toLocaleString();
-  $("#mapTitle").textContent = `${data.beatmap.artist ? `${data.beatmap.artist} — ` : ""}${data.beatmap.title}`;
-  $("#mapMeta").textContent = `${data.beatmap.version || "Unknown difficulty"} · ${Math.round(data.beatmap.lengthSeconds)}s`;
-
-  const comparison = $("#rankComparison");
-  comparison.hidden = !data.actualRank;
-  if (data.actualRank) $("#actualRank").textContent = formatRank(data.actualRank);
-
-  const video = $("#replayVideo");
-  video.src = data.videoURL;
-  video.load();
-  $("#videoLink").href = data.videoURL;
-  $("#galleryStatus").textContent = data.gallerySaved
-    ? "Saved to the public gallery."
-    : ($("#publishToggle").checked ? "Prediction complete. Gallery save failed." : "Kept private.");
-
-  results.hidden = false;
-  results.scrollIntoView({ behavior: smoothBehavior, block: "start" });
+function animateRank(element, target) {
+  const duration = 650;
+  const start = performance.now();
+  const initial = Math.max(1, Math.round(target * 1.7));
+  const tick = (now) => {
+    const progress = clamp((now - start) / duration, 0, 1);
+    const eased = 1 - Math.pow(1 - progress, 4);
+    const value = Math.round(initial + (target - initial) * eased);
+    element.textContent = formatRank(value);
+    if (progress < 1) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
 }
 
-async function analyze() {
+function renderPrediction(payload) {
+  rankPopulation = Number(payload.rankPopulation) || rankPopulation;
+  $("#resultPlayer").textContent = payload.player || "player";
+  animateRank($("#predictedRank"), Number(payload.predictedRank));
+  $("#rankContext").textContent = `${formatTopPercent(payload.topPercent)} of ranked players · ${payload.modelVersion || "rank model"}`;
+  $("#topPercent").textContent = formatTopPercent(payload.topPercent);
+  $("#accuracyValue").textContent = `${Number(payload.accuracyPercent).toFixed(2)}%`;
+  $("#modsValue").textContent = (payload.mods || ["NM"]).join("");
+  $("#confidenceLabel").textContent = payload.confidence || "—";
+  $("#starValue").textContent = `${Number(payload.beatmap?.star || 0).toFixed(2)}★`;
+  $("#ppValue").textContent = Number(payload.scorePP) > 0 ? `${Number(payload.scorePP).toFixed(1)}pp` : "not matched";
+  $("#mapTitle").textContent = `${payload.beatmap?.artist ? `${payload.beatmap.artist} — ` : ""}${payload.beatmap?.title || "Unknown map"}`;
+  $("#mapMeta").textContent = `${payload.beatmap?.version || "Unknown difficulty"} · ${(payload.mods || ["NM"]).join("")}`;
+  $("#replayVideo").src = payload.videoURL;
+  $("#videoLink").href = payload.videoURL;
+  const comparison = $("#rankComparison");
+  comparison.hidden = !payload.actualRank;
+  if (payload.actualRank) $("#actualRank").textContent = formatRank(payload.actualRank);
+  $("#galleryStatus").textContent = payload.gallerySaved
+    ? "Saved to the public gallery."
+    : $("#publishToggle").checked
+      ? "Prediction complete. Gallery storage was not available."
+      : "Prediction complete. Not published.";
+  results.hidden = false;
+  results.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+runButton.addEventListener("click", async () => {
   if (!selectedFile) return;
   const runID = ++activeRun;
+  runButton.disabled = true;
   hideError();
   resetSteps();
   results.hidden = true;
-  runButton.disabled = true;
-  runButton.textContent = "WORKING…";
   try {
-    setStep(0, "active", "Computing hash and decoding replay");
+    setStep(0, "active", "Hashing and parsing replay");
     const replayHash = await sha256File(selectedFile);
-    const cached = await cacheReplay(selectedFile, replayHash);
-    if (runID !== activeRun) return;
-    setStep(0, "done", `${cached.eventCount.toLocaleString()} events · ${cached.player}`);
+    const cache = await cacheReplay(selectedFile, replayHash);
+    setStep(0, "done", `${cache.eventCount.toLocaleString()} replay events`);
 
-    setStep(1, "active", `Submitting as ${cached.player}`);
-    const render = await createRender(selectedFile, replayHash, cached.player);
-    if (runID !== activeRun) return;
-    setStep(1, "done", `Render #${render.renderID} accepted`);
+    setStep(1, "active", "Submitting replay render");
+    const created = await createRender(selectedFile, replayHash, cache.player);
+    setStep(1, "done", `o!rdr #${created.renderID}`);
 
-    setStep(2, "active", "Waiting in o!rdr queue");
-    const rendered = await waitForRender(render.renderID, runID);
-    if (runID !== activeRun) return;
-    setStep(2, "done", "Video is ready");
+    setStep(2, "active", "Rendering video");
+    const render = await waitForRender(created.renderID, runID);
+    setStep(2, "done", "Video ready");
 
-    setStep(3, "active", "Reading structured render metadata");
-    if (!isValidHttpsVideoURL(rendered.videoURL)) throw new Error("o!rdr has not produced a usable HTTPS video URL.");
-    setStep(3, "done", "Map metadata recovered");
-
-    setStep(4, "active", "Running ONNX ensemble");
-    const prediction = await runPrediction({
-      replayHash,
-      cacheToken: cached.cacheToken,
-      renderID: render.renderID,
-      description: rendered.description || rendered.title || "",
-      renderMetadata: rendered.renderMetadata || {},
-      videoURL: rendered.videoURL,
-      publish: $("#publishToggle").checked,
-    });
-    if (runID !== activeRun) return;
+    setStep(3, "active", "Resolving beatmap and score PP");
+    setStep(3, "done", "Metadata ready");
+    setStep(4, "active", "Running rank model");
+    const prediction = await predictReplay(cache, render, created.renderID);
     setStep(4, "done", "Prediction complete");
-    renderStatus.textContent = `o!rdr #${render.renderID} · Done`;
-    renderResult(prediction);
-    galleryLoaded = false;
+    renderPrediction(prediction);
   } catch (error) {
-    failCurrentStep(error.message || "Pipeline failed");
-    showError(error.message || "Pipeline failed");
+    failCurrentStep(error.message || "Analysis failed");
+    showError(error.message || "Analysis failed");
   } finally {
-    if (runID === activeRun) {
-      runButton.disabled = false;
-      runButton.textContent = "ANALYZE REPLAY";
-    }
+    runButton.disabled = false;
   }
-}
+});
 
-replayInput.addEventListener("change", () => setFile(replayInput.files?.[0]));
-["dragenter", "dragover"].forEach((name) => dropzone.addEventListener(name, (event) => {
-  event.preventDefault();
-  dropzone.classList.add("dragging");
-}));
-["dragleave", "drop"].forEach((name) => dropzone.addEventListener(name, (event) => {
-  event.preventDefault();
-  dropzone.classList.remove("dragging");
-}));
-dropzone.addEventListener("drop", (event) => setFile(event.dataTransfer?.files?.[0]));
-runButton.addEventListener("click", analyze);
 $("#resetButton").addEventListener("click", () => {
   activeRun += 1;
   selectedFile = null;
   replayInput.value = "";
-  results.hidden = true;
   $("#fileChip").hidden = true;
-  $("#dropTitle").textContent = "CHOOSE .OSR FILE";
-  $("#dropSubtitle").textContent = "tap here or drop a file";
-  $("#replayVideo").removeAttribute("src");
+  $("#dropTitle").textContent = "choose .osr file";
+  $("#dropSubtitle").textContent = "or drop it here";
   runButton.disabled = true;
-  hideError();
+  results.hidden = true;
   resetSteps();
-  window.scrollTo({ top: 0, behavior: smoothBehavior });
+  window.scrollTo({ top: 0, behavior: "smooth" });
 });
 
-function sliderToRank(position, population = rankPopulation) {
-  const ratio = Math.max(0, Math.min(1, Number(position) / 1000));
-  return Math.max(1, Math.min(population, Math.round(10 ** (ratio * Math.log10(population)))));
-}
-
-function rankToSlider(rank, population = rankPopulation) {
-  const clamped = Math.max(1, Math.min(population, Number(rank) || 1));
-  return Math.round((Math.log10(clamped) / Math.log10(population)) * 1000);
-}
-
-function challengeCardHTML(item, label) {
-  const map = item.beatmap || {};
-  const defaultRank = Math.min(rankPopulation, 25_000);
+function rankControlHTML(initialRank = 50_000) {
+  const position = rankToSoftPosition(initialRank);
+  const tickRanks = [...new Set([1, 10_000, 100_000, 1_000_000, rankPopulation].filter((rank) => rank <= rankPopulation))];
+  const ticks = tickRanks.map((rank) => {
+    const left = (rankToSoftPosition(rank) / SLIDER_STEPS) * 100;
+    return `<button type="button" class="slider-tick" data-rank="${rank}" style="left:${left.toFixed(3)}%">${formatRank(rank)}</button>`;
+  }).join("");
   return `
-    <div class="challenge-shell">
-      <section class="card challenge-panel">
-        <div class="challenge-head"><span>${escapeHTML(label)}</span><span>${Number(item.star).toFixed(2)}★ · ${Number(item.accuracyPercent).toFixed(2)}%</span></div>
-        <video class="challenge-video" src="${escapeHTML(item.videoURL)}" controls playsinline preload="metadata"></video>
-        <div class="challenge-map"><strong>${escapeHTML(`${map.artist ? `${map.artist} — ` : ""}${map.title}`)}</strong><span>${escapeHTML(`${map.version || "Unknown difficulty"} · ${(item.mods || ["NM"]).join("")}`)}</span></div>
-      </section>
-      <section class="card guess-panel">
-        <h2>Guess the global rank</h2>
-        <p>Within 10% counts as correct. Lower rank numbers are better.</p>
-        <form class="guess-form">
-          <label class="guess-readout">
-            <span>YOUR GUESS</span>
-            <output>${formatRank(defaultRank)}</output>
-          </label>
-          <input class="rank-slider" type="range" min="0" max="1000" step="1" value="${rankToSlider(defaultRank)}" aria-label="Logarithmic rank slider" />
-          <div class="rank-scale"><span>#1</span><span>${formatRank(rankPopulation)}</span></div>
-          <div class="guess-entry-row">
-            <span class="hash-prefix">#</span>
-            <input class="rank-input" type="number" inputmode="numeric" min="1" max="${rankPopulation}" value="${defaultRank}" required aria-label="Rank number" />
-            <button class="primary-button" type="submit">GUESS</button>
-          </div>
-        </form>
-        <ol class="guess-list"></ol>
-        <div class="answer-box" hidden></div>
-        <div class="community-box" hidden></div>
-        <div class="challenge-actions" hidden></div>
-      </section>
+    <div class="rank-control">
+      <div class="rank-readout"><span>your guess</span><strong class="live-rank">${formatRank(initialRank)}</strong></div>
+      <div class="rank-slider-shell">
+        <span class="rank-slider-fill" aria-hidden="true"></span>
+        <input class="rank-slider" type="range" min="0" max="${SLIDER_STEPS}" step="1" value="${position}" aria-label="Rank guess slider" />
+      </div>
+      <div class="slider-scale" aria-label="Rank shortcuts">${ticks}</div>
+      <label class="rank-number-label">exact rank
+        <input class="rank-number-input" type="number" min="1" max="${rankPopulation}" inputmode="numeric" value="${initialRank}" required />
+      </label>
     </div>`;
 }
 
 function bindRankControl(root) {
   const slider = $(".rank-slider", root);
-  const input = $(".rank-input", root);
-  const output = $(".guess-readout output", root);
-
-  const fromSlider = () => {
-    const rank = sliderToRank(slider.value);
-    input.value = String(rank);
-    output.textContent = formatRank(rank);
+  const number = $(".rank-number-input", root);
+  const live = $(".live-rank", root);
+  const fill = $(".rank-slider-fill", root);
+  const setRank = (rank, source) => {
+    const clipped = clamp(Math.round(Number(rank) || 1), 1, rankPopulation);
+    if (source !== "number") number.value = clipped;
+    if (source !== "slider") slider.value = rankToSoftPosition(clipped);
+    live.textContent = formatRank(clipped);
+    const position = Number(slider.value) / SLIDER_STEPS;
+    if (fill) fill.style.width = `${(position * 100).toFixed(2)}%`;
+    slider.setAttribute("aria-valuetext", formatRank(clipped));
   };
-  const fromInput = () => {
-    const rank = Math.max(1, Math.min(rankPopulation, Math.round(Number(input.value) || 1)));
-    slider.value = String(rankToSlider(rank));
-    output.textContent = formatRank(rank);
-  };
-
-  slider.addEventListener("input", fromSlider, { passive: true });
-  input.addEventListener("input", fromInput);
-  input.addEventListener("blur", () => {
-    fromInput();
-    input.value = String(sliderToRank(slider.value));
+  slider.addEventListener("input", () => setRank(softPositionToRank(slider.value), "slider"));
+  number.addEventListener("input", () => setRank(number.value, "number"));
+  number.addEventListener("blur", () => setRank(number.value, null));
+  $$(".slider-tick", root).forEach((tick) => {
+    tick.addEventListener("click", () => {
+      setRank(Number(tick.dataset.rank), null);
+      slider.focus({ preventScroll: true });
+    });
   });
-  fromInput();
+  setRank(number.value, null);
+  return { value: () => clamp(Math.round(Number(number.value) || 1), 1, rankPopulation), setRank };
+}
+
+function challengeCardHTML(item, label) {
+  const map = item.beatmap || {};
+  return `
+    <div class="challenge-layout">
+      <section class="card challenge-video-card">
+        <div class="card-label">${escapeHTML(label)}</div>
+        <video class="challenge-video" src="${escapeHTML(item.videoURL)}" controls playsinline preload="metadata"></video>
+        <div class="challenge-map">
+          <strong>${escapeHTML(`${map.artist ? `${map.artist} — ` : ""}${map.title || "Unknown map"}`)}</strong>
+          <span>${escapeHTML(`${map.version || "Unknown difficulty"} · ${Number(item.star || 0).toFixed(2)}★ · ${(item.mods || ["NM"]).join("")}`)}</span>
+        </div>
+      </section>
+      <section class="card guess-panel">
+        <div class="attempt-meter" aria-label="Attempts remaining">${Array.from({ length: 5 }, (_, index) => `<i data-attempt-dot="${index}"></i>`).join("")}</div>
+        <h2>What is the player’s global rank?</h2>
+        <p>Within 10% counts as correct. Lower numbers are stronger ranks.</p>
+        <form class="guess-form">
+          ${rankControlHTML()}
+          <button class="primary-button" type="submit">submit guess</button>
+        </form>
+        <p class="challenge-error" hidden></p>
+        <ol class="guess-list"></ol>
+        <div class="answer-box" hidden></div>
+        <div class="distribution-box" hidden></div>
+        <div class="challenge-actions" hidden></div>
+      </section>
+    </div>`;
 }
 
 function feedbackText(result) {
-  if (result.correct) return "Correct — within 10%";
-  if (result.direction === "better") return "Actual rank is better (smaller)";
-  return "Actual rank is worse (larger)";
+  if (result.correct) return "within 10%";
+  if (result.direction === "better") return "actual rank is better (smaller)";
+  return "actual rank is worse (larger)";
 }
 
-function distributionHTML(distribution) {
-  if (!distribution?.count) {
-    return `<h3>Community first guesses</h3><p>No other guesses recorded yet.</p>`;
+function renderDistribution(distribution, round) {
+  if (!distribution || !distribution.count) {
+    return `<section class="distribution"><h3>community guesses</h3><p>No independent guesses recorded yet.</p></section>`;
   }
-  const maximum = Math.max(1, ...distribution.buckets.map((bucket) => Number(bucket.count || 0)));
-  const rows = distribution.buckets.map((bucket) => {
-    const bucketCount = Number(bucket.count || 0);
-    const width = bucketCount ? Math.max(3, Math.round((bucketCount / maximum) * 100)) : 0;
-    const range = bucket.minRank === bucket.maxRank
-      ? formatRank(bucket.minRank)
-      : `${formatRank(bucket.minRank)}–${formatRank(bucket.maxRank)}`;
-    return `<li><span>${range}</span><i><b style="width:${width}%"></b></i><em>${Number(bucket.count || 0)}</em></li>`;
+  const maximum = Math.max(...distribution.bins.map((bin) => Number(bin.count) || 0), 1);
+  const bars = distribution.bins.map((bin) => {
+    const height = Math.max(2, Math.round((Number(bin.count) / maximum) * 72));
+    const title = `${formatRank(bin.lower)}–${formatRank(bin.upper)}: ${bin.count}`;
+    return `<i style="height:${height}px" title="${escapeHTML(title)}"><span>${bin.count || ""}</span></i>`;
   }).join("");
   return `
-    <div class="community-heading"><h3>Community first guesses</h3><span>n=${distribution.count}</span></div>
-    <ol class="distribution-list">${rows}</ol>
-    <p>Median first guess: <strong>${formatRank(distribution.medianRank)}</strong></p>`;
+    <section class="distribution">
+      <div class="distribution-head"><h3>community first guesses</h3><span>${distribution.count.toLocaleString()} total</span></div>
+      <div class="histogram" aria-label="Community guess histogram">${bars}</div>
+      <div class="distribution-stats">
+        <span>median <b>${formatRank(distribution.medianRank)}</b></span>
+        <span>middle 50% <b>${formatRank(distribution.q25Rank)}–${formatRank(distribution.q75Rank)}</b></span>
+        <span>you <b>${formatRank(round.guesses[0]?.guessRank)}</b></span>
+      </div>
+    </section>`;
+}
+
+async function fetchDistribution(round, mode, challengeDate) {
+  const query = new URLSearchParams({ mode });
+  if (challengeDate) query.set("challengeDate", challengeDate);
+  const payload = await requestJSON(`/api/challenge/${encodeURIComponent(round.item.id)}/distribution?${query}`);
+  round.distribution = payload.distribution;
+  updateChallengeRound(round, mode, challengeDate);
+  if (mode === "daily") saveDailyState();
 }
 
 async function submitChallengeGuess(round, mode, challengeDate) {
-  const root = round.root;
-  const input = $(".rank-input", root);
-  const guessRank = Math.round(Number(input.value));
-  if (!Number.isInteger(guessRank) || guessRank < 1) return;
+  const guessRank = round.rankControl.value();
   const attempt = round.guesses.length + 1;
   const result = await requestJSON("/api/challenge/guess", {
     method: "POST",
@@ -407,7 +458,7 @@ async function submitChallengeGuess(round, mode, challengeDate) {
       attempt,
       mode,
       challengeDate,
-      sessionID,
+      visitorID,
     }),
   });
   round.guesses.push({ guessRank, ...result });
@@ -416,46 +467,71 @@ async function submitChallengeGuess(round, mode, challengeDate) {
     round.actualRank = result.actualRank;
     round.predictedRank = result.predictedRank;
     round.player = result.player;
-    round.distribution = result.distribution || null;
+    round.distribution = result.distribution;
+  } else {
+    const directionFactor = result.direction === "better" ? 0.58 : 1.72;
+    round.rankControl.setRank(clamp(Math.round(guessRank * directionFactor), 1, rankPopulation));
   }
   updateChallengeRound(round, mode, challengeDate);
   if (mode === "daily") saveDailyState();
 }
 
 function updateChallengeRound(round, mode, challengeDate) {
+  if (!round.root) return;
   const root = round.root;
   const list = $(".guess-list", root);
-  list.innerHTML = round.guesses.map((guess) => `<li><span>${formatRank(guess.guessRank)}</span><span>${escapeHTML(feedbackText(guess))}</span></li>`).join("");
-  const form = $(".guess-form", root);
-  form.hidden = round.revealed;
+  list.innerHTML = round.guesses.map((guess, index) => `
+    <li class="${guess.correct ? "correct" : guess.closeness || ""}">
+      <span>${String(index + 1).padStart(2, "0")}</span>
+      <strong>${formatRank(guess.guessRank)}</strong>
+      <em>${escapeHTML(feedbackText(guess))}</em>
+    </li>`).join("");
+  $$('[data-attempt-dot]', root).forEach((dot, index) => {
+    dot.classList.toggle("used", index < round.guesses.length);
+    dot.classList.toggle("solved", Boolean(round.guesses[index]?.correct));
+  });
+  $(".guess-form", root).hidden = round.revealed;
   const answer = $(".answer-box", root);
   answer.hidden = !round.revealed;
-  const community = $(".community-box", root);
-  community.hidden = !(round.revealed && mode === "daily");
+  const distribution = $(".distribution-box", root);
+  distribution.hidden = !round.revealed;
+  const actions = $(".challenge-actions", root);
+  actions.hidden = !round.revealed;
+
   if (round.revealed) {
-    answer.innerHTML = `<span>${escapeHTML(round.player || "Player")}</span><strong>${formatRank(round.actualRank)}</strong><small>Model prediction: ${formatRank(round.predictedRank)}</small>`;
-    if (mode === "daily") community.innerHTML = distributionHTML(round.distribution);
-    const actions = $(".challenge-actions", root);
-    actions.hidden = false;
-    actions.innerHTML = `<button class="secondary-button next-challenge" type="button">${mode === "daily" ? "NEXT REPLAY" : "NEW FRESH REPLAY"}</button>`;
+    const ratio = Math.max(round.actualRank, round.predictedRank) / Math.max(1, Math.min(round.actualRank, round.predictedRank));
+    answer.innerHTML = `
+      <span>${escapeHTML(round.player || "player")}</span>
+      <strong>${formatRank(round.actualRank)}</strong>
+      <small>model: ${formatRank(round.predictedRank)} · ${ratio.toFixed(2)}× rank ratio</small>`;
+    distribution.innerHTML = renderDistribution(round.distribution, round);
+    actions.innerHTML = `<button class="secondary-button next-challenge" type="button">${mode === "daily" ? "next daily replay" : "generate another replay"}</button>`;
     $(".next-challenge", actions).addEventListener("click", () => {
       if (mode === "daily") advanceDaily(); else loadInfinite();
     });
+    if (!round.distribution) fetchDistribution(round, mode, challengeDate).catch(() => {});
   }
 }
 
 function mountChallenge(rootElement, item, round, label, mode, challengeDate = null) {
   rootElement.innerHTML = challengeCardHTML(item, label);
   round.root = rootElement;
-  bindRankControl(rootElement);
+  round.rankControl = bindRankControl(rootElement);
   const form = $(".guess-form", rootElement);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const button = $("button", form);
+    const button = $("button[type='submit']", form);
+    const error = $(".challenge-error", rootElement);
+    error.hidden = true;
     button.disabled = true;
-    try { await submitChallengeGuess(round, mode, challengeDate); }
-    catch (error) { alert(error.message || "Guess failed"); }
-    finally { button.disabled = false; }
+    try {
+      await submitChallengeGuess(round, mode, challengeDate);
+    } catch (failure) {
+      error.textContent = failure.message || "Guess failed.";
+      error.hidden = false;
+    } finally {
+      button.disabled = false;
+    }
   });
   updateChallengeRound(round, mode, challengeDate);
 }
@@ -466,44 +542,38 @@ function saveDailyState() {
   const serializable = {
     current: dailyState.current,
     rounds: dailyState.rounds.map(({ item, guesses, revealed, actualRank, predictedRank, player, distribution }) => ({
-      id: item.id,
-      guesses,
-      revealed,
-      actualRank,
-      predictedRank,
-      player,
-      distribution,
+      id: item.id, guesses, revealed, actualRank, predictedRank, player, distribution,
     })),
   };
-  storage.set(dailyStorageKey(), JSON.stringify(serializable));
+  storageSet(dailyStorageKey(), JSON.stringify(serializable));
 }
 
 function restoreDailyState(payload) {
-  let saved = null;
-  try { saved = JSON.parse(storage.get(`osu-rankguess-daily-v2-${payload.date}`) || "null"); } catch { saved = null; }
+  const saved = JSON.parse(storageGet(`osu-rankguess-daily-v2-${payload.date}`) || "null");
   const rounds = payload.replays.map((item) => {
-    const old = saved?.rounds?.find((round) => round.id === item.id) || {};
+    const previous = saved?.rounds?.find((round) => round.id === item.id) || {};
     return {
       item,
-      guesses: old.guesses || [],
-      revealed: old.revealed || false,
-      actualRank: old.actualRank,
-      predictedRank: old.predictedRank,
-      player: old.player,
-      distribution: old.distribution || null,
+      guesses: previous.guesses || [],
+      revealed: previous.revealed || false,
+      actualRank: previous.actualRank,
+      predictedRank: previous.predictedRank,
+      player: previous.player,
+      distribution: previous.distribution,
     };
   });
-  return { current: Math.min(saved?.current || 0, 2), rounds };
+  return { current: clamp(saved?.current || 0, 0, rounds.length), rounds };
 }
 
 async function loadDaily() {
   const root = $("#dailyRoot");
-  root.innerHTML = '<p class="empty-state">Loading today\'s set…</p>';
+  root.innerHTML = '<p class="empty-state">Loading today’s replays…</p>';
   try {
     dailyPayload = await requestJSON("/api/challenge/daily");
-    rankPopulation = Number(dailyPayload.rankPopulation || rankPopulation);
+    rankPopulation = Number(dailyPayload.rankPopulation) || rankPopulation;
     if (!dailyPayload.available) {
-      root.innerHTML = `<p class="empty-state">The daily needs three public replays with known ranks. Eligible now: ${dailyPayload.eligibleReplays || 0}.</p>`;
+      root.innerHTML = `<section class="card start-card"><h2>Daily is warming up.</h2><p>Three eligible public replays are required. Available now: ${Number(dailyPayload.eligibleReplays || 0)}.</p><button class="secondary-button" data-view-link="analyze">submit a replay</button></section>`;
+      $("[data-view-link='analyze']", root)?.addEventListener("click", () => showView("analyze"));
       return;
     }
     dailyState = restoreDailyState(dailyPayload);
@@ -515,18 +585,26 @@ async function loadDaily() {
 
 function renderDaily() {
   const root = $("#dailyRoot");
-  const progress = `<div class="daily-progress" aria-label="Daily progress">${dailyState.rounds.map((round, index) => `<span class="${round.revealed ? "done" : index === dailyState.current ? "current" : ""}">${index + 1}</span>`).join("")}</div>`;
   if (dailyState.current >= dailyState.rounds.length) return renderDailySummary();
-  root.innerHTML = progress + '<div id="dailyChallengeMount"></div>';
+  const progress = `
+    <div class="daily-progress">
+      ${dailyState.rounds.map((round, index) => `<button type="button" data-daily-index="${index}" class="${round.revealed ? "done" : index === dailyState.current ? "current" : ""}" ${index > dailyState.current ? "disabled" : ""}>${index + 1}</button>`).join("")}
+      <span>${escapeHTML(dailyPayload.date)}</span>
+    </div>`;
+  root.innerHTML = `${progress}<div id="dailyChallengeMount"></div>`;
+  $$('[data-daily-index]', root).forEach((button) => button.addEventListener("click", () => {
+    dailyState.current = Number(button.dataset.dailyIndex);
+    saveDailyState();
+    renderDaily();
+  }));
   const round = dailyState.rounds[dailyState.current];
-  mountChallenge($("#dailyChallengeMount"), round.item, round, `DAILY ${dailyState.current + 1} / 3`, "daily", dailyPayload.date);
+  mountChallenge($("#dailyChallengeMount"), round.item, round, `daily ${dailyState.current + 1} / 3`, "daily", dailyPayload.date);
 }
 
 function advanceDaily() {
   dailyState.current += 1;
   saveDailyState();
   renderDaily();
-  $("#dailyRoot").scrollIntoView({ behavior: smoothBehavior, block: "start" });
 }
 
 function shareGrid() {
@@ -540,46 +618,47 @@ function shareGrid() {
 function renderDailySummary() {
   const root = $("#dailyRoot");
   const grid = shareGrid();
-  root.innerHTML = `<section class="card daily-summary"><p class="kicker">${escapeHTML(dailyPayload.date)}</p><h2>Daily complete</h2><div class="share-grid">${grid}</div><div class="challenge-actions"><button class="primary-button narrow" id="shareDaily">SHARE RESULT</button></div></section>`;
+  root.innerHTML = `
+    <section class="card daily-summary">
+      <p class="kicker">${escapeHTML(dailyPayload.date)}</p>
+      <h2>daily complete</h2>
+      <div class="share-grid">${grid}</div>
+      <div class="summary-table">
+        ${dailyState.rounds.map((round, index) => `<div><span>${index + 1}</span><b>${formatRank(round.actualRank)}</b><em>${round.guesses.length} guess${round.guesses.length === 1 ? "" : "es"}</em></div>`).join("")}
+      </div>
+      <div class="challenge-actions"><button class="primary-button narrow" id="shareDaily">share result</button></div>
+    </section>`;
   $("#shareDaily").addEventListener("click", async () => {
-    const text = `osu!rankguess ${dailyPayload.date}\n${grid}\nhttps://osu-rankguess.vercel.app/`;
-    try {
-      if (navigator.share) await navigator.share({ text, url: "https://osu-rankguess.vercel.app/" });
-      else await navigator.clipboard.writeText(text);
-      $("#shareDaily").textContent = "SHARED";
-    } catch {
-      try { await navigator.clipboard.writeText(text); $("#shareDaily").textContent = "COPIED"; } catch { /* no clipboard */ }
+    const text = `osu!rankguess ${dailyPayload.date}\n${grid}\nhttps://osu-rankguess.vercel.app/#daily`;
+    if (navigator.share) {
+      try { await navigator.share({ text }); return; } catch {}
     }
+    await copyText(text);
+    $("#shareDaily").textContent = "copied";
   });
 }
 
 async function loadInfinite() {
   const root = $("#infiniteRoot");
-  const messages = [
-    "Finding a public score with a replay…",
-    "Downloading replay data…",
-    "Submitting a fresh o!rdr render…",
-    "Waiting for the video…",
-    "Preparing the challenge…",
-  ];
-  let messageIndex = 0;
-  root.innerHTML = `<section class="card loading-card"><div class="card-label">NEW ROUND</div><strong>Preparing a fresh replay</strong><p id="infiniteLoadingText">${messages[0]}</p><p>This can take around a minute.</p></section>`;
+  const startTime = Date.now();
+  root.innerHTML = `
+    <section class="card generation-card">
+      <div class="busy-line"><i></i><span>selecting and rendering a fresh replay</span></div>
+      <strong id="generationTime">0:00</strong>
+      <p>This request downloads a public .osr and creates a new o!rdr video. Keep this tab open.</p>
+    </section>`;
   const timer = setInterval(() => {
-    messageIndex = Math.min(messages.length - 1, messageIndex + 1);
-    const element = $("#infiniteLoadingText");
-    if (element) element.textContent = messages[messageIndex];
-  }, 7000);
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const element = $("#generationTime");
+    if (element) element.textContent = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
+  }, 1000);
   try {
-    const payload = await requestJSON(`/api/challenge/infinite?sessionID=${encodeURIComponent(sessionID)}`, { method: "POST" });
-    rankPopulation = Number(payload.rankPopulation || rankPopulation);
-    if (!payload.available) {
-      root.innerHTML = '<p class="empty-state">Infinite mode is not configured.</p>';
-      return;
-    }
+    const payload = await requestJSON("/api/challenge/infinite", { method: "POST" });
+    rankPopulation = Number(payload.rankPopulation) || rankPopulation;
     infiniteRound = { item: payload.replay, guesses: [], revealed: false };
-    mountChallenge(root, payload.replay, infiniteRound, "INFINITE / FRESH", "infinite");
+    mountChallenge(root, payload.replay, infiniteRound, "fresh infinite replay", "infinite");
   } catch (error) {
-    root.innerHTML = `<section class="card loading-card"><strong>Could not prepare a replay.</strong><p>${escapeHTML(error.message)}</p><button class="secondary-button narrow" id="retryInfinite">TRY AGAIN</button></section>`;
+    root.innerHTML = `<section class="card start-card"><h2>Could not generate a replay.</h2><p>${escapeHTML(error.message)}</p><button class="primary-button narrow" id="retryInfinite">try again</button></section>`;
     $("#retryInfinite")?.addEventListener("click", loadInfinite);
   } finally {
     clearInterval(timer);
@@ -587,36 +666,87 @@ async function loadInfinite() {
 }
 $("#startInfinite").addEventListener("click", loadInfinite);
 
+function predictionRatio(item) {
+  if (!item.actualRank || !item.predictedRank) return Infinity;
+  return Math.max(item.actualRank, item.predictedRank) / Math.max(1, Math.min(item.actualRank, item.predictedRank));
+}
+
 function galleryCard(item) {
   const map = item.beatmap || {};
   const thumbnail = item.thumbnailURL || `/api/gallery/${encodeURIComponent(item.id)}/thumbnail`;
   const sourceLabel = item.source === "cron" ? "automatic sample" : "community upload";
-  const mapLabel = `${map.artist ? `${map.artist} — ` : ""}${map.title || "Unknown map"}`;
-  const detailLabel = `${map.version || "Unknown difficulty"} · ${Number(item.star || 0).toFixed(2)}★ · ${(item.mods || ["NM"]).join("")}`;
-
+  const ratio = predictionRatio(item);
+  const errorLabel = Number.isFinite(ratio) ? `${ratio.toFixed(2)}× rank ratio` : "rank unavailable";
   return `
-    <article class="gallery-card">
-      <a class="gallery-thumb" href="${escapeHTML(item.videoURL)}" target="_blank" rel="noreferrer" aria-label="Watch ${escapeHTML(item.player || "this replay")}">
-        <img src="${escapeHTML(thumbnail)}" alt="" loading="lazy" decoding="async" onerror="this.hidden=true">
-        <span>WATCH</span>
-      </a>
+    <article class="gallery-card" data-gallery-id="${escapeHTML(item.id)}" data-source="${escapeHTML(item.source || "upload")}" tabindex="0" role="button" aria-label="Open replay by ${escapeHTML(item.player || "unknown player")}">
+      <button class="gallery-thumb" type="button" aria-label="Open ${escapeHTML(item.player || "replay")}">
+        <img src="${escapeHTML(thumbnail)}" alt="" loading="lazy" decoding="async" />
+        <span>open replay</span>
+      </button>
       <div class="gallery-copy">
         <p class="gallery-source">${escapeHTML(sourceLabel)}</p>
         <h3>${escapeHTML(item.player || "Unknown player")}</h3>
-        <p>${escapeHTML(mapLabel)}<br>${escapeHTML(detailLabel)}</p>
+        <p>${escapeHTML(`${map.artist ? `${map.artist} — ` : ""}${map.title || "Unknown map"}`)}</p>
+        <small>${escapeHTML(`${map.version || "Unknown difficulty"} · ${Number(item.star || 0).toFixed(2)}★ · ${(item.mods || ["NM"]).join("")}`)}</small>
       </div>
       <div class="gallery-ranks">
-        <div><span>ACTUAL</span><strong>${formatRank(item.actualRank)}</strong></div>
-        <div><span>MODEL</span><strong>${formatRank(item.predictedRank)}</strong></div>
+        <div><span>actual</span><strong>${formatRank(item.actualRank)}</strong></div>
+        <div><span>model</span><strong>${formatRank(item.predictedRank)}</strong></div>
       </div>
+      <div class="gallery-error"><i style="width:${Math.min(100, Math.max(4, (Math.log10(Math.max(1, ratio)) / 2) * 100))}%"></i><span>${escapeHTML(errorLabel)}</span></div>
     </article>`;
 }
 
+function openGalleryDialog(item) {
+  const map = item.beatmap || {};
+  const ratio = predictionRatio(item);
+  $("#galleryDialogBody").innerHTML = `
+    <video src="${escapeHTML(item.videoURL)}" controls autoplay playsinline preload="metadata"></video>
+    <div class="dialog-copy">
+      <p class="kicker">${escapeHTML(item.source === "cron" ? "AUTOMATIC SAMPLE" : "COMMUNITY UPLOAD")}</p>
+      <h2>${escapeHTML(item.player || "Unknown player")}</h2>
+      <p>${escapeHTML(`${map.artist ? `${map.artist} — ` : ""}${map.title || "Unknown map"} [${map.version || "?"}]`)}</p>
+      <div class="dialog-ranks">
+        <div><span>actual rank</span><strong>${formatRank(item.actualRank)}</strong></div>
+        <div><span>model rank</span><strong>${formatRank(item.predictedRank)}</strong></div>
+        <div><span>rank ratio</span><strong>${Number.isFinite(ratio) ? `${ratio.toFixed(2)}×` : "—"}</strong></div>
+      </div>
+      <a href="${escapeHTML(item.videoURL)}" target="_blank" rel="noreferrer">open video in a new tab</a>
+    </div>`;
+  const dialog = $("#galleryDialog");
+  if (dialog.showModal) dialog.showModal(); else dialog.setAttribute("open", "");
+}
+
+function renderGallery() {
+  let items = galleryItems.filter((item) => galleryFilter === "all" || item.source === galleryFilter);
+  const sort = $("#gallerySort").value;
+  if (sort === "error") items = [...items].sort((a, b) => predictionRatio(b) - predictionRatio(a));
+  if (sort === "closest") items = [...items].sort((a, b) => predictionRatio(a) - predictionRatio(b));
+  $("#galleryGrid").innerHTML = items.map(galleryCard).join("");
+  $$(".gallery-card").forEach((card) => {
+    const item = galleryItems.find((candidate) => candidate.id === card.dataset.galleryId);
+    $(".gallery-thumb", card).addEventListener("click", () => openGalleryDialog(item));
+    card.addEventListener("click", (event) => {
+      if (!event.target.closest("button, a, input, select")) openGalleryDialog(item);
+    });
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openGalleryDialog(item);
+      }
+    });
+  });
+  $("#galleryEmpty").hidden = items.length !== 0;
+}
+
 async function loadGallery(reset = false) {
-  const grid = $("#galleryGrid");
   const empty = $("#galleryEmpty");
   const more = $("#loadMoreGallery");
-  if (reset) { galleryOffset = 0; grid.innerHTML = ""; }
+  if (reset) {
+    galleryOffset = 0;
+    galleryItems = [];
+    $("#galleryGrid").innerHTML = '<p class="empty-state">Loading gallery…</p>';
+  }
   try {
     const payload = await requestJSON(`/api/gallery?limit=24&offset=${galleryOffset}`);
     if (!payload.configured) {
@@ -624,19 +754,50 @@ async function loadGallery(reset = false) {
       empty.hidden = false;
       more.hidden = true;
       galleryLoaded = true;
+      $("#galleryGrid").innerHTML = "";
       return;
     }
-    grid.insertAdjacentHTML("beforeend", payload.items.map(galleryCard).join(""));
+    galleryItems.push(...payload.items.filter((item) => !galleryItems.some((existing) => existing.id === item.id)));
     galleryOffset += payload.items.length;
-    empty.hidden = payload.total !== 0;
     more.hidden = galleryOffset >= payload.total;
     galleryLoaded = true;
+    renderGallery();
   } catch (error) {
     empty.textContent = error.message;
     empty.hidden = false;
   }
 }
+
+$$('[data-gallery-filter]').forEach((button) => button.addEventListener("click", () => {
+  galleryFilter = button.dataset.galleryFilter;
+  $$('[data-gallery-filter]').forEach((candidate) => candidate.classList.toggle("active", candidate === button));
+  renderGallery();
+}));
+$("#gallerySort").addEventListener("change", renderGallery);
+
+$("#randomGallery").addEventListener("click", () => {
+  const visible = galleryItems.filter((item) => galleryFilter === "all" || item.source === galleryFilter);
+  if (!visible.length) return;
+  const item = visible[Math.floor(Math.random() * visible.length)];
+  openGalleryDialog(item);
+});
 $("#loadMoreGallery").addEventListener("click", () => loadGallery(false));
+$("#closeGalleryDialog").addEventListener("click", () => $("#galleryDialog").close());
+$("#galleryDialog").addEventListener("click", (event) => {
+  if (event.target === $("#galleryDialog")) $("#galleryDialog").close();
+});
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && $("#galleryDialog").open) $("#galleryDialog").close();
+  if (event.altKey && ["1", "2", "3", "4"].includes(event.key)) {
+    showView({ "1": "daily", "2": "infinite", "3": "analyze", "4": "gallery" }[event.key]);
+  }
+});
+
+requestJSON("/api/health").then((health) => {
+  rankPopulation = Number(health.rankPopulation) || rankPopulation;
+  $("#modelFooter").textContent = `${health.modelVersion || "rank model"} · estimates are approximate`;
+}).catch(() => {});
 
 const initialView = location.hash.replace("#", "");
-showView(["analyze", "daily", "infinite", "gallery"].includes(initialView) ? initialView : "daily");
+showView(["daily", "infinite", "analyze", "gallery"].includes(initialView) ? initialView : "daily");

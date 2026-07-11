@@ -3,57 +3,54 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#eee9d7" />
-  <meta name="color-scheme" content="light" />
-  <meta name="description" content="Guess osu! global ranks from replay clips, then analyze your own .osr replay." />
+  <meta name="theme-color" content="#ece7d3" />
+  <meta name="description" content="Guess an osu! global rank from a replay, play the daily three, or analyze your own .osr." />
   <title>osu!rankguess</title>
   <link rel="icon" href="/favicon.svg" />
-  <link rel="stylesheet" href="/styles.css?v=10" />
+  <link rel="stylesheet" href="/styles.css?v=11" />
 </head>
 <body>
-  <div class="top-strip">OSU!RANKGUESS // DAILY 3 // GLOBAL RANKS // UTC RESET</div>
-
-  <header class="site-header page-width">
-    <div class="brand-block">
-      <a class="brand" href="#daily" data-view-link="daily">osu!rankguess</a>
-      <span class="version-stamp">v0.10 beta</span>
-    </div>
+  <header class="site-header">
+    <a class="brand" href="#daily" data-view-link="daily">osu!rankguess</a>
     <nav aria-label="Main navigation">
       <button class="nav-link active" data-view-link="daily">daily 3</button>
       <button class="nav-link" data-view-link="infinite">infinite</button>
-      <button class="nav-link" data-view-link="analyze">analyze replay</button>
+      <button class="nav-link" data-view-link="analyze">analyze</button>
       <button class="nav-link" data-view-link="gallery">gallery</button>
     </nav>
   </header>
 
-  <main class="page-width">
+  <main>
     <section class="view active" id="view-daily" data-view="daily">
-      <div class="page-heading daily-heading">
-        <p class="kicker">TODAY'S SET / THREE REPLAYS</p>
+      <div class="page-heading home-heading">
+        <p class="kicker">DAILY CHALLENGE</p>
         <h1>guess the rank.</h1>
-        <p>Watch each replay and estimate the player's current global rank. You get five attempts. The scale is logarithmic because osu! ranks are not evenly distributed.</p>
+        <p>Three rendered replays each day. You get five guesses per replay. Community guesses appear only after the answer is revealed.</p>
       </div>
       <div id="dailyRoot" class="challenge-root" aria-live="polite">
-        <p class="empty-state">Loading today's set…</p>
+        <p class="empty-state">Loading today’s replays…</p>
       </div>
     </section>
 
     <section class="view" id="view-infinite" data-view="infinite" hidden>
       <div class="page-heading compact">
-        <p class="kicker">FRESH PUBLIC REPLAY</p>
-        <h1>infinite mode.</h1>
-        <p>Each round finds a new public score, downloads its replay, renders a new clip, and keeps it separate from the gallery. A round can take a minute to prepare.</p>
+        <p class="kicker">INFINITE MODE</p>
+        <h1>a new replay<br />every round.</h1>
+        <p>Each round selects a fresh public score, downloads its replay, and renders a new clip. It does not draw from the gallery.</p>
       </div>
       <div id="infiniteRoot" class="challenge-root">
-        <button class="primary-button narrow" id="startInfinite">START A FRESH ROUND</button>
+        <section class="card start-card">
+          <p>Generating a fresh clip usually takes between thirty seconds and two minutes.</p>
+          <button class="primary-button narrow" id="startInfinite">generate replay</button>
+        </section>
       </div>
     </section>
 
     <section class="view" id="view-analyze" data-view="analyze" hidden>
       <div class="page-heading compact">
         <p class="kicker">YOUR REPLAY</p>
-        <h1>predict a rank.</h1>
-        <p>Upload one standard-mode .osr replay. The backend parses the replay, renders it through o!rdr, and runs the production model.</p>
+        <h1>upload a .osr.</h1>
+        <p>The replay is parsed on the server, rendered through o!rdr, and scored by the rank model. Raw replay files are not published.</p>
       </div>
 
       <div class="analyze-grid">
@@ -61,29 +58,28 @@
           <div class="card-label">REPLAY FILE</div>
           <label class="dropzone" id="dropzone" for="replayInput">
             <input id="replayInput" type="file" accept=".osr,application/octet-stream" hidden />
-            <strong id="dropTitle">CHOOSE .OSR FILE</strong>
-            <span id="dropSubtitle">tap here or drop a file</span>
+            <strong id="dropTitle">choose .osr file</strong>
+            <span id="dropSubtitle">or drop it here</span>
             <span class="file-line" id="fileChip" hidden><b id="fileName"></b><i id="fileSize"></i></span>
           </label>
           <label class="publish-option">
             <input id="publishToggle" type="checkbox" checked />
-            <span>publish the result in the gallery</span>
+            <span>show the finished render in the public gallery</span>
           </label>
-          <button class="primary-button" id="runButton" disabled>ANALYZE REPLAY</button>
+          <button class="primary-button" id="runButton" disabled>analyze replay</button>
           <p class="status-text" id="renderStatus" hidden></p>
           <p class="error-text" id="errorBox" hidden></p>
         </section>
 
         <section class="card process-card">
-          <div class="card-label">PIPELINE</div>
+          <div class="card-label">PROGRESS</div>
           <ol class="steps">
-            <li data-step="cache" data-default-detail="Read replay telemetry"><span>01</span><div><strong>parse replay</strong><small>Read replay telemetry</small></div></li>
-            <li data-step="submit" data-default-detail="Send replay to o!rdr"><span>02</span><div><strong>submit render</strong><small>Send replay to o!rdr</small></div></li>
-            <li data-step="wait" data-default-detail="Wait for render"><span>03</span><div><strong>wait for video</strong><small>Wait for render</small></div></li>
-            <li data-step="metadata" data-default-detail="Read map metadata"><span>04</span><div><strong>read metadata</strong><small>Read map metadata</small></div></li>
-            <li data-step="model" data-default-detail="Run model ensemble"><span>05</span><div><strong>run model</strong><small>Run model ensemble</small></div></li>
+            <li data-step="cache" data-default-detail="Parse replay telemetry"><span>01</span><div><strong>parse replay</strong><small>Parse replay telemetry</small></div></li>
+            <li data-step="submit" data-default-detail="Submit to o!rdr"><span>02</span><div><strong>submit render</strong><small>Submit to o!rdr</small></div></li>
+            <li data-step="wait" data-default-detail="Wait for video"><span>03</span><div><strong>render clip</strong><small>Wait for video</small></div></li>
+            <li data-step="metadata" data-default-detail="Resolve map and score data"><span>04</span><div><strong>resolve metadata</strong><small>Resolve map and score data</small></div></li>
+            <li data-step="model" data-default-detail="Run rank ensemble"><span>05</span><div><strong>predict rank</strong><small>Run rank ensemble</small></div></li>
           </ol>
-          <p class="tiny-note">Keep this tab open until the result appears.</p>
         </section>
       </div>
 
@@ -104,11 +100,8 @@
           <div class="card-label">REPLAY</div>
           <video id="replayVideo" controls playsinline preload="metadata"></video>
           <div class="map-line">
-            <div>
-              <strong id="mapTitle">—</strong>
-              <span id="mapMeta">—</span>
-            </div>
-            <a id="videoLink" href="#" target="_blank" rel="noreferrer">OPEN MP4</a>
+            <div><strong id="mapTitle">—</strong><span id="mapMeta">—</span></div>
+            <a id="videoLink" href="#" target="_blank" rel="noreferrer">open video</a>
           </div>
           <dl class="stats-grid">
             <div><dt>TOP %</dt><dd id="topPercent">—</dd></div>
@@ -116,31 +109,49 @@
             <div><dt>MODS</dt><dd id="modsValue">—</dd></div>
             <div><dt>CONFIDENCE</dt><dd id="confidenceLabel">—</dd></div>
             <div><dt>STARS</dt><dd id="starValue">—</dd></div>
-            <div><dt>EVENTS</dt><dd id="eventsValue">—</dd></div>
+            <div><dt>PLAY PP</dt><dd id="ppValue">—</dd></div>
           </dl>
           <p class="small-note" id="galleryStatus"></p>
-          <button class="secondary-button" id="resetButton">ANALYZE ANOTHER</button>
+          <button class="secondary-button" id="resetButton">analyze another</button>
         </div>
       </section>
     </section>
 
     <section class="view" id="view-gallery" data-view="gallery" hidden>
-      <div class="page-heading compact">
-        <p class="kicker">PUBLIC RESULTS</p>
-        <h1>gallery.</h1>
-        <p>Community uploads and automatic samples. Click a thumbnail to watch the rendered replay.</p>
+      <div class="page-heading compact gallery-heading">
+        <div>
+          <p class="kicker">PUBLIC RESULTS</p>
+          <h1>gallery.</h1>
+          <p>Community uploads and automatic samples. Open a card to watch the replay and compare the prediction.</p>
+        </div>
+        <div class="gallery-controls" aria-label="Gallery filters">
+          <button class="filter-button active" data-gallery-filter="all">all</button>
+          <button class="filter-button" data-gallery-filter="upload">community</button>
+          <button class="filter-button" data-gallery-filter="cron">automatic</button>
+          <select id="gallerySort" aria-label="Sort gallery">
+            <option value="newest">newest</option>
+            <option value="error">largest miss</option>
+            <option value="closest">closest model</option>
+          </select>
+          <button class="filter-button" id="randomGallery" type="button">random replay</button>
+        </div>
       </div>
       <div id="galleryGrid" class="gallery-grid"></div>
-      <p class="empty-state" id="galleryEmpty" hidden>No public results yet.</p>
-      <button class="secondary-button narrow" id="loadMoreGallery" hidden>LOAD MORE</button>
+      <p class="empty-state" id="galleryEmpty" hidden>No public replays yet.</p>
+      <button class="secondary-button narrow" id="loadMoreGallery" hidden>load more</button>
     </section>
   </main>
 
-  <footer class="page-width">
-    <span>osu!rankguess</span>
-    <span>model test R² 0.653 · unofficial osu! project</span>
+  <footer>
+    <span>osu!rankguess · unofficial</span>
+    <span id="modelFooter">rank estimates are approximate</span>
   </footer>
 
-  <script src="/app.js?v=10" defer></script>
+  <dialog id="galleryDialog" class="gallery-dialog">
+    <button class="dialog-close" id="closeGalleryDialog" aria-label="Close">×</button>
+    <div id="galleryDialogBody"></div>
+  </dialog>
+
+  <script src="/app.js?v=11" defer></script>
 </body>
 </html>

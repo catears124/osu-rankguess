@@ -30,15 +30,13 @@ from database import (
     challenge_count,
     database_configured,
     database_diagnostics,
-    challenge_guess_distribution,
     get_daily_challenge,
-    get_infinite_challenge,
     get_submission,
-    infinite_replay_recent,
+    get_challenge_submission,
+    record_challenge_guess,
+    challenge_guess_distribution,
     list_gallery,
     make_public_id,
-    save_challenge_guess,
-    save_infinite_challenge,
     save_submission,
     submission_exists,
     update_submission_thumbnail,
@@ -54,11 +52,16 @@ from replay_features import (
     build_action_windows,
     build_event_sequence,
     build_replay_summary,
+    build_static_features_v2,
+    calculate_local_score_pp,
+    parse_osu_beatmap,
+    STATIC_FEATURE_NAMES_V2,
     parse_osr,
 )
 
 ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "model" / "model.onnx"
+MODEL_BUNDLE_PATH = ROOT / "model" / "bundle.json"
 
 MAX_REPLAY_BYTES = 4_000_000
 MAX_CACHE_TOKEN_BYTES = 1_500_000
@@ -146,13 +149,14 @@ MAP_PATTERN = re.compile(
 
 app = FastAPI(
     title="osu!rankguess",
-    version="3.2.0",
+    version="4.0.1",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
 app.add_middleware(GZipMiddleware, minimum_size=1_000)
 
 _session: ort.InferenceSession | None = None
+_model_bundle: dict[str, Any] | None = None
 _session_lock = asyncio.Lock()
 _cache_lock = asyncio.Lock()
 _osu_token_lock = asyncio.Lock()
@@ -160,6 +164,8 @@ _osu_token: str | None = None
 _osu_token_expires_at = 0.0
 _osu_user_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 _osu_beatmap_cache: dict[int, tuple[float, dict[str, Any] | None]] = {}
+_osu_beatmap_text_cache: dict[int, tuple[float, str | None]] = {}
+_osu_score_match_cache: dict[tuple[str, int], tuple[float, tuple[float | None, float]]] = {}
 
 
 @dataclass
@@ -171,6 +177,7 @@ class CachedReplay:
     event_sequence: np.ndarray
     action_windows: np.ndarray
     replay_summary: np.ndarray
+    events: np.ndarray | None
     model_mods: list[str]
     display_mods: list[str]
     expires_at: float
@@ -198,7 +205,7 @@ class ChallengeGuessPayload(BaseModel):
     attempt: int = Field(ge=1, le=MAX_CHALLENGE_ATTEMPTS)
     mode: str = Field(default="infinite")
     challenge_date: date | None = Field(default=None, alias="challengeDate")
-    session_id: str = Field(alias="sessionID", min_length=8, max_length=160)
+    visitor_id: str = Field(alias="visitorID", min_length=8, max_length=128)
 
     model_config = {"populate_by_name": True}
 
@@ -226,6 +233,156 @@ async def get_model_session() -> ort.InferenceSession:
     async with _session_lock:
         return await asyncio.to_thread(get_model_session_sync)
 
+
+
+def get_model_bundle_sync() -> dict[str, Any] | None:
+    """Load an optional v2 ensemble bundle.
+
+    A bundle is deliberately just JSON + ONNX files, so production keeps the
+    same small runtime dependency set.  The legacy six-output replay model is
+    retained as a fallback until a newly trained bundle is copied into model/.
+    """
+    global _model_bundle
+    if _model_bundle is not None:
+        return _model_bundle
+    if not MODEL_BUNDLE_PATH.exists():
+        return None
+
+    config = json.loads(MODEL_BUNDLE_PATH.read_text(encoding="utf-8"))
+    entries = list(config.get("models") or [])
+    if not entries:
+        raise RuntimeError("model/bundle.json contains no models")
+
+    sessions: list[dict[str, Any]] = []
+    for entry in entries:
+        filename = str(entry.get("file") or "").strip()
+        if not filename:
+            raise RuntimeError("Bundle model entry is missing file")
+        path = ROOT / "model" / filename
+        if not path.exists():
+            raise RuntimeError(f"Bundle model missing: {path}")
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        options.intra_op_num_threads = max(1, min(2, os.cpu_count() or 1))
+        options.inter_op_num_threads = 1
+        session = ort.InferenceSession(
+            str(path),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        sessions.append({
+            "session": session,
+            "file": filename,
+            "type": str(entry.get("type") or "auto"),
+            "weight": max(0.0, float(entry.get("weight", 1.0))),
+        })
+
+    static_names = [str(value) for value in config.get("staticFeatureNames") or []]
+    if static_names and static_names != list(STATIC_FEATURE_NAMES_V2):
+        raise RuntimeError(
+            "V2 static feature schema differs from the production feature builder"
+        )
+    _model_bundle = {"config": config, "models": sessions}
+    return _model_bundle
+
+
+async def get_model_bundle() -> dict[str, Any] | None:
+    if _model_bundle is not None:
+        return _model_bundle
+    async with _session_lock:
+        return await asyncio.to_thread(get_model_bundle_sync)
+
+
+def _onnx_dimension(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def run_bundle_model(
+    session: ort.InferenceSession,
+    *,
+    static_features: np.ndarray,
+    cached: "CachedReplay",
+) -> float:
+    feeds: dict[str, np.ndarray] = {}
+    for model_input in session.get_inputs():
+        name = model_input.name
+        lower = name.casefold()
+        shape = list(model_input.shape or [])
+        last = _onnx_dimension(shape[-1]) if shape else None
+        if "event" in lower:
+            feeds[name] = cached.event_sequence
+        elif "window" in lower or "action" in lower:
+            feeds[name] = cached.action_windows
+        elif "summary" in lower:
+            feeds[name] = cached.replay_summary
+        elif "static" in lower:
+            feeds[name] = static_features
+        elif "tabular" in lower and last == static_features.shape[1]:
+            feeds[name] = static_features
+        elif last == static_features.shape[1]:
+            feeds[name] = static_features
+        else:
+            raise RuntimeError(
+                f"Cannot map ONNX bundle input {name!r} with shape {shape}"
+            )
+    outputs = session.run(None, feeds)
+    if not outputs:
+        raise RuntimeError("Bundle model returned no outputs")
+    prediction = float(np.asarray(outputs[0], dtype=np.float64).reshape(-1)[0])
+    if not math.isfinite(prediction):
+        raise RuntimeError("Bundle model returned a non-finite prediction")
+    return prediction
+
+
+def combine_bundle_predictions(
+    bundle: dict[str, Any],
+    *,
+    static_features: np.ndarray,
+    cached: "CachedReplay",
+) -> tuple[float, float, list[float]]:
+    predictions: list[float] = []
+    weights: list[float] = []
+    for entry in bundle["models"]:
+        prediction = run_bundle_model(
+            entry["session"],
+            static_features=static_features,
+            cached=cached,
+        )
+        predictions.append(prediction)
+        weights.append(float(entry["weight"]))
+
+    weight_array = np.asarray(weights, dtype=np.float64)
+    if float(weight_array.sum()) <= 0:
+        weight_array[:] = 1.0
+    weight_array /= weight_array.sum()
+    prediction_array = np.asarray(predictions, dtype=np.float64)
+    raw_skill = float(np.dot(weight_array, prediction_array))
+
+    calibration = bundle["config"].get("calibration") or {}
+    intercept = float(calibration.get("intercept", 0.0))
+    slope = float(calibration.get("slope", 1.0))
+    skill = intercept + slope * raw_skill
+    x_thresholds = calibration.get("xThresholds") or []
+    y_thresholds = calibration.get("yThresholds") or []
+    if len(x_thresholds) >= 2 and len(x_thresholds) == len(y_thresholds):
+        skill = float(np.interp(
+            skill,
+            np.asarray(x_thresholds, dtype=np.float64),
+            np.asarray(y_thresholds, dtype=np.float64),
+        ))
+
+    ensemble_std = float(
+        np.sqrt(np.dot(weight_array, np.square(prediction_array - raw_skill)))
+    )
+    residual_floor = max(
+        0.0,
+        float(bundle["config"].get("uncertaintyFloor", 0.06)),
+    )
+    uncertainty = math.sqrt(ensemble_std ** 2 + residual_floor ** 2)
+    return skill, uncertainty, predictions
 
 def normalize_hash(value: str) -> str:
     normalized = value.strip().lower()
@@ -344,7 +501,7 @@ def cache_signing_secret() -> bytes:
 
 def encode_cache_token(cached: CachedReplay) -> str:
     metadata = {
-        "version": 1,
+        "version": 2,
         "replayHash": cached.replay_hash,
         "player": cached.player,
         "header": cached.header,
@@ -364,6 +521,7 @@ def encode_cache_token(cached: CachedReplay) -> str:
         event_sequence=cached.event_sequence.astype(np.float32, copy=False),
         action_windows=cached.action_windows.astype(np.float32, copy=False),
         replay_summary=cached.replay_summary.astype(np.float32, copy=False),
+        events=(cached.events.astype(np.float32, copy=False) if cached.events is not None else np.zeros((0, 4), dtype=np.float32)),
     )
     payload = buffer.getvalue()
     signature = hmac.new(cache_signing_secret(), payload, hashlib.sha256).digest()
@@ -414,6 +572,7 @@ def decode_cache_token(token: str, expected_hash: str) -> CachedReplay:
             event_sequence=np.asarray(archive["event_sequence"], dtype=np.float32),
             action_windows=np.asarray(archive["action_windows"], dtype=np.float32),
             replay_summary=np.asarray(archive["replay_summary"], dtype=np.float32),
+            events=(np.asarray(archive["events"], dtype=np.float32) if "events" in archive.files else None),
             model_mods=[str(value) for value in metadata["modelMods"]],
             display_mods=[str(value) for value in metadata["displayMods"]],
             expires_at=float(metadata["expiresAt"]),
@@ -500,6 +659,7 @@ def build_cached_replay_from_bytes(
         event_sequence=build_event_sequence(events)[None, :, :].astype(np.float32, copy=False),
         action_windows=build_action_windows(events)[None, :, :, :].astype(np.float32, copy=False),
         replay_summary=build_replay_summary(parsed)[None, :].astype(np.float32, copy=False),
+        events=np.asarray(events, dtype=np.float32),
         model_mods=model_mods,
         display_mods=display_mods,
         expires_at=time.time() + CACHE_TTL_SECONDS,
@@ -1017,6 +1177,163 @@ async def fetch_osu_beatmap(beatmap_id: int | None) -> dict[str, Any] | None:
     return payload
 
 
+
+async def fetch_osu_beatmap_text(beatmap_id: int | None) -> str | None:
+    if not beatmap_id:
+        return None
+    beatmap_id = int(beatmap_id)
+    cached = _osu_beatmap_text_cache.get(beatmap_id)
+    if cached and cached[0] > time.time():
+        return cached[1]
+
+    timeout = httpx.Timeout(15.0, connect=8.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(
+                f"https://osu.ppy.sh/osu/{beatmap_id}",
+                headers={"Accept": "text/plain, application/octet-stream;q=0.9"},
+            )
+    except httpx.HTTPError as exc:
+        print(json.dumps({"event": "osu_beatmap_text_failed", "error": repr(exc)}), flush=True)
+        return None
+
+    text = response.text if response.status_code == 200 else None
+    if text and "[HitObjects]" not in text:
+        text = None
+    _osu_beatmap_text_cache[beatmap_id] = (time.time() + (86400 if text else 300), text)
+    return text
+
+
+def _canonical_score_mods(mods: list[str]) -> set[str]:
+    enabled = {str(token).upper() for token in mods}
+    if "NC" in enabled:
+        enabled.add("DT")
+    if "PF" in enabled:
+        enabled.add("SD")
+    return enabled - {"CL"}
+
+
+def _score_statistics(score: dict[str, Any]) -> dict[str, int]:
+    stats = score.get("statistics") or {}
+    aliases = {
+        "count_300": ("count_300", "great"),
+        "count_100": ("count_100", "ok"),
+        "count_50": ("count_50", "meh"),
+        "count_miss": ("count_miss", "miss"),
+    }
+    result: dict[str, int] = {}
+    for destination, candidates in aliases.items():
+        value = 0
+        for candidate in candidates:
+            if candidate in stats and stats[candidate] is not None:
+                try:
+                    value = int(stats[candidate])
+                except (TypeError, ValueError):
+                    value = 0
+                break
+        result[destination] = value
+    return result
+
+
+def _score_match_quality(score: dict[str, Any], cached: CachedReplay) -> float:
+    header = cached.header
+    replay_mods = _canonical_score_mods(cached.display_mods or cached.model_mods)
+    score_mods = _canonical_score_mods(_score_mods(score))
+    mod_score = 1.0 if replay_mods == score_mods else 0.0
+
+    replay_accuracy = replay_accuracy_from_header(header)
+    accuracy_difference = abs(_score_accuracy(score) - replay_accuracy)
+    accuracy_score = math.exp(-accuracy_difference / 0.0008)
+
+    score_stats = _score_statistics(score)
+    stat_difference = sum(
+        abs(int(header.get(name) or 0) - int(score_stats.get(name) or 0))
+        for name in ("count_300", "count_100", "count_50", "count_miss")
+    )
+    stats_score = math.exp(-stat_difference / 3.0)
+
+    try:
+        score_combo = int(score.get("max_combo") or 0)
+    except (TypeError, ValueError):
+        score_combo = 0
+    replay_combo = int(header.get("max_combo") or 0)
+    combo_score = math.exp(-abs(score_combo - replay_combo) / max(2.0, replay_combo * 0.02))
+
+    exact_score = 0.0
+    try:
+        if int(score.get("score") or 0) == int(header.get("score") or -1):
+            exact_score = 1.0
+    except (TypeError, ValueError):
+        exact_score = 0.0
+
+    # Exact score IDs are not encoded in legacy .osr files, so combine the
+    # independent fields conservatively.  Mod mismatch caps the quality.
+    quality = (
+        0.30 * mod_score
+        + 0.25 * accuracy_score
+        + 0.25 * stats_score
+        + 0.10 * combo_score
+        + 0.10 * exact_score
+    )
+    if mod_score == 0.0:
+        quality *= 0.35
+    return float(np.clip(quality, 0.0, 1.0))
+
+
+async def fetch_matching_score_pp(
+    cached: CachedReplay,
+    beatmap_id: int | None,
+) -> tuple[float | None, float]:
+    """Find this exact public score and return score PP, never profile PP."""
+    if not beatmap_id:
+        return None, 0.0
+    cache_key = (cached.replay_hash, int(beatmap_id))
+    cached_result = _osu_score_match_cache.get(cache_key)
+    if cached_result and cached_result[0] > time.time():
+        return cached_result[1]
+
+    user = await fetch_osu_user(cached.player)
+    token = await get_osu_access_token()
+    if not user or not user.get("id") or not token:
+        return None, 0.0
+
+    timeout = httpx.Timeout(20.0, connect=8.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                f"{OSU_API_BASE}/beatmaps/{int(beatmap_id)}/scores/users/{int(user['id'])}/all",
+                params={"mode": "osu", "legacy_only": 0},
+                headers=_osu_headers(token),
+            )
+    except httpx.HTTPError as exc:
+        print(json.dumps({"event": "score_pp_lookup_failed", "error": repr(exc)}), flush=True)
+        return None, 0.0
+
+    if response.status_code != 200:
+        _osu_score_match_cache[cache_key] = (time.time() + 300, (None, 0.0))
+        return None, 0.0
+
+    payload = response.json()
+    scores = payload.get("scores") if isinstance(payload, dict) else payload
+    scores = list(scores or [])
+    if not scores:
+        _osu_score_match_cache[cache_key] = (time.time() + 300, (None, 0.0))
+        return None, 0.0
+
+    ranked = sorted(
+        ((_score_match_quality(score, cached), score) for score in scores),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    quality, best = ranked[0]
+    pp = _finite_number(best.get("pp"))
+    if pp is None or pp < 0 or quality < 0.72:
+        result = (None, float(quality))
+    else:
+        result = (float(pp), float(quality))
+    _osu_score_match_cache[cache_key] = (time.time() + 1800, result)
+    return result
+
 def _score_mods(score: dict[str, Any]) -> list[str]:
     raw = score.get("mods") or []
     result: list[str] = []
@@ -1359,7 +1676,7 @@ async def wait_for_ordr_render(render_id: int) -> dict[str, Any]:
             return last_snapshot
         await asyncio.sleep(2.0)
     progress = (last_snapshot or {}).get("progress") or "unknown"
-    raise RuntimeError(f"o!rdr did not finish before the request timeout (last state: {progress})")
+    raise RuntimeError(f"o!rdr did not finish before cron timeout (last state: {progress})")
 
 
 async def infer_cached_replay(
@@ -1382,29 +1699,120 @@ async def infer_cached_replay(
     )
     metadata = parsed["map"]
     accuracy = replay_accuracy
-    tabular_core = build_tabular_core(
-        float(metadata["star"]),
-        accuracy,
-        float(metadata["lengthSeconds"]),
-        cached.model_mods,
-    )
-    session = await get_model_session()
-    outputs = await asyncio.to_thread(
-        session.run,
-        None,
-        {
-            "tabular_core": tabular_core,
-            "event_sequence": cached.event_sequence,
-            "action_windows": cached.action_windows,
-            "replay_summary": cached.replay_summary,
-        },
-    )
-    skill = float(np.asarray(outputs[0]).reshape(-1)[0])
-    base_skill = float(np.asarray(outputs[1]).reshape(-1)[0])
-    replay_correction = float(np.asarray(outputs[2]).reshape(-1)[0])
-    replay_gate = float(np.asarray(outputs[3]).reshape(-1)[0])
-    uncertainty = float(np.asarray(outputs[4]).reshape(-1)[0])
-    ordinal = np.asarray(outputs[5], dtype=np.float64).reshape(-1)
+
+    bundle = await get_model_bundle()
+    score_pp = _finite_number(render_metadata.get("scorePP") or render_metadata.get("_scorePP"))
+    score_match_quality = _finite_number(render_metadata.get("scoreMatchQuality")) or 0.0
+    score_pp_source = "render_metadata" if score_pp is not None else "missing"
+    beatmap_payload: dict[str, Any] | None = None
+    beatmap_text: str | None = None
+    parsed_beatmap: dict[str, Any] | None = None
+
+    if bundle is not None and cached.events is not None and len(cached.events) >= 2:
+        map_id = metadata.get("id")
+        beatmap_payload, beatmap_text = await asyncio.gather(
+            fetch_osu_beatmap(map_id),
+            fetch_osu_beatmap_text(map_id),
+        )
+        if beatmap_text:
+            try:
+                parsed_beatmap = parse_osu_beatmap(beatmap_text)
+            except Exception as exc:
+                print(json.dumps({"event": "beatmap_parse_failed", "error": repr(exc)}), flush=True)
+                parsed_beatmap = None
+            if score_pp is None:
+                local_pp = await asyncio.to_thread(
+                    calculate_local_score_pp,
+                    beatmap_text,
+                    cached.header,
+                    cached.display_mods,
+                )
+                if local_pp is not None:
+                    score_pp = local_pp
+                    score_match_quality = 1.0
+                    score_pp_source = "local_rosu"
+        if score_pp is None:
+            score_pp, score_match_quality = await fetch_matching_score_pp(cached, map_id)
+            if score_pp is not None:
+                score_pp_source = "osu_api_match"
+
+        status_value: float = 0.0
+        status = (beatmap_payload or {}).get("status")
+        if isinstance(status, (int, float)):
+            status_value = float(status)
+        elif isinstance(status, str):
+            status_value = {
+                "graveyard": -2.0,
+                "wip": -1.0,
+                "pending": 0.0,
+                "ranked": 1.0,
+                "approved": 2.0,
+                "qualified": 3.0,
+                "loved": 4.0,
+            }.get(status.casefold(), 0.0)
+
+        replay_object = {"header": cached.header, "events": cached.events}
+        static_features = build_static_features_v2(
+            replay_object,
+            star=float(metadata["star"]),
+            accuracy=accuracy,
+            length_seconds=float(metadata["lengthSeconds"]),
+            model_mods=cached.model_mods,
+            beatmap=parsed_beatmap,
+            score_pp=score_pp,
+            score_match_quality=score_match_quality,
+            map_ranked_status=status_value,
+            map_max_combo=(beatmap_payload or {}).get("max_combo"),
+            map_drain_seconds=(beatmap_payload or {}).get("hit_length")
+            or (beatmap_payload or {}).get("drain"),
+        )[None, :].astype(np.float32, copy=False)
+        skill, uncertainty, member_predictions = await asyncio.to_thread(
+            combine_bundle_predictions,
+            bundle,
+            static_features=static_features,
+            cached=cached,
+        )
+        static_predictions = [
+            prediction
+            for prediction, entry in zip(member_predictions, bundle["models"])
+            if str(entry.get("type") or "").casefold() == "static"
+        ]
+        base_skill = float(np.mean(static_predictions)) if static_predictions else float(np.mean(member_predictions))
+        replay_correction = skill - base_skill
+        replay_gate = 1.0
+        ordinal = np.asarray(
+            [1.0 / (1.0 + math.exp(-np.clip((skill - threshold) / 0.32, -30.0, 30.0))) for threshold in (1, 2, 3, 4, 5)],
+            dtype=np.float64,
+        )
+        model_version = str(bundle["config"].get("version") or "v2-bundle")
+        model_members = len(member_predictions)
+    else:
+        tabular_core = build_tabular_core(
+            float(metadata["star"]),
+            accuracy,
+            float(metadata["lengthSeconds"]),
+            cached.model_mods,
+        )
+        session = await get_model_session()
+        outputs = await asyncio.to_thread(
+            session.run,
+            None,
+            {
+                "tabular_core": tabular_core,
+                "event_sequence": cached.event_sequence,
+                "action_windows": cached.action_windows,
+                "replay_summary": cached.replay_summary,
+            },
+        )
+        skill = float(np.asarray(outputs[0]).reshape(-1)[0])
+        base_skill = float(np.asarray(outputs[1]).reshape(-1)[0])
+        replay_correction = float(np.asarray(outputs[2]).reshape(-1)[0])
+        replay_gate = float(np.asarray(outputs[3]).reshape(-1)[0])
+        uncertainty = float(np.asarray(outputs[4]).reshape(-1)[0])
+        ordinal = np.asarray(outputs[5], dtype=np.float64).reshape(-1)
+        model_version = "legacy-replay-ensemble"
+        model_members = 5
+
     if not all(math.isfinite(value) for value in (skill, base_skill, replay_correction, replay_gate, uncertainty)):
         raise RuntimeError("Model produced non-finite output")
 
@@ -1427,9 +1835,14 @@ async def infer_cached_replay(
         "accuracyPercent": 100.0 * accuracy,
         "metadata": metadata,
         "descriptionFormat": parsed["descriptionFormat"],
+        "parsedPlayer": parsed["player"],
         "ordinal": ordinal,
+        "scorePP": score_pp,
+        "scorePPSource": score_pp_source,
+        "scoreMatchQuality": score_match_quality,
+        "modelVersion": model_version,
+        "modelMembers": model_members,
     }
-
 
 def _cron_authorized(request: Request) -> bool:
     secret = os.getenv("CRON_SECRET")
@@ -1449,16 +1862,26 @@ def _ranking_page_for_slot(slot: int, run_date: date, attempt: int) -> int:
     )
 
 
-async def find_seed_candidate(slot: int, run_date: date) -> dict[str, Any]:
+async def find_seed_candidate(
+    slot: int,
+    run_date: date,
+    *,
+    selection_key: str | None = None,
+) -> dict[str, Any]:
+    selection_key = selection_key or f"cron:{run_date.isoformat()}:{slot}"
     for page_attempt in range(8):
-        page = _ranking_page_for_slot(slot, run_date, page_attempt)
+        if selection_key.startswith("cron:"):
+            page = _ranking_page_for_slot(slot, run_date, page_attempt)
+        else:
+            minimum, maximum = ((1, 60), (61, 350), (351, 1400))[slot % 3]
+            page = _stable_number(f"fresh-page:{selection_key}:{page_attempt}", minimum, maximum)
         ranking = await fetch_rankings_page(page)
         if not ranking:
             continue
         ordered_users = sorted(
             ranking,
             key=lambda row: hashlib.sha256(
-                f"seed-user:{run_date.isoformat()}:{slot}:{page_attempt}:{(row.get('user') or {}).get('id')}".encode("utf-8")
+                f"candidate-user:{selection_key}:{page_attempt}:{(row.get('user') or {}).get('id')}".encode("utf-8")
             ).digest(),
         )
         for rank_row in ordered_users[:10]:
@@ -1478,7 +1901,7 @@ async def find_seed_candidate(slot: int, run_date: date) -> dict[str, Any]:
             good_scores = [score for score in scores if _seed_score_is_good(score)]
             good_scores.sort(
                 key=lambda score: hashlib.sha256(
-                    f"seed-score:{run_date.isoformat()}:{slot}:{_score_id(score)}".encode("utf-8")
+                    f"candidate-score:{selection_key}:{_score_id(score)}".encode("utf-8")
                 ).digest()
             )
             for score in good_scores[:12]:
@@ -1524,194 +1947,6 @@ async def find_seed_candidate(slot: int, run_date: date) -> dict[str, Any]:
     raise RuntimeError("Could not find a fresh public score with a downloadable replay")
 
 
-def challenge_session_hash(session_id: str) -> str:
-    salt = (
-        os.getenv("DAILY_CHALLENGE_SALT")
-        or os.getenv("CACHE_SIGNING_SECRET")
-        or "osu-rankguess-session"
-    )
-    normalized = session_id.strip()
-    return hashlib.sha256(f"{salt}:{normalized}".encode("utf-8")).hexdigest()[:40]
-
-
-def infinite_item_from_row(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": row["challenge_id"],
-        "renderID": row.get("render_id"),
-        "videoURL": row["video_url"],
-        "source": "live",
-        "star": row.get("star"),
-        "accuracyPercent": row.get("accuracy_percent"),
-        "mods": [token for token in str(row.get("mods") or "NM").split(",") if token],
-        "lengthSeconds": row.get("length_seconds"),
-        "mapID": row.get("map_id"),
-        "mapLink": row.get("map_link"),
-        "beatmap": {
-            "artist": row.get("artist") or "",
-            "title": row.get("title") or "Unknown map",
-            "version": row.get("version") or "",
-            "creator": row.get("creator"),
-        },
-    }
-
-
-async def find_infinite_candidate() -> dict[str, Any]:
-    nonce = secrets.token_hex(12)
-    page_ranges = ((1, 20), (21, 200), (201, 1000))
-
-    for page_attempt in range(9):
-        band = (secrets.randbelow(len(page_ranges)) + page_attempt) % len(page_ranges)
-        minimum, maximum = page_ranges[band]
-        page = minimum + secrets.randbelow(maximum - minimum + 1)
-        ranking = await fetch_rankings_page(page)
-        if not ranking:
-            continue
-
-        ordered_users = sorted(
-            ranking,
-            key=lambda row: hashlib.sha256(
-                f"infinite-user:{nonce}:{page_attempt}:{(row.get('user') or {}).get('id')}".encode("utf-8")
-            ).digest(),
-        )
-
-        for rank_row in ordered_users[:8]:
-            user = rank_row.get("user") or {}
-            try:
-                user_id = int(user.get("id"))
-            except (TypeError, ValueError):
-                continue
-            username = str(user.get("username") or "").strip()
-            if not username:
-                continue
-
-            try:
-                scores = await fetch_user_best_scores(user_id)
-            except Exception as exc:
-                print(json.dumps({"event": "infinite_scores_failed", "userID": user_id, "error": repr(exc)}), flush=True)
-                continue
-
-            good_scores = [score for score in scores if _seed_score_is_good(score)]
-            good_scores.sort(
-                key=lambda score: hashlib.sha256(
-                    f"infinite-score:{nonce}:{_score_id(score)}".encode("utf-8")
-                ).digest()
-            )
-
-            for score in good_scores[:10]:
-                score_id = _score_id(score)
-                if score_id is None:
-                    continue
-                try:
-                    replay_bytes = await download_score_replay(score_id)
-                    replay_hash = compute_replay_hash(replay_bytes)
-                    in_gallery, seen_live = await asyncio.gather(
-                        asyncio.to_thread(submission_exists, replay_hash=replay_hash),
-                        asyncio.to_thread(infinite_replay_recent, replay_hash),
-                    )
-                    if in_gallery or seen_live:
-                        continue
-                    cached = build_cached_replay_from_bytes(
-                        replay_bytes,
-                        replay_hash,
-                        keep_replay_bytes=True,
-                    )
-                except Exception as exc:
-                    print(
-                        json.dumps(
-                            {"event": "infinite_replay_rejected", "scoreID": score_id, "error": repr(exc)},
-                            separators=(",", ":"),
-                        ),
-                        flush=True,
-                    )
-                    continue
-
-                statistics = rank_row.get("statistics") or user.get("statistics") or {}
-                actual_rank = rank_row.get("global_rank") or statistics.get("global_rank")
-                try:
-                    actual_rank = int(actual_rank) if actual_rank else None
-                except (TypeError, ValueError):
-                    actual_rank = None
-                if not actual_rank:
-                    continue
-
-                return {
-                    "nonce": nonce,
-                    "score": score,
-                    "scoreID": score_id,
-                    "cached": cached,
-                    "replayBytes": replay_bytes,
-                    "replayHash": replay_hash,
-                    "user": {
-                        "id": user_id,
-                        "username": username,
-                        "actualRank": actual_rank,
-                    },
-                }
-
-    raise RuntimeError("Could not find a fresh public replay. Try again in a minute.")
-
-
-async def create_live_infinite_challenge() -> dict[str, Any]:
-    candidate = await find_infinite_candidate()
-    cached: CachedReplay = candidate["cached"]
-    replay_hash = candidate["replayHash"]
-    render_id = await submit_ordr_bytes(
-        candidate["replayBytes"],
-        cached.player,
-        replay_hash,
-    )
-    snapshot = await wait_for_ordr_render(render_id)
-    video_url = validate_video_url(str(snapshot["videoURL"]))
-    render_metadata = dict(snapshot.get("renderMetadata") or {})
-    inference = await infer_cached_replay(
-        cached,
-        render_metadata,
-        description=snapshot.get("description"),
-    )
-    metadata = inference["metadata"]
-    score = candidate["score"]
-    beatmap = score.get("beatmap") or {}
-    beatmapset = score.get("beatmapset") or {}
-    salt = os.getenv("DAILY_CHALLENGE_SALT") or os.getenv("CACHE_SIGNING_SECRET") or "osu-rankguess-live"
-    challenge_id = hashlib.sha256(
-        f"{salt}:{replay_hash}:{candidate['nonce']}:{time.time_ns()}".encode("utf-8")
-    ).hexdigest()[:28]
-
-    record = {
-        "challenge_id": challenge_id,
-        "replay_hash": replay_hash,
-        "render_id": render_id,
-        "player": cached.player,
-        "actual_rank": int(candidate["user"]["actualRank"]),
-        "predicted_rank": inference["predictedRank"],
-        "star": float(metadata["star"]),
-        "accuracy_percent": inference["accuracyPercent"],
-        "mods": ",".join(cached.display_mods or ["NM"]),
-        "artist": metadata.get("artist") or beatmapset.get("artist"),
-        "title": metadata.get("title") or beatmapset.get("title"),
-        "version": metadata.get("version") or beatmap.get("version"),
-        "creator": metadata.get("creator") or beatmapset.get("creator"),
-        "length_seconds": float(metadata["lengthSeconds"]),
-        "map_id": metadata.get("id") or beatmap.get("id"),
-        "map_link": metadata.get("url") or render_metadata.get("mapLink"),
-        "video_url": video_url,
-    }
-    saved = await asyncio.to_thread(save_infinite_challenge, record)
-    print(
-        json.dumps(
-            {
-                "event": "infinite_challenge_created",
-                "challengeID": challenge_id,
-                "renderID": render_id,
-                "scoreID": candidate["scoreID"],
-            },
-            separators=(",", ":"),
-        ),
-        flush=True,
-    )
-    return saved
-
-
 async def seed_gallery_once(slot: int) -> dict[str, Any]:
     eligible_before = await asyncio.to_thread(challenge_count)
     if eligible_before >= GALLERY_SEED_TARGET:
@@ -1732,6 +1967,10 @@ async def seed_gallery_once(slot: int) -> dict[str, Any]:
     snapshot = await wait_for_ordr_render(render_id)
     video_url = validate_video_url(str(snapshot["videoURL"]))
     render_metadata = dict(snapshot.get("renderMetadata") or {})
+    score_pp = _finite_number(candidate.get("score", {}).get("pp"))
+    if score_pp is not None:
+        render_metadata["scorePP"] = score_pp
+        render_metadata["scoreMatchQuality"] = 1.0
     inference = await infer_cached_replay(
         cached,
         render_metadata,
@@ -1797,6 +2036,87 @@ async def seed_gallery_once(slot: int) -> dict[str, Any]:
     }
 
 
+async def generate_fresh_infinite_replay() -> dict[str, Any]:
+    """Create one private challenge from a newly selected public score.
+
+    The replay is never sampled from the gallery and is not published into it.
+    It is stored privately only so later guess requests can reveal the answer.
+    """
+    selection_key = secrets.token_urlsafe(18)
+    slot = secrets.randbelow(3)
+    run_date = datetime.now(timezone.utc).date()
+    candidate = await find_seed_candidate(
+        slot,
+        run_date,
+        selection_key=selection_key,
+    )
+    cached: CachedReplay = candidate["cached"]
+    replay_hash = candidate["replayHash"]
+    replay_bytes = candidate["replayBytes"]
+    render_id = await submit_ordr_bytes(replay_bytes, cached.player, replay_hash)
+    snapshot = await wait_for_ordr_render(render_id)
+    video_url = validate_video_url(str(snapshot["videoURL"]))
+    render_metadata = dict(snapshot.get("renderMetadata") or {})
+    score_pp = _finite_number(candidate.get("score", {}).get("pp"))
+    if score_pp is not None:
+        render_metadata["scorePP"] = score_pp
+        render_metadata["scoreMatchQuality"] = 1.0
+    inference = await infer_cached_replay(
+        cached,
+        render_metadata,
+        description=snapshot.get("description"),
+    )
+    metadata = inference["metadata"]
+    score = candidate["score"]
+    user = candidate["user"]
+    actual_rank = user.get("globalRank")
+    if not actual_rank:
+        raise RuntimeError("Selected public player no longer has a global rank")
+
+    beatmap_payload = score.get("beatmap") or {}
+    if score.get("beatmapset"):
+        beatmap_payload = dict(beatmap_payload)
+        beatmap_payload["beatmapset"] = score.get("beatmapset")
+    thumbnail_url = _cover_url_from_beatmap_payload(beatmap_payload)
+    if not thumbnail_url:
+        osu_beatmap = await fetch_osu_beatmap(metadata.get("id"))
+        thumbnail_url = _cover_url_from_beatmap_payload(osu_beatmap)
+
+    public_id = make_public_id(replay_hash)
+    record = {
+        "public_id": public_id,
+        "replay_hash": replay_hash,
+        "render_id": render_id,
+        "player": cached.player,
+        "osu_user_id": user.get("id"),
+        "avatar_url": user.get("avatarURL"),
+        "country_code": user.get("countryCode"),
+        "actual_rank": int(actual_rank),
+        "predicted_rank": inference["predictedRank"],
+        "skill": inference["skill"],
+        "top_percent": inference["topPercent"],
+        "confidence": inference["confidence"],
+        "star": float(metadata["star"]),
+        "accuracy_percent": inference["accuracyPercent"],
+        "mods": ",".join(cached.display_mods or ["NM"]),
+        "artist": metadata.get("artist") or (score.get("beatmapset") or {}).get("artist"),
+        "title": metadata.get("title") or (score.get("beatmapset") or {}).get("title"),
+        "version": metadata.get("version") or (score.get("beatmap") or {}).get("version"),
+        "creator": metadata.get("creator") or (score.get("beatmapset") or {}).get("creator"),
+        "length_seconds": float(metadata["lengthSeconds"]),
+        "map_id": metadata.get("id") or (score.get("beatmap") or {}).get("id"),
+        "map_link": metadata.get("url") or render_metadata.get("mapLink"),
+        "video_url": video_url,
+        "thumbnail_url": thumbnail_url,
+        "source": "infinite",
+        "published": False,
+    }
+    saved = await asyncio.to_thread(save_submission, record)
+    if not saved:
+        raise RuntimeError("Database did not save private infinite replay")
+    return gallery_item_from_row(saved, reveal_answer=False)
+
+
 @app.get("/", include_in_schema=False)
 async def index() -> RedirectResponse:
     return RedirectResponse(url="/index.html", status_code=307)
@@ -1804,12 +2124,26 @@ async def index() -> RedirectResponse:
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    session = await get_model_session()
+    bundle = await get_model_bundle()
+    if bundle is not None:
+        model_name = "bundle.json"
+        model_version = str(bundle["config"].get("version") or "v2-bundle")
+        inputs = {
+            entry["file"]: {value.name: value.shape for value in entry["session"].get_inputs()}
+            for entry in bundle["models"]
+        }
+    else:
+        session = await get_model_session()
+        model_name = MODEL_PATH.name
+        model_version = "legacy-replay-ensemble"
+        inputs = {value.name: value.shape for value in session.get_inputs()}
     return {
         "ok": True,
-        "model": MODEL_PATH.name,
-        "version": "3.2.0",
-        "inputs": {value.name: value.shape for value in session.get_inputs()},
+        "model": model_name,
+        "modelVersion": model_version,
+        "bundleConfigured": bundle is not None,
+        "version": "4.0.1",
+        "inputs": inputs,
         "databaseConfigured": database_configured(),
         "database": database_diagnostics(),
         "rankPopulation": OSU_RANK_POPULATION,
@@ -1921,6 +2255,7 @@ async def cache_replay(
         event_sequence=event_sequence,
         action_windows=action_windows,
         replay_summary=replay_summary,
+        events=np.asarray(events, dtype=np.float32),
         model_mods=model_mods,
         display_mods=display_mods,
         expires_at=time.time() + CACHE_TTL_SECONDS,
@@ -2209,14 +2544,7 @@ async def gallery_thumbnail(public_id: str) -> RedirectResponse:
 async def daily_challenge_api() -> JSONResponse:
     challenge_date = datetime.now(timezone.utc).date()
     if not database_configured():
-        return JSONResponse({
-            "ok": True,
-            "available": False,
-            "reason": "database_not_configured",
-            "date": challenge_date.isoformat(),
-            "rankPopulation": OSU_RANK_POPULATION,
-            "replays": [],
-        })
+        return JSONResponse({"ok": True, "available": False, "reason": "database_not_configured", "date": challenge_date.isoformat(), "replays": []})
     try:
         rows = await asyncio.to_thread(get_daily_challenge, challenge_date, 3)
         count = await asyncio.to_thread(challenge_count)
@@ -2234,27 +2562,24 @@ async def daily_challenge_api() -> JSONResponse:
 
 
 @app.post("/api/challenge/infinite")
-async def infinite_challenge_api(
-    session_id: str | None = Query(default=None, alias="sessionID", max_length=160),
-) -> JSONResponse:
+async def infinite_challenge_api() -> JSONResponse:
     if not database_configured():
         return JSONResponse({"ok": True, "available": False, "reason": "database_not_configured"})
-    if not os.getenv("OSU_CLIENT_ID") or not os.getenv("OSU_CLIENT_SECRET"):
-        return JSONResponse({"ok": True, "available": False, "reason": "osu_api_not_configured"})
     try:
-        row = await create_live_infinite_challenge()
+        replay = await generate_fresh_infinite_replay()
     except Exception as exc:
-        print(json.dumps({"event": "infinite_challenge_failed", "error": repr(exc)}), flush=True)
+        print(json.dumps({"event": "infinite_generation_failed", "error": repr(exc)}), flush=True)
         raise HTTPException(
-            status_code=503,
+            status_code=502,
             detail={"code": "infinite_generation_failed", "message": str(exc)},
         ) from exc
     return JSONResponse({
         "ok": True,
         "available": True,
+        "fresh": True,
         "maxAttempts": MAX_CHALLENGE_ATTEMPTS,
         "rankPopulation": OSU_RANK_POPULATION,
-        "replay": infinite_item_from_row(row),
+        "replay": replay,
     })
 
 
@@ -2262,51 +2587,40 @@ async def infinite_challenge_api(
 async def challenge_guess(payload: ChallengeGuessPayload) -> JSONResponse:
     if not database_configured():
         raise HTTPException(status_code=503, detail={"code": "database_not_configured", "message": "Connect a database first."})
-
-    mode = payload.mode.strip().lower()
-    challenge_date = payload.challenge_date or datetime.now(timezone.utc).date()
-    challenge_key: str
-    row: dict[str, Any] | None
-
     try:
-        if mode == "daily":
-            row = await asyncio.to_thread(get_submission, payload.replay_id)
-            daily_rows = await asyncio.to_thread(get_daily_challenge, challenge_date, 3)
-            if payload.replay_id not in {item["public_id"] for item in daily_rows}:
-                raise HTTPException(status_code=400, detail={"code": "not_daily_replay", "message": "Replay is not part of that daily challenge."})
-            challenge_key = challenge_date.isoformat()
-        elif mode == "infinite":
-            row = await asyncio.to_thread(get_infinite_challenge, payload.replay_id)
-            challenge_key = payload.replay_id
-        else:
-            raise HTTPException(status_code=400, detail={"code": "invalid_mode", "message": "Mode must be daily or infinite."})
-    except HTTPException:
-        raise
+        row = await asyncio.to_thread(get_challenge_submission, payload.replay_id)
     except Exception as exc:
         raise HTTPException(status_code=503, detail={"code": "database_error", "message": str(exc)}) from exc
-
     if not row or not row.get("actual_rank"):
-        raise HTTPException(status_code=404, detail={"code": "challenge_missing", "message": "Challenge replay was not found or expired."})
+        raise HTTPException(status_code=404, detail={"code": "challenge_missing", "message": "Challenge replay was not found."})
+
+    mode = payload.mode.strip().lower()
+    if mode == "daily":
+        challenge_date = payload.challenge_date or datetime.now(timezone.utc).date()
+        daily_rows = await asyncio.to_thread(get_daily_challenge, challenge_date, 3)
+        if payload.replay_id not in {item["public_id"] for item in daily_rows}:
+            raise HTTPException(status_code=400, detail={"code": "not_daily_replay", "message": "Replay is not part of that daily challenge."})
+        challenge_key = challenge_date.isoformat()
+    elif mode == "infinite":
+        challenge_key = payload.replay_id
+    else:
+        raise HTTPException(status_code=400, detail={"code": "invalid_mode", "message": "Mode must be daily or infinite."})
+
+    try:
+        await asyncio.to_thread(
+            record_challenge_guess,
+            replay_id=payload.replay_id,
+            visitor_id=payload.visitor_id,
+            mode=mode,
+            challenge_key=challenge_key,
+            guess_rank=payload.guess_rank,
+        )
+    except Exception as exc:
+        print(json.dumps({"event": "challenge_guess_store_failed", "error": repr(exc)}), flush=True)
 
     actual_rank = int(row["actual_rank"])
     correct, direction, closeness, log_error = challenge_feedback(actual_rank, payload.guess_rank)
     reveal = correct or payload.attempt >= MAX_CHALLENGE_ATTEMPTS
-    session_hash = challenge_session_hash(payload.session_id)
-
-    try:
-        await asyncio.to_thread(
-            save_challenge_guess,
-            replay_id=payload.replay_id,
-            challenge_key=challenge_key,
-            mode=mode,
-            guess_rank=payload.guess_rank,
-            attempt=payload.attempt,
-            session_hash=session_hash,
-            correct=correct,
-        )
-    except Exception as exc:
-        print(json.dumps({"event": "challenge_guess_save_failed", "error": repr(exc)}), flush=True)
-
     response: dict[str, Any] = {
         "ok": True,
         "correct": correct,
@@ -2318,24 +2632,42 @@ async def challenge_guess(payload: ChallengeGuessPayload) -> JSONResponse:
         "logError": log_error,
     }
     if reveal:
+        distribution = await asyncio.to_thread(
+            challenge_guess_distribution,
+            replay_id=payload.replay_id,
+            mode=mode,
+            challenge_key=challenge_key,
+            rank_population=OSU_RANK_POPULATION,
+        )
         response.update({
             "actualRank": actual_rank,
             "predictedRank": int(row["predicted_rank"]),
             "player": row["player"],
             "avatarURL": row.get("avatar_url"),
+            "distribution": distribution,
         })
-        if mode == "daily":
-            try:
-                response["distribution"] = await asyncio.to_thread(
-                    challenge_guess_distribution,
-                    replay_id=payload.replay_id,
-                    challenge_key=challenge_key,
-                    mode=mode,
-                    rank_population=OSU_RANK_POPULATION,
-                )
-            except Exception as exc:
-                print(json.dumps({"event": "challenge_distribution_failed", "error": repr(exc)}), flush=True)
     return JSONResponse(response)
+
+
+@app.get("/api/challenge/{replay_id}/distribution")
+async def challenge_distribution_api(
+    replay_id: str,
+    mode: str = Query("infinite", pattern="^(daily|infinite)$"),
+    challenge_date: date | None = Query(default=None, alias="challengeDate"),
+) -> JSONResponse:
+    challenge_key = (
+        (challenge_date or datetime.now(timezone.utc).date()).isoformat()
+        if mode == "daily"
+        else replay_id
+    )
+    distribution = await asyncio.to_thread(
+        challenge_guess_distribution,
+        replay_id=replay_id,
+        mode=mode,
+        challenge_key=challenge_key,
+        rank_population=OSU_RANK_POPULATION,
+    )
+    return JSONResponse({"ok": True, "distribution": distribution})
 
 
 @app.post("/api/predict")
@@ -2354,85 +2686,52 @@ async def predict(payload: PredictPayload) -> JSONResponse:
             detail={"code": "cache_miss", "message": "Replay cache was lost. Upload the replay again."},
         )
 
-    replay_accuracy = replay_accuracy_from_header(cached.header)
-    replay_duration = replay_duration_from_summary(cached)
     render_metadata = dict(payload.render_metadata or {})
     description_text = _clean_text(payload.description or render_metadata.get("description"))
-    title_text = _clean_text(render_metadata.get("title"))
-
-    parsed_description = parse_ordr_metadata(
+    inference = await infer_cached_replay(
+        cached,
+        render_metadata,
         description=description_text,
-        title=title_text,
-        render_metadata=render_metadata,
-        fallback_length_seconds=replay_duration,
-        fallback_accuracy=replay_accuracy,
-        fallback_player=cached.player,
     )
+    metadata = inference["metadata"]
+    skill = float(inference["skill"])
+    base_skill = float(inference["baseSkill"])
+    replay_correction = float(inference["replayCorrection"])
+    replay_gate = float(inference["replayGate"])
+    uncertainty = float(inference["uncertainty"])
+    ordinal = np.asarray(inference["ordinal"], dtype=np.float64).reshape(-1)
+    rank_percentile = float(inference["rankPercentile"])
+    top_percent = float(inference["topPercent"])
+    predicted_rank = int(inference["predictedRank"])
+    confidence = str(inference["confidence"])
+    accuracy = float(inference["accuracy"])
+    one_in = max(1, int(round(1.0 / max(rank_percentile, 1e-12))))
 
     print(
         json.dumps(
             {
-                "event": "predict_metadata",
+                "event": "prediction_complete",
                 "renderID": payload.render_id,
-                "descriptionFormat": parsed_description["descriptionFormat"],
-                "star": parsed_description["star"],
-                "lengthSeconds": parsed_description["lengthSeconds"],
-                "player": parsed_description["player"],
-                "description": description_text,
-                "title": title_text,
-                "mapLength": render_metadata.get("mapLength"),
-                "replayMods": render_metadata.get("replayMods"),
+                "modelVersion": inference["modelVersion"],
+                "modelMembers": inference["modelMembers"],
+                "star": metadata.get("star"),
+                "lengthSeconds": metadata.get("lengthSeconds"),
+                "scorePP": inference.get("scorePP"),
+                "scorePPSource": inference.get("scorePPSource"),
+                "scoreMatchQuality": inference.get("scoreMatchQuality"),
+                "predictedRank": predicted_rank,
             },
             ensure_ascii=False,
             separators=(",", ":"),
         ),
         flush=True,
     )
-    # Use the replay header for accuracy because it is exact and does not
-    # depend on o!rdr's human-readable formatting or rounding.
-    accuracy = replay_accuracy
-    parsed_description["accuracy"] = accuracy
-    parsed_description["accuracyPercent"] = 100.0 * accuracy
-    metadata = parsed_description["map"]
-
-    tabular_core = build_tabular_core(
-        float(metadata["star"]),
-        accuracy,
-        float(metadata["lengthSeconds"]),
-        cached.model_mods,
-    )
-    tensors = {
-        "tabular_core": tabular_core,
-        "event_sequence": cached.event_sequence,
-        "action_windows": cached.action_windows,
-        "replay_summary": cached.replay_summary,
-    }
-
-    session = await get_model_session()
-    outputs = await asyncio.to_thread(session.run, None, tensors)
-
-    skill = float(np.asarray(outputs[0]).reshape(-1)[0])
-    base_skill = float(np.asarray(outputs[1]).reshape(-1)[0])
-    replay_correction = float(np.asarray(outputs[2]).reshape(-1)[0])
-    replay_gate = float(np.asarray(outputs[3]).reshape(-1)[0])
-    uncertainty = float(np.asarray(outputs[4]).reshape(-1)[0])
-    ordinal = np.asarray(outputs[5], dtype=np.float64).reshape(-1)
-
-    scalar_values = [skill, base_skill, replay_correction, replay_gate, uncertainty]
-    if not all(math.isfinite(value) for value in scalar_values):
-        raise RuntimeError("Model produced non-finite output")
-
-    rank_percentile = min(1.0, max(1.0 / OSU_RANK_POPULATION, 10.0 ** (-skill)))
-    top_percent = 100.0 * rank_percentile
-    one_in = max(1, int(round(1.0 / max(rank_percentile, 1e-12))))
-    predicted_rank = max(1, min(OSU_RANK_POPULATION, int(round(rank_percentile * OSU_RANK_POPULATION))))
-    confidence = confidence_label(uncertainty)
 
     header = cached.header
+    parsed_player = str(inference.get("parsedPlayer") or cached.player)
     player_warning = None
-    description_player = str(parsed_description["player"])
-    if description_player.casefold() != cached.player.casefold():
-        player_warning = f"o!rdr reported {description_player}; replay header reported {cached.player}."
+    if parsed_player.casefold() != cached.player.casefold():
+        player_warning = f"o!rdr reported {parsed_player}; replay header reported {cached.player}."
 
     osu_user = await fetch_osu_user(cached.player)
     actual_rank = int(osu_user["globalRank"]) if osu_user and osu_user.get("globalRank") else None
@@ -2483,7 +2782,6 @@ async def predict(payload: PredictPayload) -> JSONResponse:
         except Exception as exc:
             print(json.dumps({"event": "gallery_save_failed", "error": repr(exc)}), flush=True)
 
-
     return JSONResponse(
         {
             "skill": skill,
@@ -2507,6 +2805,10 @@ async def predict(payload: PredictPayload) -> JSONResponse:
                 "gt4": float(ordinal[3]),
                 "gt5": float(ordinal[4]),
             },
+            "modelVersion": inference["modelVersion"],
+            "modelMembers": inference["modelMembers"],
+            "scorePP": inference.get("scorePP"),
+            "scoreMatchQuality": inference.get("scoreMatchQuality"),
             "player": cached.player,
             "playerWarning": player_warning,
             "accuracy": accuracy,
@@ -2524,11 +2826,12 @@ async def predict(payload: PredictPayload) -> JSONResponse:
             "beatmapHash": header["beatmap_hash"],
             "beatmap": metadata,
             "renderID": payload.render_id,
-            "renderDescription": description_text or title_text,
-            "descriptionFormat": parsed_description["descriptionFormat"],
+            "renderDescription": description_text or _clean_text(render_metadata.get("title")),
+            "descriptionFormat": inference["descriptionFormat"],
             "videoURL": video_url,
             "gallerySaved": gallery_saved,
             "galleryID": gallery_id,
             "thumbnailURL": thumbnail_url,
         }
     )
+
