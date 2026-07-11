@@ -19,7 +19,7 @@ from urllib.parse import quote, urlparse
 import httpx
 import numpy as np
 import onnxruntime as ort
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
@@ -35,6 +35,8 @@ from database import (
     make_public_id,
     random_challenge_submission,
     save_submission,
+    submission_exists,
+    update_submission_thumbnail,
 )
 
 from replay_features import (
@@ -61,6 +63,8 @@ ORDR_DYNLINK_URL = "https://apis.issou.best/dynlink/ordr/gen"
 OSU_TOKEN_URL = "https://osu.ppy.sh/oauth/token"
 OSU_API_BASE = "https://osu.ppy.sh/api/v2"
 OSU_RANK_POPULATION = int(os.getenv("OSU_RANK_POPULATION", "5500000") or 5500000)
+GALLERY_SEED_TARGET = max(3, int(os.getenv("GALLERY_SEED_TARGET", "12") or 12))
+SEED_RENDER_TIMEOUT_SECONDS = max(30, min(200, int(os.getenv("SEED_RENDER_TIMEOUT_SECONDS", "160") or 160)))
 MAX_CHALLENGE_ATTEMPTS = 5
 
 MOD_BITS: dict[str, int] = {
@@ -137,7 +141,7 @@ MAP_PATTERN = re.compile(
 
 app = FastAPI(
     title="osu!rankguess",
-    version="3.0.1",
+    version="3.1.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -150,6 +154,7 @@ _osu_token_lock = asyncio.Lock()
 _osu_token: str | None = None
 _osu_token_expires_at = 0.0
 _osu_user_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_osu_beatmap_cache: dict[int, tuple[float, dict[str, Any] | None]] = {}
 
 
 @dataclass
@@ -445,6 +450,57 @@ def validate_cached_shapes(cached: CachedReplay) -> None:
     for name, expected in expected_shapes.items():
         if actual[name] != expected:
             raise RuntimeError(f"{name}: expected {expected}, got {actual[name]}")
+
+
+def build_cached_replay_from_bytes(
+    replay_bytes: bytes,
+    replay_hash: str | None = None,
+    *,
+    keep_replay_bytes: bool = False,
+) -> CachedReplay:
+    if len(replay_bytes) > MAX_REPLAY_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"code": "file_too_large", "message": "Replay exceeds the 4 MB application limit."},
+        )
+
+    replay_hash = replay_hash or compute_replay_hash(replay_bytes)
+    parsed = parse_osr(replay_bytes)
+    header = parsed["header"]
+    events = parsed["events"]
+
+    if int(header["mode"]) != 0:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "unsupported_mode", "message": "This model supports osu!standard replays only."},
+        )
+    if len(events) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "empty_replay",
+                "message": "Replay contains too few cursor events after decoding.",
+                "eventCount": int(len(events)),
+                "gameVersion": int(header["game_version"]),
+            },
+        )
+
+    model_mods, display_mods = canonical_mods_from_mask(int(header["mods_mask"]))
+    cached = CachedReplay(
+        replay_hash=replay_hash,
+        player=str(header["player_name"]),
+        header=header,
+        event_count=int(len(events)),
+        event_sequence=build_event_sequence(events)[None, :, :].astype(np.float32, copy=False),
+        action_windows=build_action_windows(events)[None, :, :, :].astype(np.float32, copy=False),
+        replay_summary=build_replay_summary(parsed)[None, :].astype(np.float32, copy=False),
+        model_mods=model_mods,
+        display_mods=display_mods,
+        expires_at=time.time() + CACHE_TTL_SECONDS,
+        replay_bytes=replay_bytes if keep_replay_bytes else None,
+    )
+    validate_cached_shapes(cached)
+    return cached
 
 
 async def put_cached_replay(cached: CachedReplay) -> None:
@@ -887,6 +943,219 @@ async def fetch_osu_user(username: str) -> dict[str, Any] | None:
     return result
 
 
+def _osu_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+
+def _cover_url_from_beatmap_payload(payload: dict[str, Any] | None) -> str | None:
+    if not payload:
+        return None
+    beatmapset = payload.get("beatmapset") or {}
+    covers = beatmapset.get("covers") or {}
+    for key in ("card@2x", "cover@2x", "card", "cover", "list@2x", "list"):
+        value = covers.get(key)
+        if isinstance(value, str) and value.startswith("https://"):
+            return value
+    beatmapset_id = beatmapset.get("id") or payload.get("beatmapset_id")
+    try:
+        beatmapset_id = int(beatmapset_id)
+    except (TypeError, ValueError):
+        return None
+    return f"https://assets.ppy.sh/beatmaps/{beatmapset_id}/covers/card.jpg"
+
+
+async def fetch_osu_beatmap(beatmap_id: int | None) -> dict[str, Any] | None:
+    if not beatmap_id:
+        return None
+    beatmap_id = int(beatmap_id)
+    cached = _osu_beatmap_cache.get(beatmap_id)
+    if cached and cached[0] > time.time():
+        return cached[1]
+
+    token = await get_osu_access_token()
+    if not token:
+        return None
+
+    timeout = httpx.Timeout(15.0, connect=8.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                f"{OSU_API_BASE}/beatmaps/{beatmap_id}",
+                headers=_osu_headers(token),
+            )
+    except httpx.HTTPError as exc:
+        print(json.dumps({"event": "osu_beatmap_failed", "error": repr(exc)}), flush=True)
+        return None
+
+    if response.status_code != 200:
+        print(
+            json.dumps(
+                {
+                    "event": "osu_beatmap_failed",
+                    "beatmapID": beatmap_id,
+                    "status": response.status_code,
+                    "body": response.text[:300],
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        _osu_beatmap_cache[beatmap_id] = (time.time() + 300, None)
+        return None
+
+    payload = response.json()
+    _osu_beatmap_cache[beatmap_id] = (time.time() + 3600, payload)
+    return payload
+
+
+def _score_mods(score: dict[str, Any]) -> list[str]:
+    raw = score.get("mods") or []
+    result: list[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            acronym = item
+        elif isinstance(item, dict):
+            acronym = item.get("acronym") or item.get("name")
+        else:
+            acronym = None
+        if acronym:
+            result.append(str(acronym).upper())
+    return result
+
+
+def _score_accuracy(score: dict[str, Any]) -> float:
+    value = score.get("accuracy")
+    try:
+        accuracy = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if accuracy > 1.0:
+        accuracy /= 100.0
+    return accuracy
+
+
+def _score_has_replay(score: dict[str, Any]) -> bool:
+    for key in ("has_replay", "replay", "replay_available"):
+        value = score.get(key)
+        if isinstance(value, bool):
+            return value
+        if value not in (None, "", 0, "0", "false", "False"):
+            return True
+    return False
+
+
+def _score_id(score: dict[str, Any]) -> int | None:
+    for key in ("id", "legacy_score_id", "score_id"):
+        try:
+            value = int(score.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _seed_score_is_good(score: dict[str, Any]) -> bool:
+    if not _score_has_replay(score) or _score_id(score) is None:
+        return False
+    accuracy = _score_accuracy(score)
+    if not 0.84 <= accuracy <= 0.99999:
+        return False
+    mods = set(_score_mods(score))
+    if mods.intersection({"RX", "AP", "AT", "FL"}):
+        return False
+    beatmap = score.get("beatmap") or {}
+    try:
+        star = float(beatmap.get("difficulty_rating") or 0.0)
+        length = float(beatmap.get("total_length") or beatmap.get("hit_length") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if not 4.5 <= star <= 10.5:
+        return False
+    if length and not 25 <= length <= 420:
+        return False
+    rank = str(score.get("rank") or "").upper()
+    if rank == "F":
+        return False
+    return True
+
+
+def _stable_number(label: str, minimum: int, maximum: int) -> int:
+    if maximum < minimum:
+        return minimum
+    digest = hashlib.sha256(label.encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "big")
+    return minimum + value % (maximum - minimum + 1)
+
+
+async def fetch_rankings_page(page: int) -> list[dict[str, Any]]:
+    token = await get_osu_access_token()
+    if not token:
+        raise RuntimeError("osu! API credentials are not configured")
+    timeout = httpx.Timeout(20.0, connect=8.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(
+            f"{OSU_API_BASE}/rankings/osu/performance",
+            params={"page": int(page)},
+            headers=_osu_headers(token),
+        )
+    if response.status_code != 200:
+        raise RuntimeError(f"osu! rankings returned HTTP {response.status_code}: {response.text[:240]}")
+    payload = response.json()
+    return list(payload.get("ranking") or [])
+
+
+async def fetch_user_best_scores(user_id: int) -> list[dict[str, Any]]:
+    token = await get_osu_access_token()
+    if not token:
+        raise RuntimeError("osu! API credentials are not configured")
+    timeout = httpx.Timeout(20.0, connect=8.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(
+            f"{OSU_API_BASE}/users/{int(user_id)}/scores/best",
+            params={
+                "mode": "osu",
+                "limit": 100,
+                "offset": 0,
+                "include_fails": 0,
+                "legacy_only": 1,
+            },
+            headers=_osu_headers(token),
+        )
+    if response.status_code != 200:
+        raise RuntimeError(f"osu! best scores returned HTTP {response.status_code}: {response.text[:240]}")
+    payload = response.json()
+    return list(payload if isinstance(payload, list) else payload.get("scores") or [])
+
+
+async def download_score_replay(score_id: int) -> bytes:
+    token = await get_osu_access_token()
+    if not token:
+        raise RuntimeError("osu! API credentials are not configured")
+    timeout = httpx.Timeout(30.0, connect=8.0)
+    paths = (
+        f"{OSU_API_BASE}/scores/osu/{int(score_id)}/download",
+        f"{OSU_API_BASE}/scores/{int(score_id)}/download",
+    )
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        last_status = None
+        last_body = ""
+        replay_headers = _osu_headers(token)
+        replay_headers["Accept"] = "application/octet-stream"
+        for url in paths:
+            response = await client.get(url, headers=replay_headers)
+            last_status = response.status_code
+            last_body = response.text[:240] if "text" in (response.headers.get("content-type") or "") else ""
+            if response.status_code == 200 and response.content:
+                return bytes(response.content)
+            if response.status_code not in {404, 422}:
+                break
+    raise RuntimeError(f"osu! replay download failed with HTTP {last_status}: {last_body}")
+
+
 def _iso_datetime(value: Any) -> str | None:
     if value is None:
         return None
@@ -900,6 +1169,8 @@ def gallery_item_from_row(row: dict[str, Any], *, reveal_answer: bool = True) ->
         "id": row["public_id"],
         "renderID": row.get("render_id"),
         "videoURL": row["video_url"],
+        "thumbnailURL": row.get("thumbnail_url") or f"/api/gallery/{row['public_id']}/thumbnail",
+        "source": row.get("source") or "upload",
         "player": row.get("player"),
         "avatarURL": row.get("avatar_url"),
         "countryCode": row.get("country_code"),
@@ -959,6 +1230,379 @@ def challenge_feedback(actual_rank: int, guess_rank: int) -> tuple[bool, str, st
     return correct, direction, closeness, log_error
 
 
+def _render_metadata_object(render: dict[str, Any]) -> dict[str, Any]:
+    description = _clean_text(render.get("description")) or None
+    title = _clean_text(render.get("title")) or None
+    return {
+        "description": description,
+        "title": title,
+        "star": _extract_star(title, description),
+        "username": render.get("username"),
+        "replayUsername": render.get("replayUsername"),
+        "replayMods": render.get("replayMods"),
+        "mapTitle": render.get("mapTitle"),
+        "mapLength": render.get("mapLength"),
+        "drainTime": render.get("drainTime"),
+        "replayDifficulty": render.get("replayDifficulty"),
+        "mapID": render.get("mapID"),
+        "mapLink": render.get("mapLink"),
+    }
+
+
+async def submit_ordr_bytes(replay_bytes: bytes, username: str, replay_hash: str) -> int:
+    data = {
+        "skin": os.getenv("ORDR_SKIN", "whitecatCK1.0"),
+        "resolution": os.getenv("ORDR_RESOLUTION", "960x540"),
+        "showPPCounter": "false",
+        "showScoreboard": "false",
+        "showResultScreen": "true",
+        "skip": "true",
+        "customSkin": "false",
+        "generateThumbnail": "true",
+    }
+    verification_key = os.getenv("ORDR_API_KEY")
+    if verification_key:
+        data["verificationKey"] = verification_key
+
+    upload_name = sanitize_replay_filename(username, replay_hash)
+    timeout = httpx.Timeout(45.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            ORDR_RENDER_URL,
+            data={key: str(value) for key, value in data.items()},
+            files={"replayFile": (upload_name, replay_bytes, "application/octet-stream")},
+            headers={"Accept": "application/json"},
+        )
+    payload = safe_ordr_error(response)
+    if response.status_code != 201:
+        raise RuntimeError(
+            f"o!rdr rejected replay (HTTP {response.status_code}, code {payload.get('errorCode')}): "
+            f"{payload.get('message') or response.text[:240]}"
+        )
+    render_id = payload.get("renderID")
+    if render_id is None:
+        raise RuntimeError("o!rdr did not return a render ID")
+    return int(render_id)
+
+
+async def fetch_ordr_snapshot(render_id: int) -> dict[str, Any]:
+    timeout = httpx.Timeout(20.0, connect=8.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(
+            ORDR_RENDER_URL,
+            params={"renderID": int(render_id)},
+            headers={"Accept": "application/json"},
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"o!rdr status returned HTTP {response.status_code}")
+        payload = response.json()
+        renders = payload.get("renders") or []
+        if not renders:
+            return {"ready": False, "progress": "Queued", "render": None, "videoURL": None}
+
+        render = dict(renders[0])
+        error_code = int(render.get("errorCode") or 0)
+        if error_code:
+            raise RuntimeError(f"o!rdr render failed with error code {error_code}")
+
+        dynlink_url: Any = None
+        try:
+            dynlink_response = await client.get(
+                ORDR_DYNLINK_URL,
+                params={"id": int(render_id)},
+                headers={"Accept": "application/json"},
+            )
+            if dynlink_response.status_code == 200:
+                dynlink_payload = dynlink_response.json()
+                if isinstance(dynlink_payload, dict):
+                    dynlink_url = dynlink_payload.get("url")
+        except (httpx.HTTPError, ValueError):
+            dynlink_url = None
+
+    video_url = next(
+        (
+            normalized
+            for candidate in (
+                dynlink_url,
+                render.get("videoUrl"),
+                render.get("videoURL"),
+                render.get("url"),
+            )
+            if (normalized := normalize_issou_video_url(candidate)) is not None
+        ),
+        None,
+    )
+    render_metadata = _render_metadata_object(render)
+    return {
+        "ready": bool(video_url and render_metadata.get("star") is not None),
+        "progress": str(render.get("progress") or "Queued"),
+        "render": render,
+        "renderMetadata": render_metadata,
+        "description": render_metadata.get("description"),
+        "title": render_metadata.get("title"),
+        "videoURL": video_url,
+    }
+
+
+async def wait_for_ordr_render(render_id: int) -> dict[str, Any]:
+    deadline = time.monotonic() + SEED_RENDER_TIMEOUT_SECONDS
+    last_snapshot: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        last_snapshot = await fetch_ordr_snapshot(render_id)
+        if last_snapshot.get("ready"):
+            return last_snapshot
+        await asyncio.sleep(2.0)
+    progress = (last_snapshot or {}).get("progress") or "unknown"
+    raise RuntimeError(f"o!rdr did not finish before cron timeout (last state: {progress})")
+
+
+async def infer_cached_replay(
+    cached: CachedReplay,
+    render_metadata: dict[str, Any],
+    *,
+    description: str | None = None,
+) -> dict[str, Any]:
+    replay_accuracy = replay_accuracy_from_header(cached.header)
+    replay_duration = replay_duration_from_summary(cached)
+    description_text = _clean_text(description or render_metadata.get("description"))
+    title_text = _clean_text(render_metadata.get("title"))
+    parsed = parse_ordr_metadata(
+        description=description_text,
+        title=title_text,
+        render_metadata=render_metadata,
+        fallback_length_seconds=replay_duration,
+        fallback_accuracy=replay_accuracy,
+        fallback_player=cached.player,
+    )
+    metadata = parsed["map"]
+    accuracy = replay_accuracy
+    tabular_core = build_tabular_core(
+        float(metadata["star"]),
+        accuracy,
+        float(metadata["lengthSeconds"]),
+        cached.model_mods,
+    )
+    session = await get_model_session()
+    outputs = await asyncio.to_thread(
+        session.run,
+        None,
+        {
+            "tabular_core": tabular_core,
+            "event_sequence": cached.event_sequence,
+            "action_windows": cached.action_windows,
+            "replay_summary": cached.replay_summary,
+        },
+    )
+    skill = float(np.asarray(outputs[0]).reshape(-1)[0])
+    base_skill = float(np.asarray(outputs[1]).reshape(-1)[0])
+    replay_correction = float(np.asarray(outputs[2]).reshape(-1)[0])
+    replay_gate = float(np.asarray(outputs[3]).reshape(-1)[0])
+    uncertainty = float(np.asarray(outputs[4]).reshape(-1)[0])
+    ordinal = np.asarray(outputs[5], dtype=np.float64).reshape(-1)
+    if not all(math.isfinite(value) for value in (skill, base_skill, replay_correction, replay_gate, uncertainty)):
+        raise RuntimeError("Model produced non-finite output")
+
+    rank_percentile = min(1.0, max(1.0 / OSU_RANK_POPULATION, 10.0 ** (-skill)))
+    predicted_rank = max(
+        1,
+        min(OSU_RANK_POPULATION, int(round(rank_percentile * OSU_RANK_POPULATION))),
+    )
+    return {
+        "skill": skill,
+        "baseSkill": base_skill,
+        "replayCorrection": replay_correction,
+        "replayGate": replay_gate,
+        "uncertainty": uncertainty,
+        "confidence": confidence_label(uncertainty),
+        "rankPercentile": rank_percentile,
+        "topPercent": 100.0 * rank_percentile,
+        "predictedRank": predicted_rank,
+        "accuracy": accuracy,
+        "accuracyPercent": 100.0 * accuracy,
+        "metadata": metadata,
+        "descriptionFormat": parsed["descriptionFormat"],
+        "ordinal": ordinal,
+    }
+
+
+def _cron_authorized(request: Request) -> bool:
+    secret = os.getenv("CRON_SECRET")
+    if not secret:
+        return False
+    supplied = request.headers.get("authorization") or ""
+    return hmac.compare_digest(supplied, f"Bearer {secret}")
+
+
+def _ranking_page_for_slot(slot: int, run_date: date, attempt: int) -> int:
+    page_ranges = ((1, 20), (21, 200), (201, 1000))
+    minimum, maximum = page_ranges[slot % len(page_ranges)]
+    return _stable_number(
+        f"seed-page:{run_date.isoformat()}:{slot}:{attempt}",
+        minimum,
+        maximum,
+    )
+
+
+async def find_seed_candidate(slot: int, run_date: date) -> dict[str, Any]:
+    for page_attempt in range(8):
+        page = _ranking_page_for_slot(slot, run_date, page_attempt)
+        ranking = await fetch_rankings_page(page)
+        if not ranking:
+            continue
+        ordered_users = sorted(
+            ranking,
+            key=lambda row: hashlib.sha256(
+                f"seed-user:{run_date.isoformat()}:{slot}:{page_attempt}:{(row.get('user') or {}).get('id')}".encode("utf-8")
+            ).digest(),
+        )
+        for rank_row in ordered_users[:10]:
+            user = rank_row.get("user") or {}
+            try:
+                user_id = int(user.get("id"))
+            except (TypeError, ValueError):
+                continue
+            username = str(user.get("username") or "").strip()
+            if not username:
+                continue
+            try:
+                scores = await fetch_user_best_scores(user_id)
+            except Exception as exc:
+                print(json.dumps({"event": "seed_scores_failed", "userID": user_id, "error": repr(exc)}), flush=True)
+                continue
+            good_scores = [score for score in scores if _seed_score_is_good(score)]
+            good_scores.sort(
+                key=lambda score: hashlib.sha256(
+                    f"seed-score:{run_date.isoformat()}:{slot}:{_score_id(score)}".encode("utf-8")
+                ).digest()
+            )
+            for score in good_scores[:12]:
+                score_id = _score_id(score)
+                if score_id is None:
+                    continue
+                try:
+                    replay_bytes = await download_score_replay(score_id)
+                    replay_hash = compute_replay_hash(replay_bytes)
+                    if await asyncio.to_thread(submission_exists, replay_hash=replay_hash):
+                        continue
+                    cached = build_cached_replay_from_bytes(replay_bytes, replay_hash, keep_replay_bytes=True)
+                except Exception as exc:
+                    print(
+                        json.dumps(
+                            {"event": "seed_replay_rejected", "scoreID": score_id, "error": repr(exc)},
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
+                    continue
+
+                statistics = rank_row.get("statistics") or user.get("statistics") or {}
+                actual_rank = rank_row.get("global_rank") or statistics.get("global_rank")
+                try:
+                    actual_rank = int(actual_rank) if actual_rank else None
+                except (TypeError, ValueError):
+                    actual_rank = None
+                return {
+                    "score": score,
+                    "scoreID": score_id,
+                    "cached": cached,
+                    "replayBytes": replay_bytes,
+                    "replayHash": replay_hash,
+                    "user": {
+                        "id": user_id,
+                        "username": username,
+                        "avatarURL": user.get("avatar_url"),
+                        "countryCode": user.get("country_code"),
+                        "globalRank": actual_rank,
+                    },
+                }
+    raise RuntimeError("Could not find a fresh public score with a downloadable replay")
+
+
+async def seed_gallery_once(slot: int) -> dict[str, Any]:
+    eligible_before = await asyncio.to_thread(challenge_count)
+    if eligible_before >= GALLERY_SEED_TARGET:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "seed_target_reached",
+            "eligible": eligible_before,
+            "target": GALLERY_SEED_TARGET,
+        }
+
+    run_date = datetime.now(timezone.utc).date()
+    candidate = await find_seed_candidate(slot, run_date)
+    cached: CachedReplay = candidate["cached"]
+    replay_hash = candidate["replayHash"]
+    replay_bytes = candidate["replayBytes"]
+    render_id = await submit_ordr_bytes(replay_bytes, cached.player, replay_hash)
+    snapshot = await wait_for_ordr_render(render_id)
+    video_url = validate_video_url(str(snapshot["videoURL"]))
+    render_metadata = dict(snapshot.get("renderMetadata") or {})
+    inference = await infer_cached_replay(
+        cached,
+        render_metadata,
+        description=snapshot.get("description"),
+    )
+    metadata = inference["metadata"]
+    score = candidate["score"]
+    user = candidate["user"]
+    beatmap_payload = score.get("beatmap") or {}
+    if score.get("beatmapset"):
+        beatmap_payload = dict(beatmap_payload)
+        beatmap_payload["beatmapset"] = score.get("beatmapset")
+    thumbnail_url = _cover_url_from_beatmap_payload(beatmap_payload)
+    if not thumbnail_url:
+        osu_beatmap = await fetch_osu_beatmap(metadata.get("id"))
+        thumbnail_url = _cover_url_from_beatmap_payload(osu_beatmap)
+
+    public_id = make_public_id(replay_hash)
+    record = {
+        "public_id": public_id,
+        "replay_hash": replay_hash,
+        "render_id": render_id,
+        "player": cached.player,
+        "osu_user_id": user.get("id"),
+        "avatar_url": user.get("avatarURL"),
+        "country_code": user.get("countryCode"),
+        "actual_rank": user.get("globalRank"),
+        "predicted_rank": inference["predictedRank"],
+        "skill": inference["skill"],
+        "top_percent": inference["topPercent"],
+        "confidence": inference["confidence"],
+        "star": float(metadata["star"]),
+        "accuracy_percent": inference["accuracyPercent"],
+        "mods": ",".join(cached.display_mods or ["NM"]),
+        "artist": metadata.get("artist") or (score.get("beatmapset") or {}).get("artist"),
+        "title": metadata.get("title") or (score.get("beatmapset") or {}).get("title"),
+        "version": metadata.get("version") or (score.get("beatmap") or {}).get("version"),
+        "creator": metadata.get("creator") or (score.get("beatmapset") or {}).get("creator"),
+        "length_seconds": float(metadata["lengthSeconds"]),
+        "map_id": metadata.get("id") or (score.get("beatmap") or {}).get("id"),
+        "map_link": metadata.get("url") or render_metadata.get("mapLink"),
+        "video_url": video_url,
+        "thumbnail_url": thumbnail_url,
+        "source": "cron",
+        "published": True,
+    }
+    saved = await asyncio.to_thread(save_submission, record)
+    if not saved:
+        raise RuntimeError("Database did not save seeded replay")
+    return {
+        "ok": True,
+        "skipped": False,
+        "slot": slot,
+        "publicID": public_id,
+        "renderID": render_id,
+        "scoreID": candidate["scoreID"],
+        "player": cached.player,
+        "actualRank": user.get("globalRank"),
+        "predictedRank": inference["predictedRank"],
+        "thumbnailURL": thumbnail_url,
+        "eligibleBefore": eligible_before,
+        "target": GALLERY_SEED_TARGET,
+    }
+
+
 @app.get("/", include_in_schema=False)
 async def index() -> RedirectResponse:
     return RedirectResponse(url="/index.html", status_code=307)
@@ -970,7 +1614,7 @@ async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "model": MODEL_PATH.name,
-        "version": "3.0.1",
+        "version": "3.1.0",
         "inputs": {value.name: value.shape for value in session.get_inputs()},
         "databaseConfigured": database_configured(),
         "database": database_diagnostics(),
@@ -982,7 +1626,44 @@ async def health() -> dict[str, Any]:
             or os.getenv("ORDR_API_KEY")
             or os.getenv("OSU_CLIENT_SECRET")
         ),
+        "cronConfigured": bool(os.getenv("CRON_SECRET")),
+        "gallerySeedTarget": GALLERY_SEED_TARGET,
+        "seedRenderTimeoutSeconds": SEED_RENDER_TIMEOUT_SECONDS,
     }
+
+
+@app.get("/api/cron/seed-gallery/{slot}")
+async def cron_seed_gallery(slot: int, request: Request) -> JSONResponse:
+    if slot not in {0, 1, 2}:
+        raise HTTPException(status_code=404, detail={"code": "invalid_seed_slot", "message": "Seed slot must be 0, 1, or 2."})
+    if not _cron_authorized(request):
+        raise HTTPException(status_code=401, detail={"code": "unauthorized", "message": "Missing or invalid cron authorization."})
+    if not database_configured():
+        raise HTTPException(status_code=503, detail={"code": "database_not_configured", "message": "Connect Postgres before seeding the gallery."})
+    try:
+        result = await seed_gallery_once(slot)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {"event": "gallery_seed_failed", "slot": slot, "error": repr(exc)},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "gallery_seed_failed", "message": str(exc)},
+        ) from exc
+    print(
+        json.dumps(
+            {"event": "gallery_seed_complete", **result},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+    return JSONResponse(result)
 
 
 @app.post("/api/replay/cache")
@@ -1107,6 +1788,7 @@ async def create_ordr_render(
         "showResultScreen": "true",
         "skip": "true",
         "customSkin": "false",
+        "generateThumbnail": "true",
     }
     verification_key = os.getenv("ORDR_API_KEY")
     if verification_key:
@@ -1302,6 +1984,33 @@ async def gallery(
     })
 
 
+@app.get("/api/gallery/{public_id}/thumbnail", include_in_schema=False)
+async def gallery_thumbnail(public_id: str) -> RedirectResponse:
+    if not database_configured():
+        raise HTTPException(status_code=404)
+    row = await asyncio.to_thread(get_submission, public_id)
+    if not row:
+        raise HTTPException(status_code=404)
+
+    thumbnail_url = row.get("thumbnail_url")
+    if not thumbnail_url:
+        beatmap_payload = await fetch_osu_beatmap(row.get("map_id"))
+        thumbnail_url = _cover_url_from_beatmap_payload(beatmap_payload)
+        if thumbnail_url:
+            try:
+                await asyncio.to_thread(update_submission_thumbnail, public_id, thumbnail_url)
+            except Exception as exc:
+                print(json.dumps({"event": "thumbnail_backfill_failed", "error": repr(exc)}), flush=True)
+
+    if not thumbnail_url:
+        raise HTTPException(status_code=404)
+    return RedirectResponse(
+        url=str(thumbnail_url),
+        status_code=307,
+        headers={"Cache-Control": "public, max-age=86400, s-maxage=86400"},
+    )
+
+
 @app.get("/api/challenge/daily")
 async def daily_challenge_api() -> JSONResponse:
     challenge_date = datetime.now(timezone.utc).date()
@@ -1481,6 +2190,14 @@ async def predict(payload: PredictPayload) -> JSONResponse:
     actual_rank = int(osu_user["globalRank"]) if osu_user and osu_user.get("globalRank") else None
     gallery_saved = False
     gallery_id = None
+    thumbnail_url = None
+    if payload.publish:
+        try:
+            beatmap_payload = await fetch_osu_beatmap(metadata.get("id"))
+            thumbnail_url = _cover_url_from_beatmap_payload(beatmap_payload)
+        except Exception as exc:
+            print(json.dumps({"event": "thumbnail_lookup_failed", "error": repr(exc)}), flush=True)
+
     if payload.publish and database_configured():
         public_id = make_public_id(replay_hash)
         record = {
@@ -1507,6 +2224,8 @@ async def predict(payload: PredictPayload) -> JSONResponse:
             "map_id": metadata.get("id"),
             "map_link": metadata.get("url"),
             "video_url": video_url,
+            "thumbnail_url": thumbnail_url,
+            "source": "upload",
             "published": True,
         }
         try:
@@ -1562,5 +2281,6 @@ async def predict(payload: PredictPayload) -> JSONResponse:
             "videoURL": video_url,
             "gallerySaved": gallery_saved,
             "galleryID": gallery_id,
+            "thumbnailURL": thumbnail_url,
         }
     )

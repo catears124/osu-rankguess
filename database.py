@@ -154,11 +154,19 @@ def ensure_schema() -> None:
                         map_id BIGINT,
                         map_link TEXT,
                         video_url TEXT NOT NULL,
+                        thumbnail_url TEXT,
+                        source TEXT NOT NULL DEFAULT 'upload',
                         published BOOLEAN NOT NULL DEFAULT TRUE,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                     """
+                )
+                cursor.execute(
+                    "ALTER TABLE replay_submissions ADD COLUMN IF NOT EXISTS thumbnail_url TEXT"
+                )
+                cursor.execute(
+                    "ALTER TABLE replay_submissions ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'upload'"
                 )
                 cursor.execute(
                     """
@@ -218,6 +226,8 @@ def save_submission(record: dict[str, Any]) -> dict[str, Any] | None:
         "map_id",
         "map_link",
         "video_url",
+        "thumbnail_url",
+        "source",
         "published",
     ]
     values = [record.get(column) for column in columns]
@@ -244,6 +254,31 @@ def save_submission(record: dict[str, Any]) -> dict[str, Any] | None:
             return cursor.fetchone()
 
 
+
+def submission_exists(*, replay_hash: str | None = None, render_id: int | None = None) -> bool:
+    if not database_configured():
+        return False
+    ensure_schema()
+    if replay_hash is None and render_id is None:
+        raise ValueError("replay_hash or render_id is required")
+
+    conditions: list[str] = []
+    values: list[Any] = []
+    if replay_hash is not None:
+        conditions.append("replay_hash = %s")
+        values.append(replay_hash)
+    if render_id is not None:
+        conditions.append("render_id = %s")
+        values.append(render_id)
+
+    with _connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT 1 FROM replay_submissions WHERE {' OR '.join(conditions)} LIMIT 1",
+                values,
+            )
+            return cursor.fetchone() is not None
+
 def list_gallery(limit: int = 24, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
     if not database_configured():
         return [], 0
@@ -265,6 +300,22 @@ def list_gallery(limit: int = 24, offset: int = 0) -> tuple[list[dict[str, Any]]
                 (limit, offset),
             )
             return list(cursor.fetchall()), int(count_row["count"])
+
+
+def update_submission_thumbnail(public_id: str, thumbnail_url: str) -> None:
+    if not database_configured():
+        return
+    ensure_schema()
+    with _connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE replay_submissions
+                SET thumbnail_url = %s, updated_at = NOW()
+                WHERE public_id = %s
+                """,
+                (thumbnail_url, public_id),
+            )
 
 
 def get_submission(public_id: str) -> dict[str, Any] | None:

@@ -200,7 +200,7 @@ async function analyze() {
   resetSteps();
   results.hidden = true;
   runButton.disabled = true;
-  runButton.textContent = "Working…";
+  runButton.textContent = "CLANKING…";
   try {
     setStep(0, "active", "Computing hash and decoding replay");
     const replayHash = await sha256File(selectedFile);
@@ -243,7 +243,7 @@ async function analyze() {
   } finally {
     if (runID === activeRun) {
       runButton.disabled = false;
-      runButton.textContent = "Analyze replay";
+      runButton.textContent = "RUN THE CONTRAPTION";
     }
   }
 }
@@ -444,7 +444,27 @@ $("#startInfinite").addEventListener("click", () => loadInfinite());
 
 function galleryCard(item) {
   const map = item.beatmap || {};
-  return `<article class="gallery-card"><video src="${escapeHTML(item.videoURL)}" controls playsinline preload="none"></video><h3>${escapeHTML(item.player || "Unknown player")}</h3><p>${escapeHTML(`${map.artist ? `${map.artist} — ` : ""}${map.title}`)}<br>${escapeHTML(`${map.version || ""} · ${Number(item.star).toFixed(2)}★ · ${(item.mods || ["NM"]).join("")}`)}</p><div class="gallery-ranks"><div><span>Actual</span><strong>${formatRank(item.actualRank)}</strong></div><div><span>AI</span><strong>${formatRank(item.predictedRank)}</strong></div></div></article>`;
+  const thumbnail = item.thumbnailURL || `/api/gallery/${encodeURIComponent(item.id)}/thumbnail`;
+  const sourceLabel = item.source === "cron" ? "found by the replay goblin" : "donated by a visitor";
+  const mapLabel = `${map.artist ? `${map.artist} — ` : ""}${map.title || "Unknown map"}`;
+  const detailLabel = `${map.version || "mystery diff"} · ${Number(item.star || 0).toFixed(2)}★ · ${(item.mods || ["NM"]).join("")}`;
+
+  return `
+    <article class="gallery-card">
+      <a class="gallery-thumb" href="${escapeHTML(item.videoURL)}" target="_blank" rel="noreferrer" aria-label="Watch ${escapeHTML(item.player || "this replay")}">
+        <img src="${escapeHTML(thumbnail)}" alt="" loading="lazy" decoding="async" onerror="this.hidden=true">
+        <span>WATCH REPLAY ↗</span>
+      </a>
+      <div class="gallery-copy">
+        <p class="gallery-source">${escapeHTML(sourceLabel)}</p>
+        <h3>${escapeHTML(item.player || "Unknown player")}</h3>
+        <p>${escapeHTML(mapLabel)}<br>${escapeHTML(detailLabel)}</p>
+      </div>
+      <div class="gallery-ranks">
+        <div><span>REAL RANK</span><strong>${formatRank(item.actualRank)}</strong></div>
+        <div><span>ROBOT SAID</span><strong>${formatRank(item.predictedRank)}</strong></div>
+      </div>
+    </article>`;
 }
 
 async function loadGallery(reset = false) {
@@ -455,7 +475,7 @@ async function loadGallery(reset = false) {
   try {
     const payload = await requestJSON(`/api/gallery?limit=24&offset=${galleryOffset}`);
     if (!payload.configured) {
-      empty.textContent = "Connect a Postgres database to enable the gallery and challenge modes.";
+      empty.textContent = "the public pile has nowhere to live. connect postgres.";
       empty.hidden = false;
       more.hidden = true;
       galleryLoaded = true;

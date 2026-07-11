@@ -1,55 +1,132 @@
-# osu!rankguess v7
+# osu!rankguess v9
 
-A monochrome FastAPI/Vercel app that:
+An intentionally slightly-janky FastAPI/Vercel site that predicts an osu!standard
+player's **global rank** from one `.osr` replay.
 
-- predicts a player's **global rank** from one `.osr` replay;
-- renders the replay through o!rdr;
-- optionally publishes the result to a public gallery;
-- runs a three-replay daily rank challenge;
-- provides an endless random challenge mode.
+It includes:
 
-Raw `.osr` files are parsed during the request and are not stored in Postgres.
-The public database stores replay metadata, the o!rdr video URL, the model
-prediction, and the player's osu! rank at submission time.
+- direct `.osr` analysis through the five-fold ONNX ensemble;
+- o!rdr video rendering;
+- a public replay gallery with beatmap-cover thumbnails;
+- a three-replay daily rank challenge;
+- infinite random guessing mode;
+- automatic gallery seeding from public osu! scores with downloadable replays.
+
+Raw `.osr` files are parsed in memory and are never stored in Postgres. The public
+database stores only replay/map metadata, the o!rdr video URL, the thumbnail URL,
+the model prediction, and the player's current public global rank.
 
 ## Deploy
 
-Copy the repository contents into the project root and leave Vercel's Root
-Directory blank.
+Put the repository contents at the Vercel project root and leave **Root Directory**
+blank.
 
-Keep the existing environment variables and add a serverless Postgres database.
-On Vercel, install a Postgres provider from **Storage / Marketplace** (Neon is a
-simple option) and connect it to this project. Confirm that it injects
-`DATABASE_URL`, then redeploy.
+Keep the connected Supabase integration. Its managed `POSTGRES_URL` is used
+automatically; do not create a fake `DATABASE_URL` with an unknown password.
 
-Required/recommended environment variables are documented in `.env.example`.
-Use stable random secrets for:
+Required environment variables:
+
+```text
+OSU_CLIENT_ID
+OSU_CLIENT_SECRET
+CACHE_SIGNING_SECRET
+DAILY_CHALLENGE_SALT
+GALLERY_ID_SALT
+CRON_SECRET
+```
+
+Strongly recommended:
+
+```text
+ORDR_API_KEY
+```
+
+Generate each secret independently:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Set the output independently as `CACHE_SIGNING_SECRET`,
-`DAILY_CHALLENGE_SALT`, and `GALLERY_ID_SALT`.
+Optional configuration:
+
+```text
+ORDR_SKIN=whitecatCK1.0
+ORDR_RESOLUTION=960x540
+OSU_RANK_POPULATION=5500000
+GALLERY_SEED_TARGET=12
+SEED_RENDER_TIMEOUT_SECONDS=160
+REPLAY_CACHE_TTL_SECONDS=1800
+```
+
+Redeploy after adding or changing environment variables.
+
+## Gallery seeding
+
+`vercel.json` installs three daily UTC cron jobs:
+
+```text
+02:05 UTC -> /api/cron/seed-gallery/0
+10:05 UTC -> /api/cron/seed-gallery/1
+18:05 UTC -> /api/cron/seed-gallery/2
+```
+
+Each job:
+
+1. chooses a different rank stratum from the public osu!standard rankings;
+2. finds a good public score whose replay is downloadable;
+3. downloads and parses the replay using the exact production feature code;
+4. renders it through o!rdr;
+5. runs rank inference;
+6. inserts it into the gallery with `source = cron`.
+
+The jobs are duplicate-safe and stop once the number of challenge-eligible gallery
+rows reaches `GALLERY_SEED_TARGET` (default: 12). User uploads count toward that
+target, so the robot does not keep filling the database forever.
+
+To populate the first three immediately after deployment, call the same protected
+endpoints manually:
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" \
+  https://osu-rankguess.vercel.app/api/cron/seed-gallery/0
+
+curl -H "Authorization: Bearer $CRON_SECRET" \
+  https://osu-rankguess.vercel.app/api/cron/seed-gallery/1
+
+curl -H "Authorization: Bearer $CRON_SECRET" \
+  https://osu-rankguess.vercel.app/api/cron/seed-gallery/2
+```
+
+With no verified `ORDR_API_KEY`, space manual calls apart to respect o!rdr's
+unverified render limit. The scheduled jobs are already eight hours apart.
+
+## Thumbnails
+
+New records store the beatmap cover returned by osu!'s API. Existing gallery rows
+without a stored thumbnail lazily backfill through:
+
+```text
+GET /api/gallery/{public_id}/thumbnail
+```
+
+The gallery opens the o!rdr MP4 when a thumbnail is clicked; it does not preload 24
+videos at once.
 
 ## API
 
-- `POST /api/replay/cache`
-- `POST /api/ordr/render`
-- `GET /api/ordr/status`
-- `POST /api/predict`
-- `GET /api/gallery`
-- `GET /api/challenge/daily`
-- `GET /api/challenge/infinite`
-- `POST /api/challenge/guess`
-- `GET /api/health`
-
-## Daily rules
-
-The daily uses three public submissions with known osu! global ranks. Each
-replay allows five guesses. A guess within 10% of the stored rank is accepted.
-The three replay IDs are selected once per UTC date and persisted so the daily
-does not change when new gallery items are submitted.
+```text
+POST /api/replay/cache
+POST /api/ordr/render
+GET  /api/ordr/status
+POST /api/predict
+GET  /api/gallery
+GET  /api/gallery/{public_id}/thumbnail
+GET  /api/challenge/daily
+GET  /api/challenge/infinite
+POST /api/challenge/guess
+GET  /api/cron/seed-gallery/{slot}
+GET  /api/health
+```
 
 ## Local run
 
@@ -60,12 +137,4 @@ pip install -e .
 uvicorn app:app --reload
 ```
 
-Static files are in `public/`; on Vercel they are served directly.
-
-
-## Supabase / psycopg URI compatibility
-
-Version 3.0.1 sanitizes provider-only query parameters (including `supa`)
-from the Vercel-injected `POSTGRES_URL` before passing it to psycopg. The
-application prefers the integration-managed `POSTGRES_URL` over a manually
-created `DATABASE_URL`.
+Static frontend files live in `public/` and are served directly by Vercel.
