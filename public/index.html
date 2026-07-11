@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#07090d" />
+  <meta name="description" content="Predict osu! rank percentile from a complete .osr replay." />
+  <title>osu!rankguess</title>
+  <link rel="icon" href="/favicon.svg" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+  <main class="shell">
+    <nav class="nav">
+      <a class="brand" href="/" aria-label="osu rankguess home">
+        <span class="brand-mark">o!</span>
+        <span>rankguess</span>
+      </a>
+      <div class="nav-meta"><span class="status-dot"></span> replay model online</div>
+    </nav>
+
+    <section class="hero">
+      <div class="eyebrow">WHOLE-REPLAY INFERENCE / V1.0</div>
+      <h1>Drop one replay.<br /><span>Get a skill read.</span></h1>
+      <p class="lede">
+        A player-disjoint model reads the complete cursor trace, key dynamics,
+        dense action windows, score metadata, and map difficulty.
+      </p>
+    </section>
+
+    <section class="workspace" id="workspace">
+      <div class="upload-panel panel" id="uploadPanel">
+        <div class="panel-label">01 / INPUT</div>
+        <label class="dropzone" id="dropzone" for="replayInput">
+          <input id="replayInput" type="file" accept=".osr,application/octet-stream" hidden />
+          <div class="drop-icon"><span></span><span></span></div>
+          <div class="drop-copy">
+            <strong id="dropTitle">Drop a .osr replay</strong>
+            <span id="dropSubtitle">or click to choose a file</span>
+          </div>
+          <div class="file-chip" id="fileChip" hidden>
+            <span id="fileName"></span>
+            <span id="fileSize"></span>
+          </div>
+        </label>
+
+        <div class="manual" id="manualPanel" hidden>
+          <div class="manual-head">
+            <div>
+              <strong>Beatmap metadata needed</strong>
+              <span>Automatic checksum lookup failed. Use mod-adjusted values.</span>
+            </div>
+          </div>
+          <div class="manual-grid">
+            <label>
+              <span>Star rating</span>
+              <input id="starInput" type="number" min="0.1" max="30" step="0.01" placeholder="7.42" />
+            </label>
+            <label>
+              <span>Length, seconds</span>
+              <input id="lengthInput" type="number" min="1" max="3600" step="1" placeholder="104" />
+            </label>
+          </div>
+        </div>
+
+        <button class="run-button" id="runButton" disabled>
+          <span>Analyze replay</span>
+          <span class="button-arrow">↗</span>
+        </button>
+        <p class="error" id="errorBox" hidden></p>
+      </div>
+
+      <aside class="pipeline panel" id="pipelinePanel">
+        <div class="panel-label">02 / PIPELINE</div>
+        <ol class="steps">
+          <li data-step="parse"><span>01</span><div><strong>Parse binary replay</strong><small>header + LZMA event stream</small></div></li>
+          <li data-step="map"><span>02</span><div><strong>Resolve beatmap</strong><small>checksum + mod-adjusted difficulty</small></div></li>
+          <li data-step="features"><span>03</span><div><strong>Reconstruct mechanics</strong><small>1024 events + 6 action windows</small></div></li>
+          <li data-step="model"><span>04</span><div><strong>Run fold ensemble</strong><small>five ONNX replay models</small></div></li>
+        </ol>
+        <div class="model-note">
+          <span>MODEL</span>
+          <strong>Temporal TCN ensemble</strong>
+          <small>Test R² 0.653 · player-disjoint split</small>
+        </div>
+      </aside>
+    </section>
+
+    <section class="results" id="results" hidden>
+      <div class="result-primary panel">
+        <div class="panel-label">03 / ESTIMATE</div>
+        <div class="result-kicker" id="resultPlayer">PLAYER</div>
+        <div class="rank-line">
+          <span class="top-label">TOP</span>
+          <strong id="topPercent">—</strong>
+        </div>
+        <div class="rank-context" id="rankContext">—</div>
+        <div class="confidence-line">
+          <span>MODEL CONFIDENCE</span>
+          <div class="confidence-track"><i id="confidenceBar"></i></div>
+          <strong id="confidenceLabel">—</strong>
+        </div>
+      </div>
+
+      <div class="result-details panel">
+        <div class="panel-label">04 / SIGNAL</div>
+        <div class="metrics">
+          <div><span>Skill score</span><strong id="skillValue">—</strong></div>
+          <div><span>Base estimate</span><strong id="baseValue">—</strong></div>
+          <div><span>Replay adjustment</span><strong id="correctionValue">—</strong></div>
+          <div><span>Fold uncertainty</span><strong id="uncertaintyValue">—</strong></div>
+        </div>
+        <div class="map-card" id="mapCard">
+          <div class="map-cover" id="mapCover"></div>
+          <div class="map-copy">
+            <span id="mapArtist">—</span>
+            <strong id="mapTitle">—</strong>
+            <small id="mapVersion">—</small>
+          </div>
+          <a id="mapLink" href="#" target="_blank" rel="noreferrer" hidden>open ↗</a>
+        </div>
+        <div class="play-row">
+          <div><span>Accuracy</span><strong id="accuracyValue">—</strong></div>
+          <div><span>Mods</span><strong id="modsValue">—</strong></div>
+          <div><span>Events read</span><strong id="eventsValue">—</strong></div>
+        </div>
+        <button class="reset-button" id="resetButton">Analyze another replay</button>
+      </div>
+    </section>
+
+    <footer>
+      <span>One replay is not a career peak. This estimates demonstrated skill from the submitted play.</span>
+      <span>Built from full .osr telemetry.</span>
+    </footer>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>
