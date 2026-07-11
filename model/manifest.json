@@ -1,0 +1,70 @@
+{
+  "name": "osu!rankguess",
+  "version": "1.0.0",
+  "model": "five-fold cross-fitted raw .osr replay ensemble",
+  "recommended_model": "model.onnx",
+  "recommended_format": "onnx-fp32",
+  "fold_count": 5,
+  "fixed_batch_size": 1,
+  "test_rows": 453,
+  "test_metrics": {
+    "base_ensemble": {
+      "mae": 0.3616938271269893,
+      "median_ae": 0.2607996463775635,
+      "rmse": 0.5165595566981598,
+      "r2": 0.6460075536779766
+    },
+    "raw_replay_ensemble_pytorch": {
+      "mae": 0.3571184712398394,
+      "median_ae": 0.24021148681640625,
+      "rmse": 0.5116561795934647,
+      "r2": 0.6526961153313293
+    },
+    "production_onnx": {
+      "mae": 0.35710293949308247,
+      "median_ae": 0.23993849754333496,
+      "rmse": 0.5116765852759078,
+      "r2": 0.6526684126888734
+    }
+  },
+  "fp32": {
+    "file": "model_fp32.onnx",
+    "size_mb": 9.51259708404541,
+    "test_metrics": {
+      "mae": 0.35710293949308247,
+      "median_ae": 0.23993849754333496,
+      "rmse": 0.5116765852759078,
+      "r2": 0.6526684126888734
+    },
+    "maximum_pytorch_difference": 0.0015954971313476562,
+    "full_test_runtime_seconds": 10.394832699999824
+  },
+  "int8": {
+    "file": null,
+    "accepted": false,
+    "size_mb": null,
+    "test_metrics": null,
+    "maximum_fp32_difference": null,
+    "mean_fp32_difference": null,
+    "full_test_runtime_seconds": null,
+    "error": "InferenceError('[ShapeInferenceError] Inferred shape and existing shape differ in dimension 0: (72) vs (192)')"
+  },
+  "cpu_latency": {
+    "median_ms": 23.419988499881583,
+    "p90_ms": 24.27828390045761,
+    "minimum_ms": 21.877564999158494,
+    "maximum_ms": 34.272441000211984
+  },
+  "target": "-log10(global_rank_percent)",
+  "rank_percentile_formula": "10 ** (-skill_prediction)",
+  "excluded_identity_features": [
+    "userid",
+    "player",
+    "global_rank",
+    "global_rank_percent",
+    "pp",
+    "player_acc",
+    "play_time",
+    "join_date"
+  ]
+}

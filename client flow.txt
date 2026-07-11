@@ -1,0 +1,25 @@
+client flow:
+(uploadbox)
+POST .osr + unique identifier hash to server
+- backend parses and caches .osr 
+- returns: replay username
+
+
+THEN 
+POST .osr to ordr using username
+returns: renderid
+
+
+THEN
+GET https://apis.issou.best/ordr/renders?renderID=4337:
+data['renders'][0]['description']
+"Player: MasterIO02, Map: Camellia - FLYING OUT TO THE SKY (covered by Nanahira, moimoi, Nana Takahashi) [browiec & Kuki's EXTRA] by Sotarks, song length is 4:24 (6.68 ⭐)  | Accuracy: 88.41%"
+
+GET https://apis.issou.best/dynlink/ordr/gen?id={{renderid}}
+{"url":"https://cdn-video-1.issou.best/ordr/rVYJisqAqsXKMzzbIKuTxHSQ.mp4"}
+
+
+POST hash, description, videoURL to /predict
+- match uuid to cached .osr + feats
+- parse description -> feats
+- pass all feats into model
