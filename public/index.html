@@ -21,11 +21,11 @@
     </nav>
 
     <section class="hero">
-      <div class="eyebrow">WHOLE-REPLAY INFERENCE / V1.0</div>
+      <div class="eyebrow">WHOLE-REPLAY INFERENCE / V2.0</div>
       <h1>Drop one replay.<br /><span>Get a skill read.</span></h1>
       <p class="lede">
-        A player-disjoint model reads the complete cursor trace, key dynamics,
-        dense action windows, score metadata, and map difficulty.
+        The client hashes your replay, the backend reconstructs its mechanics,
+        o!rdr resolves the exact map metadata, and the five-fold model estimates rank percentile.
       </p>
     </section>
 
@@ -45,39 +45,22 @@
           </div>
         </label>
 
-        <div class="manual" id="manualPanel" hidden>
-          <div class="manual-head">
-            <div>
-              <strong>Beatmap metadata needed</strong>
-              <span>Automatic checksum lookup failed. Use mod-adjusted values.</span>
-            </div>
-          </div>
-          <div class="manual-grid">
-            <label>
-              <span>Star rating</span>
-              <input id="starInput" type="number" min="0.1" max="30" step="0.01" placeholder="7.42" />
-            </label>
-            <label>
-              <span>Length, seconds</span>
-              <input id="lengthInput" type="number" min="1" max="3600" step="1" placeholder="104" />
-            </label>
-          </div>
-        </div>
-
         <button class="run-button" id="runButton" disabled>
           <span>Analyze replay</span>
           <span class="button-arrow">↗</span>
         </button>
+        <p class="render-status" id="renderStatus" hidden></p>
         <p class="error" id="errorBox" hidden></p>
       </div>
 
       <aside class="pipeline panel" id="pipelinePanel">
         <div class="panel-label">02 / PIPELINE</div>
         <ol class="steps">
-          <li data-step="parse"><span>01</span><div><strong>Parse binary replay</strong><small>header + LZMA event stream</small></div></li>
-          <li data-step="map"><span>02</span><div><strong>Resolve beatmap</strong><small>checksum + mod-adjusted difficulty</small></div></li>
-          <li data-step="features"><span>03</span><div><strong>Reconstruct mechanics</strong><small>1024 events + 6 action windows</small></div></li>
-          <li data-step="model"><span>04</span><div><strong>Run fold ensemble</strong><small>five ONNX replay models</small></div></li>
+          <li data-step="cache" data-default-detail="SHA-256 + binary replay telemetry"><span>01</span><div><strong>Parse and cache replay</strong><small>SHA-256 + binary replay telemetry</small></div></li>
+          <li data-step="submit" data-default-detail="Upload the same replay to o!rdr"><span>02</span><div><strong>Request replay render</strong><small>Upload the same replay to o!rdr</small></div></li>
+          <li data-step="wait" data-default-detail="Poll render progress without blocking"><span>03</span><div><strong>Wait for o!rdr</strong><small>Poll render progress without blocking</small></div></li>
+          <li data-step="metadata" data-default-detail="Description → star, length, accuracy"><span>04</span><div><strong>Recover map metadata</strong><small>Description → star, length, accuracy</small></div></li>
+          <li data-step="model" data-default-detail="Five raw replay fold predictions"><span>05</span><div><strong>Run model ensemble</strong><small>Five raw replay fold predictions</small></div></li>
         </ol>
         <div class="model-note">
           <span>MODEL</span>
@@ -111,6 +94,7 @@
           <div><span>Replay adjustment</span><strong id="correctionValue">—</strong></div>
           <div><span>Fold uncertainty</span><strong id="uncertaintyValue">—</strong></div>
         </div>
+
         <div class="map-card" id="mapCard">
           <div class="map-cover" id="mapCover"></div>
           <div class="map-copy">
@@ -118,19 +102,30 @@
             <strong id="mapTitle">—</strong>
             <small id="mapVersion">—</small>
           </div>
-          <a id="mapLink" href="#" target="_blank" rel="noreferrer" hidden>open ↗</a>
         </div>
-        <div class="play-row">
+
+        <div class="play-row four">
           <div><span>Accuracy</span><strong id="accuracyValue">—</strong></div>
           <div><span>Mods</span><strong id="modsValue">—</strong></div>
           <div><span>Events read</span><strong id="eventsValue">—</strong></div>
+          <div><span>o!rdr render</span><strong id="renderIdValue">—</strong></div>
         </div>
+
+        <div class="video-card">
+          <video id="replayVideo" controls playsinline preload="metadata"></video>
+          <div class="video-footer">
+            <span>o!rdr replay render</span>
+            <a id="videoLink" href="#" target="_blank" rel="noreferrer">open video ↗</a>
+          </div>
+          <p id="renderDescription" hidden></p>
+        </div>
+
         <button class="reset-button" id="resetButton">Analyze another replay</button>
       </div>
     </section>
 
     <footer>
-      <span>One replay is not a career peak. This estimates demonstrated skill from the submitted play.</span>
+      <span>Rendering can take several minutes. Unauthenticated o!rdr requests are rate-limited.</span>
       <span>Built from full .osr telemetry.</span>
     </footer>
   </main>

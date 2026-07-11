@@ -1,30 +1,42 @@
 # osu!rankguess — Vercel deployment
 
-A production FastAPI backend and static frontend for the five-fold raw `.osr`
-replay ensemble.
+A FastAPI backend and static frontend for the five-fold raw `.osr` replay
+ensemble.
 
-## Why this is one Python deployment
+## Pipeline
 
-The training representation was written in NumPy/Python. Keeping the exact
-`.osr -> tensors` implementation in Python avoids silent train/serve skew. The
-frontend is static and served by Vercel's CDN; FastAPI handles only `/api/*`
-and inference.
+1. The browser computes a SHA-256 identifier for the `.osr`.
+2. `POST /api/replay/cache` parses the replay, builds all replay tensors, caches
+   them in memory, and returns the replay username plus a signed stateless
+   fallback token.
+3. `POST /api/ordr/render` forwards the same replay to o!rdr and returns a
+   `renderID`.
+4. The browser polls `GET /api/ordr/status?renderID=...` until o!rdr returns a
+   description and video URL.
+5. `POST /api/predict` sends the replay hash, signed cache token, o!rdr
+   description, and video URL. The backend parses star rating, song length, and
+   accuracy from the description and runs the ONNX model.
+
+The signed token matters on Vercel because sequential requests are not
+promised to land on the same warm function instance.
 
 ## Deploy
 
 1. Push this directory to GitHub.
-2. Import the repository into Vercel.
-3. Add environment variables:
-   - `OSU_CLIENT_ID`
-   - `OSU_CLIENT_SECRET`
-4. Deploy.
+2. Import it into Vercel.
+3. Leave **Root Directory blank** when `app.py` is at the repository root.
+4. Add `CACHE_SIGNING_SECRET` using a long random value.
+5. Optionally add `ORDR_API_KEY` to avoid unauthenticated o!rdr limits.
+6. Deploy.
 
-Register an osu! OAuth application from your osu! account settings. The app
-uses the client-credentials flow only to resolve a replay's beatmap checksum
-and mod-adjusted difficulty attributes.
+Optional variables:
 
-The UI also supports manual star rating and map length when credentials are
-not configured or a checksum cannot be resolved.
+- `ORDR_SKIN=whitecatCK1.0`
+- `ORDR_RESOLUTION=960x540`
+- `OSU_RANK_POPULATION=3000000`
+- `REPLAY_CACHE_TTL_SECONDS=1800`
+
+The root URL is redirected to `/index.html` by `vercel.json`.
 
 ## Local development
 
@@ -40,21 +52,53 @@ Open `http://127.0.0.1:8000`.
 
 ## API
 
-### `POST /api/predict`
+### `POST /api/replay/cache`
 
 Multipart fields:
 
 - `replay`: `.osr` file
-- `star`: optional manual mod-adjusted star rating
-- `length_seconds`: optional manual mod-adjusted map length
+- `replay_hash`: SHA-256 hex digest of the exact upload
+
+Returns `player`, `eventCount`, `replayHash`, and `cacheToken`.
+
+### `POST /api/ordr/render`
+
+Multipart fields:
+
+- `replay`: the same `.osr`
+- `replay_hash`: the same SHA-256 digest
+- `username`: username returned by the cache endpoint
+
+Returns `renderID`.
+
+### `GET /api/ordr/status?renderID=123`
+
+Returns o!rdr progress. Once ready, it includes `description` and `videoURL`.
+
+### `POST /api/predict`
+
+JSON body:
+
+```json
+{
+  "replayHash": "...",
+  "cacheToken": "...",
+  "renderID": 123,
+  "description": "Player: ...",
+  "videoURL": "https://...issou.best/...mp4"
+}
+```
 
 ### `GET /api/health`
 
-Loads the ONNX model and reports its input contract.
+Loads the ONNX model and reports the input contract.
 
 ## Notes
 
 - osu!standard only.
 - Relax and Autopilot are rejected because they were excluded from training.
-- Maximum application upload is 4 MB, below Vercel's 4.5 MB function payload limit.
-- `model.onnx` includes the five raw fold models; the failed Ridge stacker is not deployed.
+- Negative-delta replay marker/seed records are skipped instead of terminating
+  replay decoding.
+- Maximum application upload is 4 MB.
+- `model.onnx` includes the five raw fold models; the failed Ridge stacker is
+  not deployed.

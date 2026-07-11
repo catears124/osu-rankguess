@@ -109,8 +109,12 @@ def parse_osr(source) -> dict:
             key_mask = int(float(fields[3]))
         except (ValueError, OverflowError):
             continue
+        # Stable/lazer replays may contain negative-delta marker or RNG-seed
+        # records before or after the actual cursor frames. They are metadata,
+        # not movement. Skipping them (rather than stopping at the first one)
+        # keeps the real frames that follow.
         if delta_ms < 0:
-            break
+            continue
         cumulative_time_ms += delta_ms
         if not (np.isfinite(x) and np.isfinite(y)):
             continue

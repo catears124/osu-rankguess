@@ -3,11 +3,16 @@
   "functions": {
     "app.py": {
       "maxDuration": 60,
-      "includeFiles": [
-        "model/**"
-      ]
+      "includeFiles": "model/**"
     }
   },
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "/index.html",
+      "permanent": false
+    }
+  ],
   "headers": [
     {
       "source": "/api/(.*)",
