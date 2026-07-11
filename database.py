@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import statistics
 import threading
 from datetime import date
 from typing import Any
@@ -25,9 +27,6 @@ _DATABASE_URL_SOURCE = (
     else None
 )
 
-# Supabase's Vercel integration may append provider metadata such as
-# `supa=...` to POSTGRES_URL. libpq/psycopg rejects unknown URI
-# parameters, so preserve only parameters that PostgreSQL understands.
 _ALLOWED_LIBPQ_QUERY_PARAMETERS = {
     "application_name",
     "channel_binding",
@@ -67,8 +66,6 @@ def _sanitize_database_url(value: str | None) -> tuple[str | None, tuple[str, ..
         else:
             removed.append(key)
 
-    # Supabase requires TLS for hosted database connections. Add the
-    # standard libpq parameter when the integration URL omitted it.
     if parts.hostname and "supabase" in parts.hostname.lower():
         if not any(key == "sslmode" for key, _ in kept):
             kept.append(("sslmode", "require"))
@@ -189,6 +186,63 @@ def ensure_schema() -> None:
                     )
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS infinite_challenges (
+                        challenge_id TEXT PRIMARY KEY,
+                        replay_hash TEXT NOT NULL,
+                        render_id BIGINT,
+                        player TEXT NOT NULL,
+                        actual_rank INTEGER NOT NULL,
+                        predicted_rank INTEGER NOT NULL,
+                        star DOUBLE PRECISION NOT NULL,
+                        accuracy_percent DOUBLE PRECISION NOT NULL,
+                        mods TEXT NOT NULL,
+                        artist TEXT,
+                        title TEXT,
+                        version TEXT,
+                        creator TEXT,
+                        length_seconds DOUBLE PRECISION,
+                        map_id BIGINT,
+                        map_link TEXT,
+                        video_url TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours')
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS infinite_challenges_recent_idx
+                    ON infinite_challenges (replay_hash, expires_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS challenge_guesses (
+                        id BIGSERIAL PRIMARY KEY,
+                        replay_id TEXT NOT NULL,
+                        challenge_key TEXT NOT NULL,
+                        mode TEXT NOT NULL,
+                        guess_rank INTEGER NOT NULL,
+                        log_guess DOUBLE PRECISION NOT NULL,
+                        attempt SMALLINT NOT NULL,
+                        session_hash TEXT NOT NULL,
+                        correct BOOLEAN NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (replay_id, challenge_key, mode, session_hash, attempt)
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS challenge_guesses_distribution_idx
+                    ON challenge_guesses (replay_id, challenge_key, mode, session_hash, attempt)
+                    """
+                )
+                cursor.execute(
+                    "DELETE FROM infinite_challenges WHERE expires_at < NOW()"
+                )
         _schema_ready = True
 
 
@@ -254,7 +308,6 @@ def save_submission(record: dict[str, Any]) -> dict[str, Any] | None:
             return cursor.fetchone()
 
 
-
 def submission_exists(*, replay_hash: str | None = None, render_id: int | None = None) -> bool:
     if not database_configured():
         return False
@@ -278,6 +331,7 @@ def submission_exists(*, replay_hash: str | None = None, render_id: int | None =
                 values,
             )
             return cursor.fetchone() is not None
+
 
 def list_gallery(limit: int = 24, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
     if not database_configured():
@@ -331,39 +385,6 @@ def get_submission(public_id: str) -> dict[str, Any] | None:
                 """,
                 (public_id,),
             )
-            return cursor.fetchone()
-
-
-def random_challenge_submission(exclude_public_id: str | None = None) -> dict[str, Any] | None:
-    if not database_configured():
-        return None
-    ensure_schema()
-    with _connect() as connection:
-        with connection.cursor() as cursor:
-            if exclude_public_id:
-                cursor.execute(
-                    """
-                    SELECT * FROM replay_submissions
-                    WHERE published = TRUE
-                      AND actual_rank IS NOT NULL
-                      AND actual_rank > 0
-                      AND public_id <> %s
-                    ORDER BY RANDOM()
-                    LIMIT 1
-                    """,
-                    (exclude_public_id,),
-                )
-            else:
-                cursor.execute(
-                    """
-                    SELECT * FROM replay_submissions
-                    WHERE published = TRUE
-                      AND actual_rank IS NOT NULL
-                      AND actual_rank > 0
-                    ORDER BY RANDOM()
-                    LIMIT 1
-                    """
-                )
             return cursor.fetchone()
 
 
@@ -454,3 +475,210 @@ def challenge_count() -> int:
             )
             row = cursor.fetchone() or {"count": 0}
             return int(row["count"])
+
+
+def save_infinite_challenge(record: dict[str, Any]) -> dict[str, Any]:
+    if not database_configured():
+        raise RuntimeError("Database is required for infinite challenges")
+    ensure_schema()
+    columns = [
+        "challenge_id",
+        "replay_hash",
+        "render_id",
+        "player",
+        "actual_rank",
+        "predicted_rank",
+        "star",
+        "accuracy_percent",
+        "mods",
+        "artist",
+        "title",
+        "version",
+        "creator",
+        "length_seconds",
+        "map_id",
+        "map_link",
+        "video_url",
+    ]
+    values = [record.get(column) for column in columns]
+    placeholders = ", ".join(["%s"] * len(columns))
+    with _connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM infinite_challenges WHERE expires_at < NOW()")
+            cursor.execute(
+                f"""
+                INSERT INTO infinite_challenges ({', '.join(columns)})
+                VALUES ({placeholders})
+                ON CONFLICT (challenge_id) DO UPDATE SET
+                    render_id = EXCLUDED.render_id,
+                    player = EXCLUDED.player,
+                    actual_rank = EXCLUDED.actual_rank,
+                    predicted_rank = EXCLUDED.predicted_rank,
+                    star = EXCLUDED.star,
+                    accuracy_percent = EXCLUDED.accuracy_percent,
+                    mods = EXCLUDED.mods,
+                    artist = EXCLUDED.artist,
+                    title = EXCLUDED.title,
+                    version = EXCLUDED.version,
+                    creator = EXCLUDED.creator,
+                    length_seconds = EXCLUDED.length_seconds,
+                    map_id = EXCLUDED.map_id,
+                    map_link = EXCLUDED.map_link,
+                    video_url = EXCLUDED.video_url,
+                    expires_at = NOW() + INTERVAL '24 hours'
+                RETURNING *
+                """,
+                values,
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise RuntimeError("Could not save infinite challenge")
+            return row
+
+
+def get_infinite_challenge(challenge_id: str) -> dict[str, Any] | None:
+    if not database_configured():
+        return None
+    ensure_schema()
+    with _connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM infinite_challenges
+                WHERE challenge_id = %s AND expires_at > NOW()
+                """,
+                (challenge_id,),
+            )
+            return cursor.fetchone()
+
+
+def infinite_replay_recent(replay_hash: str) -> bool:
+    if not database_configured():
+        return False
+    ensure_schema()
+    with _connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 1 FROM infinite_challenges
+                WHERE replay_hash = %s AND expires_at > NOW()
+                LIMIT 1
+                """,
+                (replay_hash,),
+            )
+            return cursor.fetchone() is not None
+
+
+def save_challenge_guess(
+    *,
+    replay_id: str,
+    challenge_key: str,
+    mode: str,
+    guess_rank: int,
+    attempt: int,
+    session_hash: str,
+    correct: bool,
+) -> None:
+    if not database_configured():
+        return
+    ensure_schema()
+    with _connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO challenge_guesses (
+                    replay_id,
+                    challenge_key,
+                    mode,
+                    guess_rank,
+                    log_guess,
+                    attempt,
+                    session_hash,
+                    correct
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (replay_id, challenge_key, mode, session_hash, attempt)
+                DO UPDATE SET
+                    guess_rank = EXCLUDED.guess_rank,
+                    log_guess = EXCLUDED.log_guess,
+                    correct = EXCLUDED.correct
+                """,
+                (
+                    replay_id,
+                    challenge_key,
+                    mode,
+                    int(guess_rank),
+                    math.log10(max(1, int(guess_rank))),
+                    int(attempt),
+                    session_hash,
+                    bool(correct),
+                ),
+            )
+
+
+def challenge_guess_distribution(
+    *,
+    replay_id: str,
+    challenge_key: str,
+    mode: str,
+    rank_population: int,
+    bucket_count: int = 12,
+) -> dict[str, Any]:
+    if not database_configured():
+        return {"count": 0, "medianRank": None, "buckets": []}
+    ensure_schema()
+    with _connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH first_guesses AS (
+                    SELECT DISTINCT ON (session_hash)
+                        session_hash,
+                        guess_rank,
+                        attempt,
+                        created_at
+                    FROM challenge_guesses
+                    WHERE replay_id = %s
+                      AND challenge_key = %s
+                      AND mode = %s
+                    ORDER BY session_hash, attempt ASC, created_at ASC
+                )
+                SELECT guess_rank FROM first_guesses
+                """,
+                (replay_id, challenge_key, mode),
+            )
+            guesses = [int(row["guess_rank"]) for row in cursor.fetchall()]
+
+    population = max(10, int(rank_population))
+    maximum_log = math.log10(population)
+    edges = [1]
+    for index in range(1, bucket_count + 1):
+        value = int(round(10 ** (maximum_log * index / bucket_count)))
+        edges.append(max(edges[-1] + 1, min(population, value)))
+    edges[-1] = population
+
+    counts = [0 for _ in range(bucket_count)]
+    for guess in guesses:
+        clamped = min(population, max(1, guess))
+        position = 0 if maximum_log <= 0 else int(
+            min(bucket_count - 1, math.floor(math.log10(clamped) / maximum_log * bucket_count))
+        )
+        counts[position] += 1
+
+    buckets = []
+    for index, count in enumerate(counts):
+        minimum = edges[index]
+        maximum = edges[index + 1]
+        buckets.append(
+            {
+                "minRank": minimum,
+                "maxRank": maximum,
+                "count": count,
+            }
+        )
+
+    return {
+        "count": len(guesses),
+        "medianRank": int(round(statistics.median(guesses))) if guesses else None,
+        "buckets": buckets,
+    }

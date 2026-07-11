@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -29,11 +30,15 @@ from database import (
     challenge_count,
     database_configured,
     database_diagnostics,
+    challenge_guess_distribution,
     get_daily_challenge,
+    get_infinite_challenge,
     get_submission,
+    infinite_replay_recent,
     list_gallery,
     make_public_id,
-    random_challenge_submission,
+    save_challenge_guess,
+    save_infinite_challenge,
     save_submission,
     submission_exists,
     update_submission_thumbnail,
@@ -141,7 +146,7 @@ MAP_PATTERN = re.compile(
 
 app = FastAPI(
     title="osu!rankguess",
-    version="3.1.0",
+    version="3.2.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
@@ -193,6 +198,7 @@ class ChallengeGuessPayload(BaseModel):
     attempt: int = Field(ge=1, le=MAX_CHALLENGE_ATTEMPTS)
     mode: str = Field(default="infinite")
     challenge_date: date | None = Field(default=None, alias="challengeDate")
+    session_id: str = Field(alias="sessionID", min_length=8, max_length=160)
 
     model_config = {"populate_by_name": True}
 
@@ -1353,7 +1359,7 @@ async def wait_for_ordr_render(render_id: int) -> dict[str, Any]:
             return last_snapshot
         await asyncio.sleep(2.0)
     progress = (last_snapshot or {}).get("progress") or "unknown"
-    raise RuntimeError(f"o!rdr did not finish before cron timeout (last state: {progress})")
+    raise RuntimeError(f"o!rdr did not finish before the request timeout (last state: {progress})")
 
 
 async def infer_cached_replay(
@@ -1518,6 +1524,194 @@ async def find_seed_candidate(slot: int, run_date: date) -> dict[str, Any]:
     raise RuntimeError("Could not find a fresh public score with a downloadable replay")
 
 
+def challenge_session_hash(session_id: str) -> str:
+    salt = (
+        os.getenv("DAILY_CHALLENGE_SALT")
+        or os.getenv("CACHE_SIGNING_SECRET")
+        or "osu-rankguess-session"
+    )
+    normalized = session_id.strip()
+    return hashlib.sha256(f"{salt}:{normalized}".encode("utf-8")).hexdigest()[:40]
+
+
+def infinite_item_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["challenge_id"],
+        "renderID": row.get("render_id"),
+        "videoURL": row["video_url"],
+        "source": "live",
+        "star": row.get("star"),
+        "accuracyPercent": row.get("accuracy_percent"),
+        "mods": [token for token in str(row.get("mods") or "NM").split(",") if token],
+        "lengthSeconds": row.get("length_seconds"),
+        "mapID": row.get("map_id"),
+        "mapLink": row.get("map_link"),
+        "beatmap": {
+            "artist": row.get("artist") or "",
+            "title": row.get("title") or "Unknown map",
+            "version": row.get("version") or "",
+            "creator": row.get("creator"),
+        },
+    }
+
+
+async def find_infinite_candidate() -> dict[str, Any]:
+    nonce = secrets.token_hex(12)
+    page_ranges = ((1, 20), (21, 200), (201, 1000))
+
+    for page_attempt in range(9):
+        band = (secrets.randbelow(len(page_ranges)) + page_attempt) % len(page_ranges)
+        minimum, maximum = page_ranges[band]
+        page = minimum + secrets.randbelow(maximum - minimum + 1)
+        ranking = await fetch_rankings_page(page)
+        if not ranking:
+            continue
+
+        ordered_users = sorted(
+            ranking,
+            key=lambda row: hashlib.sha256(
+                f"infinite-user:{nonce}:{page_attempt}:{(row.get('user') or {}).get('id')}".encode("utf-8")
+            ).digest(),
+        )
+
+        for rank_row in ordered_users[:8]:
+            user = rank_row.get("user") or {}
+            try:
+                user_id = int(user.get("id"))
+            except (TypeError, ValueError):
+                continue
+            username = str(user.get("username") or "").strip()
+            if not username:
+                continue
+
+            try:
+                scores = await fetch_user_best_scores(user_id)
+            except Exception as exc:
+                print(json.dumps({"event": "infinite_scores_failed", "userID": user_id, "error": repr(exc)}), flush=True)
+                continue
+
+            good_scores = [score for score in scores if _seed_score_is_good(score)]
+            good_scores.sort(
+                key=lambda score: hashlib.sha256(
+                    f"infinite-score:{nonce}:{_score_id(score)}".encode("utf-8")
+                ).digest()
+            )
+
+            for score in good_scores[:10]:
+                score_id = _score_id(score)
+                if score_id is None:
+                    continue
+                try:
+                    replay_bytes = await download_score_replay(score_id)
+                    replay_hash = compute_replay_hash(replay_bytes)
+                    in_gallery, seen_live = await asyncio.gather(
+                        asyncio.to_thread(submission_exists, replay_hash=replay_hash),
+                        asyncio.to_thread(infinite_replay_recent, replay_hash),
+                    )
+                    if in_gallery or seen_live:
+                        continue
+                    cached = build_cached_replay_from_bytes(
+                        replay_bytes,
+                        replay_hash,
+                        keep_replay_bytes=True,
+                    )
+                except Exception as exc:
+                    print(
+                        json.dumps(
+                            {"event": "infinite_replay_rejected", "scoreID": score_id, "error": repr(exc)},
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
+                    continue
+
+                statistics = rank_row.get("statistics") or user.get("statistics") or {}
+                actual_rank = rank_row.get("global_rank") or statistics.get("global_rank")
+                try:
+                    actual_rank = int(actual_rank) if actual_rank else None
+                except (TypeError, ValueError):
+                    actual_rank = None
+                if not actual_rank:
+                    continue
+
+                return {
+                    "nonce": nonce,
+                    "score": score,
+                    "scoreID": score_id,
+                    "cached": cached,
+                    "replayBytes": replay_bytes,
+                    "replayHash": replay_hash,
+                    "user": {
+                        "id": user_id,
+                        "username": username,
+                        "actualRank": actual_rank,
+                    },
+                }
+
+    raise RuntimeError("Could not find a fresh public replay. Try again in a minute.")
+
+
+async def create_live_infinite_challenge() -> dict[str, Any]:
+    candidate = await find_infinite_candidate()
+    cached: CachedReplay = candidate["cached"]
+    replay_hash = candidate["replayHash"]
+    render_id = await submit_ordr_bytes(
+        candidate["replayBytes"],
+        cached.player,
+        replay_hash,
+    )
+    snapshot = await wait_for_ordr_render(render_id)
+    video_url = validate_video_url(str(snapshot["videoURL"]))
+    render_metadata = dict(snapshot.get("renderMetadata") or {})
+    inference = await infer_cached_replay(
+        cached,
+        render_metadata,
+        description=snapshot.get("description"),
+    )
+    metadata = inference["metadata"]
+    score = candidate["score"]
+    beatmap = score.get("beatmap") or {}
+    beatmapset = score.get("beatmapset") or {}
+    salt = os.getenv("DAILY_CHALLENGE_SALT") or os.getenv("CACHE_SIGNING_SECRET") or "osu-rankguess-live"
+    challenge_id = hashlib.sha256(
+        f"{salt}:{replay_hash}:{candidate['nonce']}:{time.time_ns()}".encode("utf-8")
+    ).hexdigest()[:28]
+
+    record = {
+        "challenge_id": challenge_id,
+        "replay_hash": replay_hash,
+        "render_id": render_id,
+        "player": cached.player,
+        "actual_rank": int(candidate["user"]["actualRank"]),
+        "predicted_rank": inference["predictedRank"],
+        "star": float(metadata["star"]),
+        "accuracy_percent": inference["accuracyPercent"],
+        "mods": ",".join(cached.display_mods or ["NM"]),
+        "artist": metadata.get("artist") or beatmapset.get("artist"),
+        "title": metadata.get("title") or beatmapset.get("title"),
+        "version": metadata.get("version") or beatmap.get("version"),
+        "creator": metadata.get("creator") or beatmapset.get("creator"),
+        "length_seconds": float(metadata["lengthSeconds"]),
+        "map_id": metadata.get("id") or beatmap.get("id"),
+        "map_link": metadata.get("url") or render_metadata.get("mapLink"),
+        "video_url": video_url,
+    }
+    saved = await asyncio.to_thread(save_infinite_challenge, record)
+    print(
+        json.dumps(
+            {
+                "event": "infinite_challenge_created",
+                "challengeID": challenge_id,
+                "renderID": render_id,
+                "scoreID": candidate["scoreID"],
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+    return saved
+
+
 async def seed_gallery_once(slot: int) -> dict[str, Any]:
     eligible_before = await asyncio.to_thread(challenge_count)
     if eligible_before >= GALLERY_SEED_TARGET:
@@ -1614,7 +1808,7 @@ async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "model": MODEL_PATH.name,
-        "version": "3.1.0",
+        "version": "3.2.0",
         "inputs": {value.name: value.shape for value in session.get_inputs()},
         "databaseConfigured": database_configured(),
         "database": database_diagnostics(),
@@ -2015,7 +2209,14 @@ async def gallery_thumbnail(public_id: str) -> RedirectResponse:
 async def daily_challenge_api() -> JSONResponse:
     challenge_date = datetime.now(timezone.utc).date()
     if not database_configured():
-        return JSONResponse({"ok": True, "available": False, "reason": "database_not_configured", "date": challenge_date.isoformat(), "replays": []})
+        return JSONResponse({
+            "ok": True,
+            "available": False,
+            "reason": "database_not_configured",
+            "date": challenge_date.isoformat(),
+            "rankPopulation": OSU_RANK_POPULATION,
+            "replays": [],
+        })
     try:
         rows = await asyncio.to_thread(get_daily_challenge, challenge_date, 3)
         count = await asyncio.to_thread(challenge_count)
@@ -2026,24 +2227,34 @@ async def daily_challenge_api() -> JSONResponse:
         "available": len(rows) == 3,
         "date": challenge_date.isoformat(),
         "maxAttempts": MAX_CHALLENGE_ATTEMPTS,
+        "rankPopulation": OSU_RANK_POPULATION,
         "eligibleReplays": count,
         "replays": [gallery_item_from_row(row, reveal_answer=False) for row in rows],
     })
 
 
-@app.get("/api/challenge/infinite")
-async def infinite_challenge_api(exclude: str | None = Query(default=None, max_length=64)) -> JSONResponse:
+@app.post("/api/challenge/infinite")
+async def infinite_challenge_api(
+    session_id: str | None = Query(default=None, alias="sessionID", max_length=160),
+) -> JSONResponse:
     if not database_configured():
         return JSONResponse({"ok": True, "available": False, "reason": "database_not_configured"})
+    if not os.getenv("OSU_CLIENT_ID") or not os.getenv("OSU_CLIENT_SECRET"):
+        return JSONResponse({"ok": True, "available": False, "reason": "osu_api_not_configured"})
     try:
-        row = await asyncio.to_thread(random_challenge_submission, exclude)
+        row = await create_live_infinite_challenge()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail={"code": "database_error", "message": str(exc)}) from exc
+        print(json.dumps({"event": "infinite_challenge_failed", "error": repr(exc)}), flush=True)
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "infinite_generation_failed", "message": str(exc)},
+        ) from exc
     return JSONResponse({
         "ok": True,
-        "available": row is not None,
+        "available": True,
         "maxAttempts": MAX_CHALLENGE_ATTEMPTS,
-        "replay": gallery_item_from_row(row, reveal_answer=False) if row else None,
+        "rankPopulation": OSU_RANK_POPULATION,
+        "replay": infinite_item_from_row(row),
     })
 
 
@@ -2051,26 +2262,52 @@ async def infinite_challenge_api(exclude: str | None = Query(default=None, max_l
 async def challenge_guess(payload: ChallengeGuessPayload) -> JSONResponse:
     if not database_configured():
         raise HTTPException(status_code=503, detail={"code": "database_not_configured", "message": "Connect a database first."})
-    try:
-        row = await asyncio.to_thread(get_submission, payload.replay_id)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail={"code": "database_error", "message": str(exc)}) from exc
-    if not row or not row.get("actual_rank"):
-        raise HTTPException(status_code=404, detail={"code": "challenge_missing", "message": "Challenge replay was not found."})
 
     mode = payload.mode.strip().lower()
-    if mode == "daily":
-        challenge_date = payload.challenge_date or datetime.now(timezone.utc).date()
-        daily_rows = await asyncio.to_thread(get_daily_challenge, challenge_date, 3)
-        if payload.replay_id not in {item["public_id"] for item in daily_rows}:
-            raise HTTPException(status_code=400, detail={"code": "not_daily_replay", "message": "Replay is not part of that daily challenge."})
-    elif mode != "infinite":
-        raise HTTPException(status_code=400, detail={"code": "invalid_mode", "message": "Mode must be daily or infinite."})
+    challenge_date = payload.challenge_date or datetime.now(timezone.utc).date()
+    challenge_key: str
+    row: dict[str, Any] | None
+
+    try:
+        if mode == "daily":
+            row = await asyncio.to_thread(get_submission, payload.replay_id)
+            daily_rows = await asyncio.to_thread(get_daily_challenge, challenge_date, 3)
+            if payload.replay_id not in {item["public_id"] for item in daily_rows}:
+                raise HTTPException(status_code=400, detail={"code": "not_daily_replay", "message": "Replay is not part of that daily challenge."})
+            challenge_key = challenge_date.isoformat()
+        elif mode == "infinite":
+            row = await asyncio.to_thread(get_infinite_challenge, payload.replay_id)
+            challenge_key = payload.replay_id
+        else:
+            raise HTTPException(status_code=400, detail={"code": "invalid_mode", "message": "Mode must be daily or infinite."})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={"code": "database_error", "message": str(exc)}) from exc
+
+    if not row or not row.get("actual_rank"):
+        raise HTTPException(status_code=404, detail={"code": "challenge_missing", "message": "Challenge replay was not found or expired."})
 
     actual_rank = int(row["actual_rank"])
     correct, direction, closeness, log_error = challenge_feedback(actual_rank, payload.guess_rank)
     reveal = correct or payload.attempt >= MAX_CHALLENGE_ATTEMPTS
-    response = {
+    session_hash = challenge_session_hash(payload.session_id)
+
+    try:
+        await asyncio.to_thread(
+            save_challenge_guess,
+            replay_id=payload.replay_id,
+            challenge_key=challenge_key,
+            mode=mode,
+            guess_rank=payload.guess_rank,
+            attempt=payload.attempt,
+            session_hash=session_hash,
+            correct=correct,
+        )
+    except Exception as exc:
+        print(json.dumps({"event": "challenge_guess_save_failed", "error": repr(exc)}), flush=True)
+
+    response: dict[str, Any] = {
         "ok": True,
         "correct": correct,
         "direction": direction,
@@ -2087,6 +2324,17 @@ async def challenge_guess(payload: ChallengeGuessPayload) -> JSONResponse:
             "player": row["player"],
             "avatarURL": row.get("avatar_url"),
         })
+        if mode == "daily":
+            try:
+                response["distribution"] = await asyncio.to_thread(
+                    challenge_guess_distribution,
+                    replay_id=payload.replay_id,
+                    challenge_key=challenge_key,
+                    mode=mode,
+                    rank_population=OSU_RANK_POPULATION,
+                )
+            except Exception as exc:
+                print(json.dumps({"event": "challenge_distribution_failed", "error": repr(exc)}), flush=True)
     return JSONResponse(response)
 
 

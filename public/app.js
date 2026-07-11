@@ -15,6 +15,7 @@ let galleryLoaded = false;
 let dailyPayload = null;
 let dailyState = null;
 let infiniteRound = null;
+let rankPopulation = 5_500_000;
 
 const escapeHTML = (value) => String(value ?? "")
   .replaceAll("&", "&amp;")
@@ -22,6 +23,25 @@ const escapeHTML = (value) => String(value ?? "")
   .replaceAll(">", "&gt;")
   .replaceAll('"', "&quot;")
   .replaceAll("'", "&#039;");
+
+const storage = {
+  get(key) {
+    try { return localStorage.getItem(key); } catch { return null; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, value); } catch { /* in-app browser storage may be disabled */ }
+  },
+};
+
+function makeSessionID() {
+  const existing = storage.get("osu-rankguess-session-v1");
+  if (existing) return existing;
+  const value = globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+  storage.set("osu-rankguess-session-v1", value);
+  return value;
+}
+const sessionID = makeSessionID();
 
 const formatBytes = (bytes) => {
   if (bytes < 1024) return `${bytes} B`;
@@ -31,12 +51,14 @@ const formatBytes = (bytes) => {
 
 const formatRank = (value) => value ? `#${Number(value).toLocaleString()}` : "—";
 const formatTopPercent = (value) => {
-  if (value < 0.001) return `${value.toExponential(2)}%`;
-  if (value < 0.1) return `${value.toFixed(3)}%`;
-  if (value < 1) return `${value.toFixed(2)}%`;
-  return `${value.toFixed(1)}%`;
+  const number = Number(value || 0);
+  if (number < 0.001) return `${number.toExponential(2)}%`;
+  if (number < 0.1) return `${number.toFixed(3)}%`;
+  if (number < 1) return `${number.toFixed(2)}%`;
+  return `${number.toFixed(1)}%`;
 };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const smoothBehavior = matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
 
 const apiError = async (response) => {
   const payload = await response.json().catch(() => ({}));
@@ -45,12 +67,13 @@ const apiError = async (response) => {
 };
 
 const requestJSON = async (url, options = {}) => {
-  const response = await fetch(url, options);
+  const response = await fetch(url, { cache: "no-store", ...options });
   if (!response.ok) throw await apiError(response);
   return response.json();
 };
 
 const sha256File = async (file) => {
+  if (!crypto?.subtle) throw new Error("This browser cannot hash replay files. Open the site in Safari, Chrome, or Firefox.");
   const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 };
@@ -70,13 +93,14 @@ function showView(name) {
     view.hidden = !active;
     view.classList.toggle("active", active);
   });
-  $$("[data-view-link]").forEach((link) => link.classList.toggle("active", link.dataset.viewLink === name));
+  $$('[data-view-link]').forEach((link) => link.classList.toggle("active", link.dataset.viewLink === name));
   history.replaceState(null, "", `#${name}`);
+  window.scrollTo({ top: 0, behavior: "auto" });
   if (name === "gallery" && !galleryLoaded) loadGallery(true);
   if (name === "daily" && !dailyPayload) loadDaily();
 }
 
-$$("[data-view-link]").forEach((link) => link.addEventListener("click", (event) => {
+$$('[data-view-link]').forEach((link) => link.addEventListener("click", (event) => {
   event.preventDefault();
   showView(link.dataset.viewLink);
 }));
@@ -114,11 +138,11 @@ function failCurrentStep(message) {
 
 function setFile(file) {
   if (!file) return;
-  if (!file.name.toLowerCase().endsWith(".osr")) return showError("That is not a .osr replay file.");
+  if (!file.name.toLowerCase().endsWith(".osr")) return showError("Select an .osr replay file.");
   if (file.size > 4_000_000) return showError("Replay exceeds the 4 MB upload limit.");
   selectedFile = file;
-  $("#dropTitle").textContent = "Replay selected";
-  $("#dropSubtitle").textContent = "Ready to parse and render";
+  $("#dropTitle").textContent = "REPLAY SELECTED";
+  $("#dropSubtitle").textContent = "ready to analyze";
   $("#fileName").textContent = file.name;
   $("#fileSize").textContent = formatBytes(file.size);
   $("#fileChip").hidden = false;
@@ -187,10 +211,10 @@ function renderResult(data) {
   $("#videoLink").href = data.videoURL;
   $("#galleryStatus").textContent = data.gallerySaved
     ? "Saved to the public gallery."
-    : ($("#publishToggle").checked ? "Prediction complete. Gallery storage is not configured or could not save." : "Kept private.");
+    : ($("#publishToggle").checked ? "Prediction complete. Gallery save failed." : "Kept private.");
 
   results.hidden = false;
-  results.scrollIntoView({ behavior: "smooth", block: "start" });
+  results.scrollIntoView({ behavior: smoothBehavior, block: "start" });
 }
 
 async function analyze() {
@@ -200,7 +224,7 @@ async function analyze() {
   resetSteps();
   results.hidden = true;
   runButton.disabled = true;
-  runButton.textContent = "CLANKING…";
+  runButton.textContent = "WORKING…";
   try {
     setStep(0, "active", "Computing hash and decoding replay");
     const replayHash = await sha256File(selectedFile);
@@ -243,7 +267,7 @@ async function analyze() {
   } finally {
     if (runID === activeRun) {
       runButton.disabled = false;
-      runButton.textContent = "RUN THE CONTRAPTION";
+      runButton.textContent = "ANALYZE REPLAY";
     }
   }
 }
@@ -265,17 +289,28 @@ $("#resetButton").addEventListener("click", () => {
   replayInput.value = "";
   results.hidden = true;
   $("#fileChip").hidden = true;
-  $("#dropTitle").textContent = "Choose a .osr replay";
-  $("#dropSubtitle").textContent = "Drop it here or click to browse";
+  $("#dropTitle").textContent = "CHOOSE .OSR FILE";
+  $("#dropSubtitle").textContent = "tap here or drop a file";
   $("#replayVideo").removeAttribute("src");
   runButton.disabled = true;
   hideError();
   resetSteps();
-  window.scrollTo({ top: 0, behavior: "smooth" });
+  window.scrollTo({ top: 0, behavior: smoothBehavior });
 });
+
+function sliderToRank(position, population = rankPopulation) {
+  const ratio = Math.max(0, Math.min(1, Number(position) / 1000));
+  return Math.max(1, Math.min(population, Math.round(10 ** (ratio * Math.log10(population)))));
+}
+
+function rankToSlider(rank, population = rankPopulation) {
+  const clamped = Math.max(1, Math.min(population, Number(rank) || 1));
+  return Math.round((Math.log10(clamped) / Math.log10(population)) * 1000);
+}
 
 function challengeCardHTML(item, label) {
   const map = item.beatmap || {};
+  const defaultRank = Math.min(rankPopulation, 25_000);
   return `
     <div class="challenge-shell">
       <section class="card challenge-panel">
@@ -285,13 +320,51 @@ function challengeCardHTML(item, label) {
       </section>
       <section class="card guess-panel">
         <h2>Guess the global rank</h2>
-        <p>Within 10% counts as correct. Smaller rank numbers are better.</p>
-        <form class="guess-form"><input type="number" min="1" max="100000000" placeholder="e.g. 25000" required /><button class="primary-button" type="submit">Guess</button></form>
+        <p>Within 10% counts as correct. Lower rank numbers are better.</p>
+        <form class="guess-form">
+          <label class="guess-readout">
+            <span>YOUR GUESS</span>
+            <output>${formatRank(defaultRank)}</output>
+          </label>
+          <input class="rank-slider" type="range" min="0" max="1000" step="1" value="${rankToSlider(defaultRank)}" aria-label="Logarithmic rank slider" />
+          <div class="rank-scale"><span>#1</span><span>${formatRank(rankPopulation)}</span></div>
+          <div class="guess-entry-row">
+            <span class="hash-prefix">#</span>
+            <input class="rank-input" type="number" inputmode="numeric" min="1" max="${rankPopulation}" value="${defaultRank}" required aria-label="Rank number" />
+            <button class="primary-button" type="submit">GUESS</button>
+          </div>
+        </form>
         <ol class="guess-list"></ol>
         <div class="answer-box" hidden></div>
+        <div class="community-box" hidden></div>
         <div class="challenge-actions" hidden></div>
       </section>
     </div>`;
+}
+
+function bindRankControl(root) {
+  const slider = $(".rank-slider", root);
+  const input = $(".rank-input", root);
+  const output = $(".guess-readout output", root);
+
+  const fromSlider = () => {
+    const rank = sliderToRank(slider.value);
+    input.value = String(rank);
+    output.textContent = formatRank(rank);
+  };
+  const fromInput = () => {
+    const rank = Math.max(1, Math.min(rankPopulation, Math.round(Number(input.value) || 1)));
+    slider.value = String(rankToSlider(rank));
+    output.textContent = formatRank(rank);
+  };
+
+  slider.addEventListener("input", fromSlider, { passive: true });
+  input.addEventListener("input", fromInput);
+  input.addEventListener("blur", () => {
+    fromInput();
+    input.value = String(sliderToRank(slider.value));
+  });
+  fromInput();
 }
 
 function feedbackText(result) {
@@ -300,16 +373,42 @@ function feedbackText(result) {
   return "Actual rank is worse (larger)";
 }
 
+function distributionHTML(distribution) {
+  if (!distribution?.count) {
+    return `<h3>Community first guesses</h3><p>No other guesses recorded yet.</p>`;
+  }
+  const maximum = Math.max(1, ...distribution.buckets.map((bucket) => Number(bucket.count || 0)));
+  const rows = distribution.buckets.map((bucket) => {
+    const bucketCount = Number(bucket.count || 0);
+    const width = bucketCount ? Math.max(3, Math.round((bucketCount / maximum) * 100)) : 0;
+    const range = bucket.minRank === bucket.maxRank
+      ? formatRank(bucket.minRank)
+      : `${formatRank(bucket.minRank)}–${formatRank(bucket.maxRank)}`;
+    return `<li><span>${range}</span><i><b style="width:${width}%"></b></i><em>${Number(bucket.count || 0)}</em></li>`;
+  }).join("");
+  return `
+    <div class="community-heading"><h3>Community first guesses</h3><span>n=${distribution.count}</span></div>
+    <ol class="distribution-list">${rows}</ol>
+    <p>Median first guess: <strong>${formatRank(distribution.medianRank)}</strong></p>`;
+}
+
 async function submitChallengeGuess(round, mode, challengeDate) {
   const root = round.root;
-  const input = $(".guess-form input", root);
-  const guessRank = Number(input.value);
+  const input = $(".rank-input", root);
+  const guessRank = Math.round(Number(input.value));
   if (!Number.isInteger(guessRank) || guessRank < 1) return;
   const attempt = round.guesses.length + 1;
   const result = await requestJSON("/api/challenge/guess", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ replayID: round.item.id, guessRank, attempt, mode, challengeDate }),
+    body: JSON.stringify({
+      replayID: round.item.id,
+      guessRank,
+      attempt,
+      mode,
+      challengeDate,
+      sessionID,
+    }),
   });
   round.guesses.push({ guessRank, ...result });
   if (result.revealed) {
@@ -317,8 +416,8 @@ async function submitChallengeGuess(round, mode, challengeDate) {
     round.actualRank = result.actualRank;
     round.predictedRank = result.predictedRank;
     round.player = result.player;
+    round.distribution = result.distribution || null;
   }
-  input.value = "";
   updateChallengeRound(round, mode, challengeDate);
   if (mode === "daily") saveDailyState();
 }
@@ -331,13 +430,16 @@ function updateChallengeRound(round, mode, challengeDate) {
   form.hidden = round.revealed;
   const answer = $(".answer-box", root);
   answer.hidden = !round.revealed;
+  const community = $(".community-box", root);
+  community.hidden = !(round.revealed && mode === "daily");
   if (round.revealed) {
-    answer.innerHTML = `<span>${escapeHTML(round.player || "Player")}</span><strong>${formatRank(round.actualRank)}</strong><small>AI predicted ${formatRank(round.predictedRank)}</small>`;
+    answer.innerHTML = `<span>${escapeHTML(round.player || "Player")}</span><strong>${formatRank(round.actualRank)}</strong><small>Model prediction: ${formatRank(round.predictedRank)}</small>`;
+    if (mode === "daily") community.innerHTML = distributionHTML(round.distribution);
     const actions = $(".challenge-actions", root);
     actions.hidden = false;
-    actions.innerHTML = `<button class="secondary-button next-challenge" type="button">${mode === "daily" ? "Next replay" : "Another replay"}</button>`;
+    actions.innerHTML = `<button class="secondary-button next-challenge" type="button">${mode === "daily" ? "NEXT REPLAY" : "NEW FRESH REPLAY"}</button>`;
     $(".next-challenge", actions).addEventListener("click", () => {
-      if (mode === "daily") advanceDaily(); else loadInfinite(round.item.id);
+      if (mode === "daily") advanceDaily(); else loadInfinite();
     });
   }
 }
@@ -345,6 +447,7 @@ function updateChallengeRound(round, mode, challengeDate) {
 function mountChallenge(rootElement, item, round, label, mode, challengeDate = null) {
   rootElement.innerHTML = challengeCardHTML(item, label);
   round.root = rootElement;
+  bindRankControl(rootElement);
   const form = $(".guess-form", rootElement);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -357,32 +460,50 @@ function mountChallenge(rootElement, item, round, label, mode, challengeDate = n
   updateChallengeRound(round, mode, challengeDate);
 }
 
-function dailyStorageKey() { return dailyPayload ? `osu-rankguess-daily-${dailyPayload.date}` : ""; }
+function dailyStorageKey() { return dailyPayload ? `osu-rankguess-daily-v2-${dailyPayload.date}` : ""; }
 function saveDailyState() {
   if (!dailyPayload || !dailyState) return;
   const serializable = {
     current: dailyState.current,
-    rounds: dailyState.rounds.map(({ item, guesses, revealed, actualRank, predictedRank, player }) => ({ id: item.id, guesses, revealed, actualRank, predictedRank, player })),
+    rounds: dailyState.rounds.map(({ item, guesses, revealed, actualRank, predictedRank, player, distribution }) => ({
+      id: item.id,
+      guesses,
+      revealed,
+      actualRank,
+      predictedRank,
+      player,
+      distribution,
+    })),
   };
-  localStorage.setItem(dailyStorageKey(), JSON.stringify(serializable));
+  storage.set(dailyStorageKey(), JSON.stringify(serializable));
 }
 
 function restoreDailyState(payload) {
-  const saved = JSON.parse(localStorage.getItem(`osu-rankguess-daily-${payload.date}`) || "null");
+  let saved = null;
+  try { saved = JSON.parse(storage.get(`osu-rankguess-daily-v2-${payload.date}`) || "null"); } catch { saved = null; }
   const rounds = payload.replays.map((item) => {
     const old = saved?.rounds?.find((round) => round.id === item.id) || {};
-    return { item, guesses: old.guesses || [], revealed: old.revealed || false, actualRank: old.actualRank, predictedRank: old.predictedRank, player: old.player };
+    return {
+      item,
+      guesses: old.guesses || [],
+      revealed: old.revealed || false,
+      actualRank: old.actualRank,
+      predictedRank: old.predictedRank,
+      player: old.player,
+      distribution: old.distribution || null,
+    };
   });
   return { current: Math.min(saved?.current || 0, 2), rounds };
 }
 
 async function loadDaily() {
   const root = $("#dailyRoot");
-  root.innerHTML = '<p class="empty-state">Loading today\'s challenge…</p>';
+  root.innerHTML = '<p class="empty-state">Loading today\'s set…</p>';
   try {
     dailyPayload = await requestJSON("/api/challenge/daily");
+    rankPopulation = Number(dailyPayload.rankPopulation || rankPopulation);
     if (!dailyPayload.available) {
-      root.innerHTML = `<p class="empty-state">Daily challenge needs three public submissions with known osu! ranks. Eligible now: ${dailyPayload.eligibleReplays || 0}.</p>`;
+      root.innerHTML = `<p class="empty-state">The daily needs three public replays with known ranks. Eligible now: ${dailyPayload.eligibleReplays || 0}.</p>`;
       return;
     }
     dailyState = restoreDailyState(dailyPayload);
@@ -394,17 +515,18 @@ async function loadDaily() {
 
 function renderDaily() {
   const root = $("#dailyRoot");
-  const progress = `<div class="daily-progress">${dailyState.rounds.map((round, index) => `<span class="${round.revealed ? "done" : index === dailyState.current ? "current" : ""}">${index + 1}</span>`).join("")}</div>`;
+  const progress = `<div class="daily-progress" aria-label="Daily progress">${dailyState.rounds.map((round, index) => `<span class="${round.revealed ? "done" : index === dailyState.current ? "current" : ""}">${index + 1}</span>`).join("")}</div>`;
   if (dailyState.current >= dailyState.rounds.length) return renderDailySummary();
   root.innerHTML = progress + '<div id="dailyChallengeMount"></div>';
   const round = dailyState.rounds[dailyState.current];
-  mountChallenge($("#dailyChallengeMount"), round.item, round, `Daily ${dailyState.current + 1} / 3`, "daily", dailyPayload.date);
+  mountChallenge($("#dailyChallengeMount"), round.item, round, `DAILY ${dailyState.current + 1} / 3`, "daily", dailyPayload.date);
 }
 
 function advanceDaily() {
   dailyState.current += 1;
   saveDailyState();
   renderDaily();
+  $("#dailyRoot").scrollIntoView({ behavior: smoothBehavior, block: "start" });
 }
 
 function shareGrid() {
@@ -418,42 +540,65 @@ function shareGrid() {
 function renderDailySummary() {
   const root = $("#dailyRoot");
   const grid = shareGrid();
-  root.innerHTML = `<section class="card daily-summary"><p class="kicker">Complete · ${escapeHTML(dailyPayload.date)}</p><h2>Daily finished</h2><div class="share-grid">${grid}</div><div class="challenge-actions"><button class="primary-button narrow" id="shareDaily">Copy result</button></div></section>`;
+  root.innerHTML = `<section class="card daily-summary"><p class="kicker">${escapeHTML(dailyPayload.date)}</p><h2>Daily complete</h2><div class="share-grid">${grid}</div><div class="challenge-actions"><button class="primary-button narrow" id="shareDaily">SHARE RESULT</button></div></section>`;
   $("#shareDaily").addEventListener("click", async () => {
-    await navigator.clipboard.writeText(`osu!rankguess ${dailyPayload.date}\n${grid}\nhttps://osu-rankguess.vercel.app/#daily`);
-    $("#shareDaily").textContent = "Copied";
+    const text = `osu!rankguess ${dailyPayload.date}\n${grid}\nhttps://osu-rankguess.vercel.app/`;
+    try {
+      if (navigator.share) await navigator.share({ text, url: "https://osu-rankguess.vercel.app/" });
+      else await navigator.clipboard.writeText(text);
+      $("#shareDaily").textContent = "SHARED";
+    } catch {
+      try { await navigator.clipboard.writeText(text); $("#shareDaily").textContent = "COPIED"; } catch { /* no clipboard */ }
+    }
   });
 }
 
-async function loadInfinite(exclude = null) {
+async function loadInfinite() {
   const root = $("#infiniteRoot");
-  root.innerHTML = '<p class="empty-state">Loading replay…</p>';
+  const messages = [
+    "Finding a public score with a replay…",
+    "Downloading replay data…",
+    "Submitting a fresh o!rdr render…",
+    "Waiting for the video…",
+    "Preparing the challenge…",
+  ];
+  let messageIndex = 0;
+  root.innerHTML = `<section class="card loading-card"><div class="card-label">NEW ROUND</div><strong>Preparing a fresh replay</strong><p id="infiniteLoadingText">${messages[0]}</p><p>This can take around a minute.</p></section>`;
+  const timer = setInterval(() => {
+    messageIndex = Math.min(messages.length - 1, messageIndex + 1);
+    const element = $("#infiniteLoadingText");
+    if (element) element.textContent = messages[messageIndex];
+  }, 7000);
   try {
-    const payload = await requestJSON(`/api/challenge/infinite${exclude ? `?exclude=${encodeURIComponent(exclude)}` : ""}`);
+    const payload = await requestJSON(`/api/challenge/infinite?sessionID=${encodeURIComponent(sessionID)}`, { method: "POST" });
+    rankPopulation = Number(payload.rankPopulation || rankPopulation);
     if (!payload.available) {
-      root.innerHTML = '<p class="empty-state">Infinite mode needs at least one public submission with a known osu! rank.</p>';
+      root.innerHTML = '<p class="empty-state">Infinite mode is not configured.</p>';
       return;
     }
     infiniteRound = { item: payload.replay, guesses: [], revealed: false };
-    mountChallenge(root, payload.replay, infiniteRound, "Infinite", "infinite");
+    mountChallenge(root, payload.replay, infiniteRound, "INFINITE / FRESH", "infinite");
   } catch (error) {
-    root.innerHTML = `<p class="empty-state">${escapeHTML(error.message)}</p>`;
+    root.innerHTML = `<section class="card loading-card"><strong>Could not prepare a replay.</strong><p>${escapeHTML(error.message)}</p><button class="secondary-button narrow" id="retryInfinite">TRY AGAIN</button></section>`;
+    $("#retryInfinite")?.addEventListener("click", loadInfinite);
+  } finally {
+    clearInterval(timer);
   }
 }
-$("#startInfinite").addEventListener("click", () => loadInfinite());
+$("#startInfinite").addEventListener("click", loadInfinite);
 
 function galleryCard(item) {
   const map = item.beatmap || {};
   const thumbnail = item.thumbnailURL || `/api/gallery/${encodeURIComponent(item.id)}/thumbnail`;
-  const sourceLabel = item.source === "cron" ? "found by the replay goblin" : "donated by a visitor";
+  const sourceLabel = item.source === "cron" ? "automatic sample" : "community upload";
   const mapLabel = `${map.artist ? `${map.artist} — ` : ""}${map.title || "Unknown map"}`;
-  const detailLabel = `${map.version || "mystery diff"} · ${Number(item.star || 0).toFixed(2)}★ · ${(item.mods || ["NM"]).join("")}`;
+  const detailLabel = `${map.version || "Unknown difficulty"} · ${Number(item.star || 0).toFixed(2)}★ · ${(item.mods || ["NM"]).join("")}`;
 
   return `
     <article class="gallery-card">
       <a class="gallery-thumb" href="${escapeHTML(item.videoURL)}" target="_blank" rel="noreferrer" aria-label="Watch ${escapeHTML(item.player || "this replay")}">
         <img src="${escapeHTML(thumbnail)}" alt="" loading="lazy" decoding="async" onerror="this.hidden=true">
-        <span>WATCH REPLAY ↗</span>
+        <span>WATCH</span>
       </a>
       <div class="gallery-copy">
         <p class="gallery-source">${escapeHTML(sourceLabel)}</p>
@@ -461,8 +606,8 @@ function galleryCard(item) {
         <p>${escapeHTML(mapLabel)}<br>${escapeHTML(detailLabel)}</p>
       </div>
       <div class="gallery-ranks">
-        <div><span>REAL RANK</span><strong>${formatRank(item.actualRank)}</strong></div>
-        <div><span>ROBOT SAID</span><strong>${formatRank(item.predictedRank)}</strong></div>
+        <div><span>ACTUAL</span><strong>${formatRank(item.actualRank)}</strong></div>
+        <div><span>MODEL</span><strong>${formatRank(item.predictedRank)}</strong></div>
       </div>
     </article>`;
 }
@@ -475,7 +620,7 @@ async function loadGallery(reset = false) {
   try {
     const payload = await requestJSON(`/api/gallery?limit=24&offset=${galleryOffset}`);
     if (!payload.configured) {
-      empty.textContent = "the public pile has nowhere to live. connect postgres.";
+      empty.textContent = "Gallery storage is not configured.";
       empty.hidden = false;
       more.hidden = true;
       galleryLoaded = true;
@@ -494,4 +639,4 @@ async function loadGallery(reset = false) {
 $("#loadMoreGallery").addEventListener("click", () => loadGallery(false));
 
 const initialView = location.hash.replace("#", "");
-showView(["analyze", "daily", "infinite", "gallery"].includes(initialView) ? initialView : "analyze");
+showView(["analyze", "daily", "infinite", "gallery"].includes(initialView) ? initialView : "daily");

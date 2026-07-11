@@ -2,90 +2,113 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#e9e4cf" />
-  <meta name="description" content="Guess an osu! global rank from a complete .osr replay." />
-  <title>osu!rankguess [beta]</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#eee9d7" />
+  <meta name="color-scheme" content="light" />
+  <meta name="description" content="Guess osu! global ranks from replay clips, then analyze your own .osr replay." />
+  <title>osu!rankguess</title>
   <link rel="icon" href="/favicon.svg" />
-  <link rel="stylesheet" href="/styles.css?v=9" />
+  <link rel="stylesheet" href="/styles.css?v=10" />
 </head>
 <body>
-  <div class="top-strip">*** ONE REPLAY IN. ONE SUSPICIOUSLY SPECIFIC RANK OUT. ***</div>
+  <div class="top-strip">OSU!RANKGUESS // DAILY 3 // GLOBAL RANKS // UTC RESET</div>
 
-  <header class="site-header">
+  <header class="site-header page-width">
     <div class="brand-block">
-      <a class="brand" href="#analyze" data-view-link="analyze">osu!rankguess</a>
-      <span class="beta-stamp">BETA / probably</span>
+      <a class="brand" href="#daily" data-view-link="daily">osu!rankguess</a>
+      <span class="version-stamp">v0.10 beta</span>
     </div>
     <nav aria-label="Main navigation">
-      <button class="nav-link active" data-view-link="analyze">[ analyze ]</button>
-      <button class="nav-link" data-view-link="daily">[ daily 3 ]</button>
-      <button class="nav-link" data-view-link="infinite">[ infinite ]</button>
-      <button class="nav-link" data-view-link="gallery">[ gallery ]</button>
+      <button class="nav-link active" data-view-link="daily">daily 3</button>
+      <button class="nav-link" data-view-link="infinite">infinite</button>
+      <button class="nav-link" data-view-link="analyze">analyze replay</button>
+      <button class="nav-link" data-view-link="gallery">gallery</button>
     </nav>
   </header>
 
-  <main>
-    <section class="view active" id="view-analyze" data-view="analyze">
-      <div class="page-heading">
-        <p class="kicker">COMPUTER GUESSING DEPARTMENT</p>
-        <h1>drop a replay.<br />receive a rank.</h1>
-        <p>The cursor timeline goes into the machine. A global rank comes back out. Please do not ask the machine to explain itself.</p>
+  <main class="page-width">
+    <section class="view active" id="view-daily" data-view="daily">
+      <div class="page-heading daily-heading">
+        <p class="kicker">TODAY'S SET / THREE REPLAYS</p>
+        <h1>guess the rank.</h1>
+        <p>Watch each replay and estimate the player's current global rank. You get five attempts. The scale is logarithmic because osu! ranks are not evenly distributed.</p>
+      </div>
+      <div id="dailyRoot" class="challenge-root" aria-live="polite">
+        <p class="empty-state">Loading today's set…</p>
+      </div>
+    </section>
+
+    <section class="view" id="view-infinite" data-view="infinite" hidden>
+      <div class="page-heading compact">
+        <p class="kicker">FRESH PUBLIC REPLAY</p>
+        <h1>infinite mode.</h1>
+        <p>Each round finds a new public score, downloads its replay, renders a new clip, and keeps it separate from the gallery. A round can take a minute to prepare.</p>
+      </div>
+      <div id="infiniteRoot" class="challenge-root">
+        <button class="primary-button narrow" id="startInfinite">START A FRESH ROUND</button>
+      </div>
+    </section>
+
+    <section class="view" id="view-analyze" data-view="analyze" hidden>
+      <div class="page-heading compact">
+        <p class="kicker">YOUR REPLAY</p>
+        <h1>predict a rank.</h1>
+        <p>Upload one standard-mode .osr replay. The backend parses the replay, renders it through o!rdr, and runs the production model.</p>
       </div>
 
       <div class="analyze-grid">
         <section class="card upload-card">
-          <div class="card-label">FORM 001-A: REPLAY INTAKE</div>
+          <div class="card-label">REPLAY FILE</div>
           <label class="dropzone" id="dropzone" for="replayInput">
             <input id="replayInput" type="file" accept=".osr,application/octet-stream" hidden />
             <strong id="dropTitle">CHOOSE .OSR FILE</strong>
-            <span id="dropSubtitle">or drag the little guy onto this box</span>
+            <span id="dropSubtitle">tap here or drop a file</span>
             <span class="file-line" id="fileChip" hidden><b id="fileName"></b><i id="fileSize"></i></span>
           </label>
           <label class="publish-option">
             <input id="publishToggle" type="checkbox" checked />
-            <span>put the finished replay in the public pile</span>
+            <span>publish the result in the gallery</span>
           </label>
-          <button class="primary-button" id="runButton" disabled>RUN THE CONTRAPTION</button>
+          <button class="primary-button" id="runButton" disabled>ANALYZE REPLAY</button>
           <p class="status-text" id="renderStatus" hidden></p>
           <p class="error-text" id="errorBox" hidden></p>
         </section>
 
         <section class="card process-card">
-          <div class="card-label">CURRENTLY DOING</div>
+          <div class="card-label">PIPELINE</div>
           <ol class="steps">
-            <li data-step="cache" data-default-detail="Read replay telemetry"><span>01</span><div><strong>open replay</strong><small>Read replay telemetry</small></div></li>
-            <li data-step="submit" data-default-detail="Send replay to o!rdr"><span>02</span><div><strong>mail to o!rdr</strong><small>Send replay to o!rdr</small></div></li>
-            <li data-step="wait" data-default-detail="Wait for render"><span>03</span><div><strong>wait around</strong><small>Wait for render</small></div></li>
-            <li data-step="metadata" data-default-detail="Read map metadata"><span>04</span><div><strong>steal map facts</strong><small>Read map metadata</small></div></li>
-            <li data-step="model" data-default-detail="Run five model folds"><span>05</span><div><strong>consult machine</strong><small>Run five model folds</small></div></li>
+            <li data-step="cache" data-default-detail="Read replay telemetry"><span>01</span><div><strong>parse replay</strong><small>Read replay telemetry</small></div></li>
+            <li data-step="submit" data-default-detail="Send replay to o!rdr"><span>02</span><div><strong>submit render</strong><small>Send replay to o!rdr</small></div></li>
+            <li data-step="wait" data-default-detail="Wait for render"><span>03</span><div><strong>wait for video</strong><small>Wait for render</small></div></li>
+            <li data-step="metadata" data-default-detail="Read map metadata"><span>04</span><div><strong>read metadata</strong><small>Read map metadata</small></div></li>
+            <li data-step="model" data-default-detail="Run model ensemble"><span>05</span><div><strong>run model</strong><small>Run model ensemble</small></div></li>
           </ol>
-          <p class="tiny-warning">Do not refresh while the machine is thinking. It gets offended.</p>
+          <p class="tiny-note">Keep this tab open until the result appears.</p>
         </section>
       </div>
 
       <section class="result-block" id="results" hidden>
         <div class="rank-result card">
-          <div class="card-label">OFFICIAL-LOOKING RESULT</div>
+          <div class="card-label">PREDICTION</div>
           <p class="kicker" id="resultPlayer">PLAYER</p>
           <span class="rank-label">predicted global rank</span>
           <strong class="rank-number" id="predictedRank">#—</strong>
           <p class="rank-secondary" id="rankContext">—</p>
           <div class="rank-comparison" id="rankComparison" hidden>
-            <span>actual rank right now</span>
+            <span>current public rank</span>
             <strong id="actualRank">#—</strong>
           </div>
         </div>
 
         <div class="card result-details">
-          <div class="card-label">EVIDENCE</div>
+          <div class="card-label">REPLAY</div>
           <video id="replayVideo" controls playsinline preload="metadata"></video>
           <div class="map-line">
             <div>
               <strong id="mapTitle">—</strong>
               <span id="mapMeta">—</span>
             </div>
-            <a id="videoLink" href="#" target="_blank" rel="noreferrer">OPEN MP4 ↗</a>
+            <a id="videoLink" href="#" target="_blank" rel="noreferrer">OPEN MP4</a>
           </div>
           <dl class="stats-grid">
             <div><dt>TOP %</dt><dd id="topPercent">—</dd></div>
@@ -96,50 +119,28 @@
             <div><dt>EVENTS</dt><dd id="eventsValue">—</dd></div>
           </dl>
           <p class="small-note" id="galleryStatus"></p>
-          <button class="secondary-button" id="resetButton">DO ANOTHER ONE</button>
+          <button class="secondary-button" id="resetButton">ANALYZE ANOTHER</button>
         </div>
       </section>
     </section>
 
-    <section class="view" id="view-daily" data-view="daily" hidden>
-      <div class="page-heading compact">
-        <p class="kicker">TODAY'S INTERNET HOMEWORK</p>
-        <h1>three replays.<br />guess the ranks.</h1>
-        <p>Five guesses each. Smaller numbers are better. The website will be vaguely helpful.</p>
-      </div>
-      <div id="dailyRoot" class="challenge-root">
-        <p class="empty-state">loading today's three victims…</p>
-      </div>
-    </section>
-
-    <section class="view" id="view-infinite" data-view="infinite" hidden>
-      <div class="page-heading compact">
-        <p class="kicker">NO RESPONSIBLE STOPPING POINT</p>
-        <h1>keep guessing<br />until bored.</h1>
-        <p>Random public replays. No streak system, no coins, no battle pass.</p>
-      </div>
-      <div id="infiniteRoot" class="challenge-root">
-        <button class="primary-button narrow" id="startInfinite">GIVE ME ONE</button>
-      </div>
-    </section>
-
     <section class="view" id="view-gallery" data-view="gallery" hidden>
       <div class="page-heading compact">
-        <p class="kicker">THE PUBLIC PILE</p>
-        <h1>other people's<br />replays.</h1>
-        <p>Click a thumbnail to watch. Raw replay files are not published. The little crooked cards are intentional.</p>
+        <p class="kicker">PUBLIC RESULTS</p>
+        <h1>gallery.</h1>
+        <p>Community uploads and automatic samples. Click a thumbnail to watch the rendered replay.</p>
       </div>
       <div id="galleryGrid" class="gallery-grid"></div>
-      <p class="empty-state" id="galleryEmpty" hidden>nothing here yet. suspicious.</p>
-      <button class="secondary-button narrow" id="loadMoreGallery" hidden>MORE CARDS</button>
+      <p class="empty-state" id="galleryEmpty" hidden>No public results yet.</p>
+      <button class="secondary-button narrow" id="loadMoreGallery" hidden>LOAD MORE</button>
     </section>
   </main>
 
-  <footer>
-    <span>osu!rankguess · made with a replay parser and poor restraint</span>
-    <span>model test R² 0.653 · this is not an official osu! website</span>
+  <footer class="page-width">
+    <span>osu!rankguess</span>
+    <span>model test R² 0.653 · unofficial osu! project</span>
   </footer>
 
-  <script src="/app.js?v=9" defer></script>
+  <script src="/app.js?v=10" defer></script>
 </body>
 </html>
