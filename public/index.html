@@ -13,7 +13,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" />
   <link rel="stylesheet" href="/styles.css?v=15" />
-  <link rel="stylesheet" href="/refine.css?v=16" />
+  <link rel="stylesheet" href="/refine.css?v=17" />
 </head>
 <body data-view="daily">
   <header class="site-header">
@@ -38,9 +38,9 @@
       <div id="infiniteRoot" class="challenge-root">
         <section class="mode-intro">
           <p class="kicker">infinite</p>
-          <h1>a fresh replay every round.</h1>
-          <p>Each round finds a public score, downloads its replay, and makes a new o!rdr clip. It never pulls from the gallery.</p>
-          <button class="primary-button narrow" id="startInfinite" type="button">start a round</button>
+          <h1>endless gallery replays.</h1>
+          <p>Each round pulls a replay from the public gallery. The next one loads in the background while you play.</p>
+          <button class="primary-button narrow" id="startInfinite" type="button">start</button>
         </section>
       </div>
     </section>
@@ -98,7 +98,7 @@
 
         <div class="card result-details">
           <div class="card-label">replay</div>
-          <video id="replayVideo" controls playsinline preload="metadata"></video>
+          <video id="replayVideo" controls autoplay playsinline preload="auto"></video>
           <div class="map-line">
             <div><strong id="mapTitle">—</strong><span id="mapMeta">—</span></div>
             <a id="videoLink" href="#" target="_blank" rel="noreferrer">open video</a>
@@ -151,7 +151,9 @@
   </dialog>
 
   <script src="/app.js?v=15" defer></script>
-  <script src="/refine.js?v=16" defer></script>
+  <script src="/refine.js?v=17" defer></script>
   <script src="/rank-rule.js?v=16" defer></script>
+  <script src="/layout-redo.js?v=17" defer></script>
+  <script src="/gallery-infinite.js?v=17" defer></script>
 </body>
 </html>
