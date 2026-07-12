@@ -1,14 +1,16 @@
 [project]
 name = "osu-rankguess"
-version = "1.0.0"
-description = "Whole-replay osu! rank percentile inference"
+version = "4.0.1"
+description = "Whole-replay osu! rank prediction with a daily-first rank guessing, fresh infinite renders, and model-bundle inference"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "fastapi>=0.117.1,<1.0",
   "httpx>=0.28.1,<1.0",
   "numpy>=2.0,<3.0",
   "onnxruntime>=1.22,<2.0",
+  "rosu-pp-py>=4.0.2,<5",
   "python-multipart>=0.0.20,<1.0",
+  "psycopg[binary]>=3.2,<4.0",
   "uvicorn>=0.35,<1.0",
 ]
 

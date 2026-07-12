@@ -2,12 +2,31 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "app.py": {
-      "maxDuration": 60,
-      "includeFiles": [
-        "model/**"
-      ]
+      "maxDuration": 240,
+      "includeFiles": "model/**"
     }
   },
+  "crons": [
+    {
+      "path": "/api/cron/seed-gallery/0",
+      "schedule": "5 2 * * *"
+    },
+    {
+      "path": "/api/cron/seed-gallery/1",
+      "schedule": "5 10 * * *"
+    },
+    {
+      "path": "/api/cron/seed-gallery/2",
+      "schedule": "5 18 * * *"
+    }
+  ],
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "/index.html",
+      "permanent": false
+    }
+  ],
   "headers": [
     {
       "source": "/api/(.*)",
@@ -19,6 +38,15 @@
         {
           "key": "Cache-Control",
           "value": "no-store"
+        }
+      ]
+    },
+    {
+      "source": "/(index.html|.*\\.js|.*\\.css)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, max-age=0"
         }
       ]
     }

@@ -2,6 +2,10 @@ __pycache__/
 *.py[cod]
 .venv/
 .vercel/
+.vscode/
 .env
 .env.local
 .DS_Store
+training-output/
+training-cache/
+*.pt
