@@ -42,7 +42,7 @@
       ]
     },
     {
-      "source": "/(index.html|app.js|styles.css)",
+      "source": "/(index.html|.*\\.js|.*\\.css)",
       "headers": [
         {
           "key": "Cache-Control",
