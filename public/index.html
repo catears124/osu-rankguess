@@ -11,8 +11,9 @@
   <link rel="icon" href="/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:wght@500;600;700;800;900&display=swap" />
-  <link rel="stylesheet" href="/styles.css?v=14" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" />
+  <link rel="stylesheet" href="/styles.css?v=15" />
+  <link rel="stylesheet" href="/refine.css?v=16" />
 </head>
 <body data-view="daily">
   <header class="site-header">
@@ -121,18 +122,16 @@
         <div>
           <p class="kicker">public results</p>
           <h1>gallery.</h1>
-          <p>Community uploads and automatic samples. Open a card to watch the replay and compare ranks.</p>
+          <p>Open a replay to reveal the player, map, and rank comparison.</p>
         </div>
-        <div class="gallery-controls" aria-label="Gallery filters">
-          <button class="filter-button active" type="button" data-gallery-filter="all">all</button>
-          <button class="filter-button" type="button" data-gallery-filter="upload">community</button>
-          <button class="filter-button" type="button" data-gallery-filter="cron">automatic</button>
+        <div class="gallery-controls" aria-label="Gallery controls">
+          <button class="filter-button active" id="gallerySpoilerToggle" type="button" aria-pressed="true">spoilers hidden</button>
           <select id="gallerySort" aria-label="Sort gallery">
             <option value="newest">newest</option>
-            <option value="error">largest miss</option>
+            <option value="error">largest model miss</option>
             <option value="closest">closest model</option>
           </select>
-          <button class="filter-button" id="randomGallery" type="button">random</button>
+          <button class="filter-button" id="randomGallery" type="button">random replay</button>
         </div>
       </div>
       <div id="galleryGrid" class="gallery-grid"></div>
@@ -151,6 +150,7 @@
     <div id="galleryDialogBody"></div>
   </dialog>
 
-  <script src="/app.js?v=14" defer></script>
+  <script src="/app.js?v=15" defer></script>
+  <script src="/refine.js?v=16" defer></script>
 </body>
 </html>
