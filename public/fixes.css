@@ -1,0 +1,23 @@
+/* Focused layout fixes loaded after polish.css. */
+.polish-rank .rank-number-input{appearance:none!important;-webkit-appearance:none!important;-moz-appearance:textfield!important}
+.polish-rank .rank-number-input::-webkit-outer-spin-button,.polish-rank .rank-number-input::-webkit-inner-spin-button{display:none!important;margin:0!important;-webkit-appearance:none!important}
+
+.polish-history .duel-turn-list{overflow-x:hidden!important;overflow-y:auto!important;scrollbar-width:thin}
+.polish-history .duel-turn{width:100%;min-width:0;box-sizing:border-box}
+.guess-summary{display:flex;align-items:baseline;justify-content:flex-end;gap:5px;min-width:0;overflow:hidden;white-space:nowrap;text-align:right}
+.guess-summary span{flex:0 0 auto;color:var(--muted);font:750 9px/1 var(--font);text-transform:lowercase}
+.guess-summary strong{min-width:0;overflow:hidden;color:#fff;font:800 13px/1 var(--font);font-variant-numeric:tabular-nums;text-overflow:ellipsis;white-space:nowrap}
+.polish-history .player-hit .guess-summary span,.polish-history .player-hit .guess-summary strong{color:var(--green)}
+
+.polish-rank .rank-range-mask{display:none!important}
+.polish-rank .rank-known-range{top:6px!important;height:4px!important;transform:none!important;border:0!important;background:var(--pink)!important;box-shadow:0 0 0 1px rgba(255,102,171,.18)!important;opacity:1!important;z-index:5!important}
+.polish-rank .rank-slider{z-index:4!important}
+
+#view-infinite .polish-mapline{margin:0!important;padding:0!important;line-height:1!important}
+#view-infinite .polish-mapline strong,#view-infinite .polish-mapline span{line-height:1!important}
+#view-infinite .polish-stage{margin:-1px 0 0!important;padding:0!important}
+#view-infinite .polish-video-card,#view-infinite .polish-video-card .video-wrap{margin-top:0!important}
+
+.result-turn:not(.result-turn-head)>strong{min-width:0;color:#fff;font:800 12px/1 var(--font);font-variant-numeric:tabular-nums;text-align:left;white-space:nowrap}
+.result-turn:not(.result-turn-head)>strong:last-child{color:var(--pink)}
+.result-turn-head>span:nth-child(2),.result-turn-head>span:nth-child(3){text-align:left}
