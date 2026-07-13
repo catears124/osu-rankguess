@@ -1,0 +1,9 @@
+{
+  "encoding": "base64",
+  "compression": "xz",
+  "parts": 3,
+  "compressedBytes": 866696,
+  "rawBytes": 31395091,
+  "sha256Compressed": "45251f8e8d152d323253eb42dbf85edb24c6d0d24515b86df23ff8ca83bb296a",
+  "sha256Raw": "35a94000a10b85a62a20cddaa329312b2e9d8b7e8da376fc02dc26721867d060"
+}
