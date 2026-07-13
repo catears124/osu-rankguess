@@ -102,10 +102,7 @@
   const renderHistory = (round) => {
     const list = round.root?.querySelector(".guess-list");
     if (!list) return;
-    list.innerHTML = (round.guesses || []).map((guess, index) => `<li class="duel-turn ${guess?.correct ? "player-hit" : ""}">
-      <div class="guess-summary"><span>${directionLabel(guess)}:</span><strong>${formatRank(guess?.guessRank)}</strong></div>
-      <span class="duel-turn-number">${String(index + 1).padStart(2, "0")}</span>
-    </li>`).join("");
+    list.innerHTML = (round.guesses || []).map((guess) => `<li class="duel-turn ${guess?.correct ? "player-hit" : ""}"><div class="guess-summary"><span>${directionLabel(guess)}:</span><strong>${formatRank(guess?.guessRank)}</strong></div></li>`).join("");
   };
 
   const resultHTML = (round, mode) => {
@@ -120,11 +117,7 @@
         : "same error";
     const turns = (round.guesses || []).map((guess, index) => {
       const botGuess = round.botGuesses?.[index];
-      return `<div class="result-turn">
-        <span>${String(index + 1).padStart(2, "0")}</span>
-        <strong>${formatRank(guess?.guessRank)}</strong>
-        <strong>${formatRank(botGuess?.guessRank)}</strong>
-      </div>`;
+      return `<div class="result-turn"><span>${String(index + 1).padStart(2, "0")}</span><strong>${formatRank(guess?.guessRank)}</strong><strong>${formatRank(botGuess?.guessRank)}</strong></div>`;
     }).join("");
 
     return `<div class="result-backdrop" role="dialog" aria-modal="true" aria-labelledby="roundResultTitle">
