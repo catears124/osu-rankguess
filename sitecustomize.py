@@ -1,4 +1,4 @@
-"""Load base64/xz-packed ONNX models from Git-friendly text parts."""
+"""Load packed models and install process-wide runtime compatibility patches."""
 from __future__ import annotations
 
 import base64
@@ -53,3 +53,9 @@ if _ort is not None and not getattr(_ort, "_rankguess_parts_patch", False):
 
     _ort.InferenceSession = _packed_inference_session
     _ort._rankguess_parts_patch = True
+
+try:
+    import ordr_recovery as _ordr_recovery
+    _ordr_recovery.install()
+except Exception:  # pragma: no cover - never block application startup for a recovery shim.
+    pass
