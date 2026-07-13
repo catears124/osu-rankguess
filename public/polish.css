@@ -12,13 +12,16 @@
 .daily-inline button.done{color:var(--text)}
 .daily-inline button.done::after{background:var(--green)}
 .daily-inline button:disabled{opacity:.3;cursor:not-allowed}
+.polish-shell .attempt-pips i{width:7px;height:7px;border:0!important;background:rgba(255,255,255,.2)}
+.polish-shell .attempt-pips i.used{background:rgba(255,255,255,.08)}
+.polish-shell .attempt-pips i.hit{background:var(--green)}
 .polish-mapline{display:flex;align-items:baseline;justify-content:space-between;gap:18px;padding:0 0 13px;border:0!important}
 .polish-mapline strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .polish-mapline span{flex:0 0 auto;white-space:nowrap}
 .polish-stage{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,250px);gap:28px;align-items:start;padding:0}
 .polish-video-card,.polish-history{min-width:0;border:0!important;background:transparent!important}
 .polish-video-card{display:block}
-.polish-video-card .video-wrap{position:relative!important;width:100%;aspect-ratio:16/9;height:auto!important;max-height:none!important;border:1px solid var(--border);background:#000;overflow:hidden}
+.polish-video-card .video-wrap{position:relative!important;width:100%;aspect-ratio:16/9;height:auto!important;max-height:none!important;border:1px solid var(--border);background:#000;box-shadow:none!important;overflow:hidden}
 .polish-video-card .challenge-video{display:block;width:100%;height:100%!important;object-fit:contain!important;background:#000;cursor:pointer;outline:0}
 .polish-video-card .challenge-video:focus-visible{box-shadow:inset 0 0 0 2px var(--pink)}
 .polish-shell .video-toggle{position:absolute!important;right:12px!important;bottom:10px!important;z-index:3;display:block!important;width:auto!important;height:auto!important;margin:0!important;padding:7px 8px!important;border:0!important;background:rgba(0,0,0,.52)!important;color:rgba(255,255,255,.72)!important;font:800 9px/1 var(--font)!important;letter-spacing:.5px;text-transform:uppercase;transform:none!important;backdrop-filter:blur(5px)}
@@ -39,7 +42,7 @@
 .polish-history .duel-guess strong{font-size:12px}
 .polish-history .duel-guess em{grid-column:2;color:var(--faint);font-size:8px;white-space:normal}
 .polish-dock{position:static!important;inset:auto!important;margin-top:26px;padding:0!important;overflow:visible!important}
-.polish-dock .guess-zone{padding:0!important;border:0!important;background:transparent!important;overflow:visible!important}
+.polish-dock .guess-zone{width:100%!important;margin:0!important;padding:0!important;border:0!important;background:transparent!important;overflow:visible!important}
 .polish-form{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:10px!important;align-items:stretch!important}
 .polish-rank{min-width:0;width:100%}
 .polish-rank-head{display:flex;align-items:end;justify-content:space-between;gap:22px;margin-bottom:11px}
@@ -47,7 +50,7 @@
 .polish-live-rank span,.polish-rank .rank-number-label>span,.polish-range-copy span{color:var(--muted);font:800 8px/1 var(--font);letter-spacing:.75px;text-transform:uppercase}
 .polish-live-rank .live-rank{color:#fff;font:800 clamp(30px,3.6vw,44px)/.9 var(--font);font-variant-numeric:tabular-nums}
 .polish-rank .rank-number-label{display:grid!important;grid-template-columns:1fr!important;justify-items:end;gap:5px;margin:0!important}
-.polish-rank .rank-number-shell{display:flex!important;align-items:baseline!important;width:145px;min-width:0;padding:0!important;border:0!important;background:transparent!important}
+.polish-rank .rank-number-shell{display:flex!important;align-items:baseline!important;width:145px;min-width:0;min-height:0!important;padding:0!important;border:0!important;background:transparent!important}
 .polish-rank .rank-number-shell b{color:var(--pink);font-size:18px}
 .polish-rank .rank-number-input{width:100%;padding:0!important;border:0!important;background:transparent!important;color:#fff!important;font:800 18px/1 var(--font)!important;text-align:right;box-shadow:none!important;outline:0}
 .polish-rank .rank-number-input:focus{color:var(--pink)!important}
