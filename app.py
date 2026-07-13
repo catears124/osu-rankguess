@@ -2583,6 +2583,65 @@ async def infinite_challenge_api() -> JSONResponse:
     })
 
 
+def _soft_rank_position(rank: int, population: int = OSU_RANK_POPULATION) -> float:
+    softness = 2_500.0
+    maximum = max(2, int(population))
+    clipped = max(1, min(maximum, int(rank)))
+    scale = math.log1p((maximum - 1) / softness)
+    return math.log1p((clipped - 1) / softness) / scale
+
+
+def _soft_rank_from_position(position: float, population: int = OSU_RANK_POPULATION) -> int:
+    softness = 2_500.0
+    maximum = max(2, int(population))
+    unit = max(0.0, min(1.0, float(position)))
+    scale = math.log1p((maximum - 1) / softness)
+    return max(1, min(maximum, int(round(1 + softness * math.expm1(unit * scale)))))
+
+
+def rankbot_guess_for_attempt(
+    *,
+    actual_rank: int,
+    predicted_rank: int,
+    attempt: int,
+    population: int = OSU_RANK_POPULATION,
+) -> tuple[int, bool, str, str, float]:
+    """Open with the model prediction, then binary-search the visible slider range."""
+    maximum = max(2, int(population))
+    actual = max(1, min(maximum, int(actual_rank)))
+    opening = max(1, min(maximum, int(predicted_rank)))
+    lower = 1
+    upper = maximum
+
+    guess = opening
+    feedback = challenge_feedback(actual, guess)
+
+    for turn in range(1, max(1, int(attempt)) + 1):
+        if turn == 1:
+            guess = opening
+        else:
+            left = _soft_rank_position(lower, maximum)
+            right = _soft_rank_position(upper, maximum)
+            guess = _soft_rank_from_position((left + right) / 2.0, maximum)
+            guess = max(lower, min(upper, guess))
+
+        feedback = challenge_feedback(actual, guess)
+        correct, direction, _, _ = feedback
+
+        if turn >= attempt or correct:
+            return guess, *feedback
+
+        if direction == "better":
+            upper = min(upper, max(1, guess - 1))
+        elif direction == "worse":
+            lower = max(lower, min(maximum, guess + 1))
+
+        if lower > upper:
+            lower = upper = actual
+
+    return guess, *feedback
+
+
 @app.post("/api/challenge/guess")
 async def challenge_guess(payload: ChallengeGuessPayload) -> JSONResponse:
     if not database_configured():
@@ -2619,8 +2678,27 @@ async def challenge_guess(payload: ChallengeGuessPayload) -> JSONResponse:
         print(json.dumps({"event": "challenge_guess_store_failed", "error": repr(exc)}), flush=True)
 
     actual_rank = int(row["actual_rank"])
+    predicted_rank = max(1, min(OSU_RANK_POPULATION, int(row.get("predicted_rank") or 1)))
     correct, direction, closeness, log_error = challenge_feedback(actual_rank, payload.guess_rank)
-    reveal = correct or payload.attempt >= MAX_CHALLENGE_ATTEMPTS
+    bot_guess, bot_correct, bot_direction, bot_closeness, bot_log_error = rankbot_guess_for_attempt(
+        actual_rank=actual_rank,
+        predicted_rank=predicted_rank,
+        attempt=payload.attempt,
+    )
+
+    reveal = correct or bot_correct or payload.attempt >= MAX_CHALLENGE_ATTEMPTS
+    if correct and bot_correct:
+        if abs(log_error - bot_log_error) < 1e-12:
+            turn_winner = "tie"
+        else:
+            turn_winner = "player" if log_error < bot_log_error else "bot"
+    elif correct:
+        turn_winner = "player"
+    elif bot_correct:
+        turn_winner = "bot"
+    else:
+        turn_winner = "pending"
+
     response: dict[str, Any] = {
         "ok": True,
         "correct": correct,
@@ -2630,6 +2708,12 @@ async def challenge_guess(payload: ChallengeGuessPayload) -> JSONResponse:
         "maxAttempts": MAX_CHALLENGE_ATTEMPTS,
         "revealed": reveal,
         "logError": log_error,
+        "botGuess": bot_guess,
+        "botCorrect": bot_correct,
+        "botDirection": bot_direction,
+        "botCloseness": bot_closeness,
+        "botLogError": bot_log_error,
+        "turnWinner": turn_winner,
     }
     if reveal:
         distribution = await asyncio.to_thread(
@@ -2641,7 +2725,7 @@ async def challenge_guess(payload: ChallengeGuessPayload) -> JSONResponse:
         )
         response.update({
             "actualRank": actual_rank,
-            "predictedRank": int(row["predicted_rank"]),
+            "predictedRank": predicted_rank,
             "player": row["player"],
             "avatarURL": row.get("avatar_url"),
             "distribution": distribution,
