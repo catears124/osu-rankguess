@@ -1,0 +1,56 @@
+/* Stable, minimal game layout. Loaded last. */
+footer,.version-stamp,.challenge-rule,.bot-lock,.infinite-prefetch-status,#view-infinite .mode-intro{display:none!important}
+main{padding-bottom:max(26px,env(safe-area-inset-bottom))}
+.clean-shell{width:min(1040px,calc(100vw - 28px));margin:16px auto 0;padding-bottom:max(14px,env(safe-area-inset-bottom));overflow:visible}
+.clean-topline{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:12px;min-height:32px;margin-bottom:8px}
+.clean-topline .game-round{color:var(--muted)}
+.duel-title{justify-self:center;color:#fff;font:800 11px/1 var(--font);letter-spacing:.7px;text-transform:uppercase}
+.clean-mapline{display:flex;align-items:baseline;justify-content:space-between;gap:16px;padding:0 2px 9px;border-bottom:1px solid var(--border-soft)}
+.clean-mapline strong{min-width:0;overflow:hidden;color:#fff;font:750 13px/1.2 var(--font);text-overflow:ellipsis;white-space:nowrap}
+.clean-mapline span{flex:0 0 auto;color:var(--muted);font:650 10px/1 var(--font);white-space:nowrap}
+.clean-content{display:block!important;padding-top:12px}
+.video-column{min-width:0;width:100%}
+.clean-shell .video-wrap,#replayVideo,.gallery-dialog video{width:100%;aspect-ratio:16/9;height:auto!important;max-height:min(68vh,680px);background:#000;overflow:hidden}
+.clean-shell .challenge-video,#replayVideo,.gallery-dialog video{display:block;width:100%;height:100%!important;object-fit:contain!important;background:#000}
+.clean-history[hidden]{display:none!important}
+.clean-history{width:100%;margin-top:9px;padding:0!important;border:0!important;background:transparent!important;overflow:visible}
+.clean-history .duel-turn-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:7px;max-height:none;padding:0}
+.clean-history .duel-turn{grid-template-columns:20px minmax(0,1fr);gap:4px 7px;padding:7px!important;background:rgba(255,255,255,.018)}
+.clean-history .duel-turn-number{font-size:9px}
+.clean-history .duel-guess{grid-template-columns:25px minmax(0,1fr) auto;gap:6px}
+.clean-history .duel-guess strong{font-size:11px}
+.clean-history .duel-guess em{font-size:7px}
+.clean-dock{position:static!important;inset:auto!important;margin-top:10px;padding:0!important;overflow:visible!important}
+.clean-dock .guess-zone{padding:11px!important;border:1px solid var(--border);background:rgba(255,255,255,.018);overflow:visible}
+.clean-dock .guess-form{display:grid;grid-template-columns:minmax(0,1fr) 132px;align-items:end;gap:13px}
+.duel-rank-control{min-width:0}
+.duel-guess-head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:7px}
+.duel-guess-head>div{display:grid;gap:4px}
+.duel-guess-head>div>span,.duel-guess-head .rank-number-label>span,.known-range-copy span{color:var(--muted);font:800 8px/1 var(--font);letter-spacing:.75px;text-transform:uppercase}
+.duel-guess-head .live-rank{color:#fff;font:800 clamp(24px,3.2vw,38px)/.92 var(--font);font-variant-numeric:tabular-nums}
+.duel-guess-head .rank-number-label{display:grid;justify-items:end;gap:4px;margin:0}
+.duel-guess-head .rank-number-shell{width:150px}
+.known-range-copy{margin:0 0 5px}
+.known-range-copy strong{font-size:10px}
+.range-callout{min-height:13px;margin:7px 0 0;color:var(--muted);font:750 10px/1.2 var(--font);text-transform:none}
+.clean-dock .guess-submit{width:132px;height:44px;margin-bottom:19px}
+.clean-reveal{max-height:none!important;overflow:visible!important;margin:0!important;padding:0!important}
+.duel-result-strip{display:grid;grid-template-columns:minmax(230px,1.25fr) minmax(210px,1fr) 118px;align-items:center;gap:18px;min-height:104px;padding:14px 15px;border:1px solid var(--border);background:rgba(255,255,255,.025)}
+.duel-result-strip.player{border-color:rgba(93,226,160,.48)}
+.duel-result-strip.bot{border-color:rgba(255,102,171,.45)}
+.actual-block,.outcome-block{display:grid;gap:4px;min-width:0}
+.actual-block span,.outcome-block span{color:var(--muted);font:800 9px/1 var(--font);letter-spacing:.8px;text-transform:uppercase}
+.actual-block strong{color:#fff;font:850 clamp(30px,4.6vw,54px)/.92 var(--font);font-variant-numeric:tabular-nums;white-space:nowrap}
+.actual-block small,.outcome-block small{overflow:hidden;color:var(--muted);font:650 10px/1.2 var(--font);text-overflow:ellipsis;white-space:nowrap}
+.outcome-block strong{color:#fff;font:800 16px/1 var(--font);font-variant-numeric:tabular-nums}
+.duel-result-strip.player .outcome-block span{color:var(--green)}
+.duel-result-strip.bot .outcome-block span{color:var(--pink)}
+.duel-result-strip .next-challenge{align-self:stretch;width:118px;min-height:50px;margin:0!important}
+.generation-card{min-height:260px;display:grid;place-content:center;text-align:center}
+.generation-card p{display:none}
+#view-analyze .page-heading .kicker,#view-analyze .page-heading>p,.process-card .steps small,.process-card .tiny-note,#view-gallery .page-heading p{display:none!important}
+#view-analyze .page-heading{margin-bottom:14px}
+#view-analyze .page-heading h1{font-size:clamp(28px,4vw,44px)}
+.result-block{padding-bottom:max(18px,env(safe-area-inset-bottom))}
+@media(max-width:760px){.clean-shell{width:calc(100vw - 16px);margin-top:8px}.clean-topline{grid-template-columns:auto auto;justify-content:space-between}.duel-title{display:none}.clean-mapline{display:grid;gap:4px}.clean-mapline strong,.clean-mapline span{white-space:normal}.clean-content{padding-top:8px}.clean-shell .video-wrap{max-height:none}.clean-history .duel-turn-list{grid-template-columns:1fr 1fr}.clean-dock{margin-top:8px}.clean-dock .guess-zone{padding:9px!important}.clean-dock .guess-form{grid-template-columns:1fr}.clean-dock .guess-submit{width:100%;height:46px;margin:0}.duel-result-strip{grid-template-columns:1fr 1fr;gap:10px;min-height:0;padding:12px}.duel-result-strip .next-challenge{grid-column:1/-1;width:100%;min-height:50px;margin-bottom:max(2px,env(safe-area-inset-bottom))!important}}
+@media(max-width:520px){.duel-guess-head{align-items:stretch}.duel-guess-head .live-rank{font-size:28px}.duel-guess-head .rank-number-shell{width:120px}.clean-history .duel-turn-list{grid-template-columns:1fr}.actual-block strong{font-size:42px}.attempt-stack{gap:6px}}
