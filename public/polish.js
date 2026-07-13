@@ -1,6 +1,7 @@
 /* Final interaction and layout polish. Loaded after clean.js. */
 (() => {
   const stageNames = ["replay", "submit", "render", "metadata", "rank"];
+  const baseUpdateChallengeRound = updateChallengeRound;
   let activeAnalysisStep = -1;
 
   const shortDate = (value) => {
@@ -11,6 +12,67 @@
       day: "numeric",
       timeZone: "UTC",
     }).format(date);
+  };
+
+  const rankRatio = (guess, actual) => {
+    const left = Number(guess);
+    const right = Number(actual);
+    if (!(left > 0) || !(right > 0)) return Infinity;
+    return Math.max(left, right) / Math.max(1, Math.min(left, right));
+  };
+
+  const bestRatio = (guesses, actualRank) => {
+    if (!Array.isArray(guesses) || !guesses.length) return Infinity;
+    return Math.min(...guesses.map((guess) => rankRatio(guess?.guessRank, actualRank)));
+  };
+
+  const firstHit = (guesses) => Array.isArray(guesses)
+    ? guesses.findIndex((guess) => guess?.correct)
+    : -1;
+
+  const winnerFor = (round) => {
+    const playerHit = firstHit(round.guesses);
+    const botHit = firstHit(round.botGuesses);
+    if (playerHit >= 0 || botHit >= 0) {
+      if (playerHit < 0) return "bot";
+      if (botHit < 0) return "player";
+      if (playerHit !== botHit) return playerHit < botHit ? "player" : "bot";
+      const playerError = Number(round.guesses[playerHit]?.logError) || 0;
+      const botError = Number(round.botGuesses[botHit]?.logError) || 0;
+      if (Math.abs(playerError - botError) < 1e-9) return "tie";
+      return playerError < botError ? "player" : "bot";
+    }
+
+    const playerRatio = bestRatio(round.guesses, round.actualRank);
+    const botRatio = bestRatio(round.botGuesses, round.actualRank);
+    if (Math.abs(playerRatio - botRatio) < 1e-9) return "tie";
+    return playerRatio < botRatio ? "player" : "bot";
+  };
+
+  const ratioText = (value) => Number.isFinite(value) ? `${value.toFixed(2)}×` : "—";
+
+  const resultHTML = (round, mode) => {
+    const winner = winnerFor(round);
+    const playerRatio = bestRatio(round.guesses, round.actualRank);
+    const botRatio = bestRatio(round.botGuesses, round.actualRank);
+    const botRank = round.botGuesses?.at(-1)?.guessRank || round.predictedRank;
+    const heading = winner === "player" ? "you win" : winner === "bot" ? "rankbot wins" : "tie";
+    const comparison = winner === "player"
+      ? "closer than rankbot"
+      : winner === "bot"
+        ? "rankbot was closer"
+        : "same error";
+    const botSummary = Number.isFinite(botRatio)
+      ? `rankbot ${ratioText(botRatio)}`
+      : Number(botRank) > 0
+        ? `rankbot ${formatRank(botRank)}`
+        : "rankbot —";
+
+    return `<div class="polish-result ${winner}">
+      <div class="result-rank"><span>actual rank</span><strong>${formatRank(round.actualRank)}</strong><small>${escapeHTML(round.player || "player")}</small></div>
+      <div class="result-outcome"><span>${heading}</span><strong>${comparison}</strong><small>you ${ratioText(playerRatio)} · ${botSummary}</small></div>
+      <button class="primary-button next-challenge" type="button">${mode === "daily" ? "next" : "next replay"}</button>
+    </div>`;
   };
 
   rankControlHTML = function polishedRankControl(initialRank = 50_000) {
@@ -39,7 +101,6 @@
         <input class="rank-slider" type="range" min="0" max="${SLIDER_STEPS}" step="1" value="${position}" aria-label="Rank guess" />
       </div>
       <div class="slider-scale" aria-label="Rank shortcuts">${ticks}</div>
-      <p class="range-callout">pick a rank</p>
     </div>`;
   };
 
@@ -57,10 +118,10 @@
       <div class="clean-mapline polish-mapline"><strong>${escapeHTML(title)}</strong><span>${escapeHTML(stats)}</span></div>
       <div class="polish-stage">
         <section class="polish-video-card">
-          <div class="video-wrap"><video class="challenge-video" src="${escapeHTML(item.videoURL)}" muted loop playsinline preload="auto"></video></div>
-          <div class="video-controls">
-            <button class="video-play" type="button" aria-label="Hold to play replay">hold to play</button>
+          <div class="video-wrap" data-video-state="loading">
+            <video class="challenge-video" src="${escapeHTML(item.videoURL)}" muted autoplay loop playsinline preload="auto" tabindex="0" aria-label="Replay video. Click to pause or play."></video>
             <button class="video-toggle" type="button" aria-label="Toggle sound">sound off</button>
+            <span class="video-playback-hint" aria-live="polite"></span>
           </div>
         </section>
         <aside class="challenge-side polish-history">
@@ -68,68 +129,100 @@
           <ol class="guess-list duel-turn-list" aria-label="Turn history"></ol>
         </aside>
       </div>
-      <div class="guess-dock clean-dock polish-dock"><div class="guess-zone"><form class="guess-form polish-form">${rankControlHTML()}<button class="primary-button guess-submit" type="submit">lock guess</button></form><p class="challenge-error" hidden></p><div class="reveal-panel clean-reveal" hidden></div></div></div>
+      <div class="guess-dock clean-dock polish-dock"><div class="guess-zone"><form class="guess-form polish-form">${rankControlHTML()}<div class="guess-actions"><p class="range-callout">pick a rank</p><button class="primary-button guess-submit" type="submit">lock guess</button></div></form><p class="challenge-error" hidden></p><div class="reveal-panel clean-reveal" hidden></div></div></div>
     </div>`;
   };
 
-  bindChallengeVideo = function holdToPlay(root) {
+  bindChallengeVideo = function clickToToggle(root) {
     const video = root.querySelector(".challenge-video");
-    const play = root.querySelector(".video-play");
     const sound = root.querySelector(".video-toggle");
-    if (!video || !play || !sound) return;
+    const hint = root.querySelector(".video-playback-hint");
+    const wrap = root.querySelector(".video-wrap");
+    if (!video || !sound || !wrap) return;
 
-    let held = false;
-    video.autoplay = false;
+    let hintTimer = 0;
+    let userPaused = false;
+    video.autoplay = true;
+    video.defaultMuted = true;
     video.muted = true;
-    video.pause();
-    play.textContent = "hold to play";
+    video.loop = true;
     sound.textContent = "sound off";
 
-    const start = async () => {
-      if (held) return;
-      held = true;
-      play.classList.add("holding");
-      play.textContent = "playing";
-      try { await video.play(); } catch {}
+    const showHint = (text, persist = false) => {
+      if (!hint) return;
+      window.clearTimeout(hintTimer);
+      hint.textContent = text;
+      hint.classList.add("visible");
+      if (!persist) hintTimer = window.setTimeout(() => hint.classList.remove("visible"), 650);
     };
 
-    const stop = () => {
-      if (!held) return;
-      held = false;
-      video.pause();
-      play.classList.remove("holding");
-      play.textContent = "hold to play";
+    const syncState = () => {
+      const state = video.paused ? "paused" : "playing";
+      wrap.dataset.videoState = state;
+      video.setAttribute("aria-label", `Replay video. Click to ${video.paused ? "play" : "pause"}.`);
     };
 
-    play.addEventListener("pointerdown", (event) => {
-      event.preventDefault();
-      try { play.setPointerCapture(event.pointerId); } catch {}
-      start();
-    });
-    play.addEventListener("pointerup", stop);
-    play.addEventListener("pointercancel", stop);
-    play.addEventListener("lostpointercapture", stop);
-    play.addEventListener("contextmenu", (event) => event.preventDefault());
-    play.addEventListener("keydown", (event) => {
-      if (event.repeat || !["Enter", " "].includes(event.key)) return;
-      event.preventDefault();
-      start();
-    });
-    play.addEventListener("keyup", (event) => {
+    const play = async (showFailure = false) => {
+      if (userPaused) return false;
+      try {
+        await video.play();
+        syncState();
+        return true;
+      } catch {
+        syncState();
+        if (showFailure) showHint("click to play", true);
+        return false;
+      }
+    };
+
+    const togglePlayback = async () => {
+      if (video.paused) {
+        userPaused = false;
+        const started = await play(true);
+        if (started) showHint("playing");
+      } else {
+        userPaused = true;
+        video.pause();
+        syncState();
+        showHint("paused");
+      }
+    };
+
+    video.addEventListener("click", togglePlayback);
+    video.addEventListener("keydown", (event) => {
       if (!["Enter", " "].includes(event.key)) return;
       event.preventDefault();
-      stop();
+      togglePlayback();
     });
-    play.addEventListener("blur", stop);
-    window.addEventListener("pointerup", stop, { passive: true });
+    video.addEventListener("play", syncState);
+    video.addEventListener("pause", syncState);
+    video.addEventListener("loadeddata", () => play(true), { once: true });
+    video.addEventListener("error", () => showHint("video unavailable", true));
 
-    video.addEventListener("play", () => {
-      if (!held) video.pause();
-    });
-    sound.addEventListener("click", () => {
+    sound.addEventListener("click", async () => {
       video.muted = !video.muted;
       sound.textContent = video.muted ? "sound off" : "sound on";
       sound.classList.toggle("on", !video.muted);
+      if (video.paused) {
+        userPaused = false;
+        await play(true);
+      }
+    });
+
+    requestAnimationFrame(() => play(true));
+  };
+
+  updateChallengeRound = function polishedUpdateChallengeRound(round, mode, challengeDate) {
+    baseUpdateChallengeRound(round, mode, challengeDate);
+    if (!round?.revealed || !round.root) return;
+
+    const panel = round.root.querySelector(".reveal-panel");
+    if (!panel) return;
+    panel.hidden = false;
+    panel.innerHTML = resultHTML(round, mode);
+    panel.querySelector(".next-challenge")?.addEventListener("click", () => {
+      if (mode === "daily") advanceDaily();
+      else loadInfinite();
     });
   };
 
