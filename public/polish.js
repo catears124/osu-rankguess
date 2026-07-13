@@ -62,10 +62,15 @@
       : winner === "bot"
         ? "rankbot was closer"
         : "same error";
+    const botSummary = Number.isFinite(botRatio)
+      ? `rankbot ${ratioText(botRatio)}`
+      : Number(botRank) > 0
+        ? `rankbot ${formatRank(botRank)}`
+        : "rankbot —";
 
     return `<div class="polish-result ${winner}">
       <div class="result-rank"><span>actual rank</span><strong>${formatRank(round.actualRank)}</strong><small>${escapeHTML(round.player || "player")}</small></div>
-      <div class="result-outcome"><span>${heading}</span><strong>${comparison}</strong><small>you ${ratioText(playerRatio)} · rankbot ${ratioText(botRatio)}${Number(botRank) > 0 ? ` · ${formatRank(botRank)}` : ""}</small></div>
+      <div class="result-outcome"><span>${heading}</span><strong>${comparison}</strong><small>you ${ratioText(playerRatio)} · ${botSummary}</small></div>
       <button class="primary-button next-challenge" type="button">${mode === "daily" ? "next" : "next replay"}</button>
     </div>`;
   };
@@ -136,6 +141,7 @@
     if (!video || !sound || !wrap) return;
 
     let hintTimer = 0;
+    let userPaused = false;
     video.autoplay = true;
     video.defaultMuted = true;
     video.muted = true;
@@ -157,6 +163,7 @@
     };
 
     const play = async (showFailure = false) => {
+      if (userPaused) return false;
       try {
         await video.play();
         syncState();
@@ -170,9 +177,11 @@
 
     const togglePlayback = async () => {
       if (video.paused) {
+        userPaused = false;
         const started = await play(true);
         if (started) showHint("playing");
       } else {
+        userPaused = true;
         video.pause();
         syncState();
         showHint("paused");
@@ -194,7 +203,10 @@
       video.muted = !video.muted;
       sound.textContent = video.muted ? "sound off" : "sound on";
       sound.classList.toggle("on", !video.muted);
-      if (video.paused) await play(true);
+      if (video.paused) {
+        userPaused = false;
+        await play(true);
+      }
     });
 
     requestAnimationFrame(() => play(true));
