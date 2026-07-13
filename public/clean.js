@@ -100,8 +100,8 @@
       <div class="clean-mapline"><strong>${escapeHTML(title)}</strong><span>${escapeHTML(stats)}</span></div>
       <div class="challenge-content clean-content">
         <div class="video-column"><div class="video-wrap"><video class="challenge-video" src="${escapeHTML(item.videoURL)}" autoplay loop playsinline preload="auto"></video><button class="video-toggle on" type="button" aria-label="Toggle sound">${ICON_SOUND}</button><button class="video-play" type="button" aria-label="Play or pause replay">pause</button></div></div>
-        <aside class="challenge-side clean-history" hidden><ol class="guess-list duel-turn-list" aria-label="Turn history"></ol></aside>
       </div>
+      <aside class="challenge-side clean-history" hidden><ol class="guess-list duel-turn-list" aria-label="Turn history"></ol></aside>
       <div class="guess-dock clean-dock"><div class="guess-zone"><form class="guess-form">${rankControlHTML()}<button class="primary-button guess-submit" type="submit">lock guess</button></form><p class="challenge-error" hidden></p><div class="reveal-panel clean-reveal" hidden></div></div></div>
     </div>`;
   };
@@ -121,9 +121,10 @@
     const botRatio = bestRatio(round.botGuesses, round.actualRank);
     const botRank = round.botGuesses.at(-1)?.guessRank || round.predictedRank;
     const title = winner === "player" ? "you win" : winner === "bot" ? "rankbot wins" : "tie";
+    const ratioText = (value) => Number.isFinite(value) ? `${value.toFixed(2)}×` : "—";
     return `<div class="duel-result-strip ${winner}">
       <div class="actual-block"><span>actual rank</span><strong>${formatRank(round.actualRank)}</strong><small>${escapeHTML(round.player || "player")}</small></div>
-      <div class="outcome-block"><span>${title}</span><strong>bot ${formatRank(botRank)}</strong><small>you ${playerRatio.toFixed(2)}× · bot ${botRatio.toFixed(2)}×</small></div>
+      <div class="outcome-block"><span>${title}</span><strong>rankbot ${formatRank(botRank)}</strong><small>you ${ratioText(playerRatio)} · bot ${ratioText(botRatio)}</small></div>
       <button class="primary-button next-challenge" type="button">${mode === "daily" ? "next" : "next replay"}</button>
     </div>`;
   };
