@@ -1,0 +1,37 @@
+name: apply game fix
+
+on:
+  push:
+    branches:
+      - fix-game
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message == 'run game fix'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python scripts/apply_game_fix.py
+      - run: python -m py_compile app.py
+      - run: node --check public/clean.js
+      - run: |
+          grep -q '"botGuess": bot_guess' app.py
+          grep -q 'grid-template-columns:repeat(auto-fit' public/clean.css
+          grep -q '/clean.js?v=2' public/index.html
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add app.py public/clean.js public/clean.css public/index.html
+          git commit -m 'apply game fix'
+          git push origin HEAD:fix-game
