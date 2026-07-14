@@ -1,0 +1,90 @@
+name: Rewrite main history
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/rewrite-history.yml
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build clean daily history
+        shell: bash
+        env:
+          TZ: America/Chicago
+        run: |
+          set -euo pipefail
+
+          # This workflow commit is temporary. Rewrite the app state immediately
+          # before it, so the final tree contains no rewrite machinery.
+          ORIGINAL_HEAD="$(git rev-parse HEAD^)"
+
+          mapfile -t SNAPSHOTS < <(
+            git log --first-parent \
+              --date=format-local:'%Y-%m-%d' \
+              --format='%H|%cd|%cI' \
+              "$ORIGINAL_HEAD" \
+            | awk -F'|' '!seen[$2]++' \
+            | head -n 5 \
+            | tac
+          )
+
+          if [ "${#SNAPSHOTS[@]}" -lt 4 ]; then
+            echo "Expected at least four development days; found ${#SNAPSHOTS[@]}." >&2
+            exit 1
+          fi
+
+          git config user.name "catears124"
+          git config user.email "72218235+catears124@users.noreply.github.com"
+          git checkout --orphan rewritten-main
+          git rm -rf . >/dev/null 2>&1 || true
+          git clean -fdx
+
+          MESSAGES=(
+            "build rank prediction foundation"
+            "add daily and infinite replay modes"
+            "polish gameplay, gallery, and analysis"
+            "move o!rdr submission to the client"
+            "finish community data and deployment"
+          )
+
+          total="${#SNAPSHOTS[@]}"
+          for index in "${!SNAPSHOTS[@]}"; do
+            IFS='|' read -r snapshot day timestamp <<< "${SNAPSHOTS[$index]}"
+
+            git checkout "$snapshot" -- .
+            rm -f .github/workflows/rewrite-history.yml
+            git add -A
+
+            if [ "$total" -eq 1 ]; then
+              message_index=4
+            else
+              message_index=$(( index * 4 / (total - 1) ))
+            fi
+
+            GIT_AUTHOR_DATE="$timestamp" \
+            GIT_COMMITTER_DATE="$timestamp" \
+              git commit -m "${MESSAGES[$message_index]}"
+
+            echo "snapshot $((index + 1))/$total: $day $snapshot"
+
+            if [ "$index" -lt $((total - 1)) ]; then
+              git rm -rf . >/dev/null 2>&1 || true
+              git clean -fdx
+            fi
+          done
+
+          git diff --exit-code "$ORIGINAL_HEAD" rewritten-main -- .
+          test "$(git rev-list --count rewritten-main)" -eq "$total"
+          test ! -e .github/workflows/rewrite-history.yml
+
+          git push --force origin rewritten-main:refs/heads/history-rewrite-ready
