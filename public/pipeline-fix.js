@@ -1,14 +1,24 @@
-/* Submit and track o!rdr entirely from the browser, matching client flow.txt. */
+/* Submit the replay from the browser without requiring o!rdr CORS response access. */
 (() => {
   const ORDR_API_ROOT = "https://apis.issou.best";
   const ORDR_RENDER_URL = `${ORDR_API_ROOT}/ordr/renders`;
-  const ORDR_DYNLINK_URL = `${ORDR_API_ROOT}/dynlink/ordr/gen`;
   const ORDR_SOCKET_PATH = "/ordr/ws";
   const STATUS_FALLBACK_MS = 30_000;
   const RATE_LIMIT_BACKOFF_MS = 60_000;
-  const TIMEOUT_MS = 30 * 60_000;
+  const IDENTIFY_TIMEOUT_MS = 120_000;
+  const RENDER_TIMEOUT_MS = 30 * 60_000;
+  const MAX_CANDIDATES = 12;
 
-  const renderStorageKey = (replayHash) => `osu-rankguess-ordr-v2:${String(replayHash || "").toLowerCase()}`;
+  const baseCacheReplay = cacheReplay;
+  let latestCache = null;
+  let activeSession = null;
+
+  const renderStorageKey = (replayHash) => `osu-rankguess-ordr-v3:${String(replayHash || "").toLowerCase()}`;
+
+  cacheReplay = async function cacheReplayWithIdentity(file, replayHash) {
+    latestCache = await baseCacheReplay(file, replayHash);
+    return latestCache;
+  };
 
   const setPipelineProgress = (percent, detail) => {
     const bounded = Math.max(0, Math.min(100, Math.round(percent)));
@@ -22,29 +32,34 @@
     renderStatus.textContent = detail;
   };
 
-  const responsePayload = async (response) => {
-    const payload = await response.json().catch(() => ({}));
-    if (response.ok) return payload;
-    const message = payload?.message || payload?.detail?.message || `o!rdr request failed (${response.status})`;
-    const error = new Error(message);
-    error.status = response.status;
-    error.errorCode = Number(payload?.errorCode ?? payload?.detail?.errorCode);
-    error.payload = payload;
-    throw error;
+  const normalizePlayer = (value) => String(value || "").trim().normalize("NFKC").toLowerCase();
+
+  const descriptionIdentity = (value) => {
+    const text = String(value || "");
+    const playerMatch = text.match(/Player:\s*(.*?)\s*,\s*Map:/i);
+    const accuracyMatches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*%/g)];
+    const accuracy = accuracyMatches.length ? Number(accuracyMatches.at(-1)[1]) : null;
+    return {
+      player: playerMatch ? normalizePlayer(playerMatch[1]) : "",
+      accuracy: Number.isFinite(accuracy) ? accuracy : null,
+    };
   };
 
-  const directJSON = async (url, options = {}) => {
-    const response = await fetch(url, {
-      cache: "no-store",
-      credentials: "omit",
-      mode: "cors",
-      ...options,
-    });
-    return responsePayload(response);
-  };
+  const expectedIdentity = (username) => ({
+    player: normalizePlayer(latestCache?.player || username),
+    accuracy: Number.isFinite(Number(latestCache?.accuracyPercent))
+      ? Number(latestCache.accuracyPercent)
+      : null,
+  });
 
-  const isRateLimit = (error) => Number(error?.status) === 429
-    || /too many requests|http\s*429|rate limit/i.test(String(error?.message || error || ""));
+  const identityMatches = (expected, payload) => {
+    const replayPlayer = normalizePlayer(payload?.replayUsername);
+    const parsed = descriptionIdentity(payload?.description || payload?.title);
+    const player = replayPlayer || parsed.player;
+    if (!expected.player || player !== expected.player) return false;
+    if (expected.accuracy === null || parsed.accuracy === null) return true;
+    return Math.abs(expected.accuracy - parsed.accuracy) <= 0.025;
+  };
 
   const savedRenderID = (replayHash) => {
     const value = Number(storage.get(renderStorageKey(replayHash)) || 0);
@@ -53,7 +68,9 @@
 
   const saveRenderID = (replayHash, renderID) => {
     const numeric = Number(renderID);
-    if (Number.isInteger(numeric) && numeric > 0) storage.set(renderStorageKey(replayHash), String(numeric));
+    if (Number.isInteger(numeric) && numeric > 0) {
+      storage.set(renderStorageKey(replayHash), String(numeric));
+    }
   };
 
   const safeUploadName = (username, replayHash) => {
@@ -65,107 +82,175 @@
     return `${player}-${String(replayHash || "").slice(0, 12)}.osr`;
   };
 
-  const renderMetadata = (render) => ({
-    description: render?.description || null,
-    title: render?.title || null,
-    username: render?.username,
-    replayUsername: render?.replayUsername,
-    replayMods: render?.replayMods,
-    mapTitle: render?.mapTitle,
-    mapLength: render?.mapLength,
-    drainTime: render?.drainTime,
-    replayDifficulty: render?.replayDifficulty,
-    mapID: render?.mapID,
-    mapLink: render?.mapLink,
-  });
+  const isRateLimit = (error) => /too many requests|http\s*429|rate limit/i.test(String(error?.message || error || ""));
 
-  const directRenderSnapshot = async (renderID, videoHint = null) => {
-    const numericRenderID = Number(renderID);
-    const payload = await directJSON(`${ORDR_RENDER_URL}?renderID=${encodeURIComponent(numericRenderID)}`);
-    const render = Array.isArray(payload?.renders) ? payload.renders[0] : null;
-    if (!render) {
-      return {
-        ready: false,
-        failed: false,
-        progress: "Queued",
-        renderID: numericRenderID,
-      };
-    }
+  const progressState = (renderID, progress, phase = "progress") => {
+    const text = String(progress || "working").trim();
+    const folded = text.toLowerCase();
+    const explicitMatch = text.match(/(\d{1,3}(?:\.\d+)?)\s*%/);
+    const explicit = explicitMatch ? Math.max(0, Math.min(100, Number(explicitMatch[1]))) : null;
+    let percent = 48;
+    if (phase === "done") percent = 60;
+    else if (folded.includes("queue") || folded.includes("waiting")) percent = 44;
+    else if (explicit !== null) percent = 49 + explicit * 0.1;
+    else if (folded.includes("upload") || folded.includes("final")) percent = 58;
+    else if (folded.includes("render") || folded.includes("encode") || folded.includes("process")) percent = 53;
+    return { percent, detail: `o!rdr #${renderID} · ${text}` };
+  };
 
-    const errorCode = Number(render.errorCode || 0);
-    const progress = String(render.progress || "Queued");
-    if (errorCode) {
-      return {
-        ready: false,
-        failed: true,
-        errorCode,
-        progress,
-        renderID: numericRenderID,
-      };
-    }
+  const statusSnapshot = (renderID) => requestJSON(`/api/ordr/status?renderID=${encodeURIComponent(renderID)}`);
 
-    const done = /done|complete|finished/i.test(progress) || Boolean(videoHint || render.videoUrl || render.videoURL);
-    let videoURL = null;
-    if (done) {
-      try {
-        const dynlink = await directJSON(`${ORDR_DYNLINK_URL}?id=${encodeURIComponent(numericRenderID)}`);
-        videoURL = typeof dynlink?.url === "string" ? dynlink.url : null;
-      } catch (error) {
-        if (Number(error?.status) !== 404) throw error;
-      }
-    }
+  const createSession = (expected, replayHash, knownRenderID = null) => {
+    activeSession?.close?.();
 
-    return {
-      ready: Boolean(videoURL && (render.description || render.title)),
-      failed: false,
-      progress: done && !videoURL ? "Finalizing video link" : progress,
-      renderID: numericRenderID,
-      description: render.description || null,
-      title: render.title || null,
-      videoURL,
-      renderMetadata: renderMetadata(render),
+    const listeners = {
+      progress: new Set(),
+      done: new Set(),
+      failed: new Set(),
     };
+    const candidateIDs = new Set();
+    const checkedIDs = new Set();
+    let renderID = Number(knownRenderID) || null;
+    let submitted = false;
+    let closed = false;
+    let identifyResolve = null;
+    let identifyReject = null;
+    let identifyTimer = null;
+    let socket = null;
+
+    const identifyPromise = new Promise((resolve, reject) => {
+      identifyResolve = resolve;
+      identifyReject = reject;
+    });
+
+    const acceptRender = (value) => {
+      const numeric = Number(value);
+      if (closed || !(numeric > 0)) return;
+      if (renderID && renderID !== numeric) return;
+      renderID = numeric;
+      saveRenderID(replayHash, numeric);
+      if (identifyTimer) clearTimeout(identifyTimer);
+      identifyResolve?.(numeric);
+      identifyResolve = null;
+      identifyReject = null;
+    };
+
+    const emit = (type, payload) => {
+      for (const listener of listeners[type]) listener(payload);
+    };
+
+    const verifyCandidate = async (candidateID) => {
+      const numeric = Number(candidateID);
+      if (closed || renderID || checkedIDs.has(numeric) || checkedIDs.size >= MAX_CANDIDATES) return;
+      checkedIDs.add(numeric);
+      try {
+        const snapshot = await statusSnapshot(numeric);
+        if (identityMatches(expected, snapshot)) {
+          acceptRender(numeric);
+          emit("progress", snapshot);
+        }
+      } catch {
+        // The websocket description will still identify the render when rendering begins.
+      }
+    };
+
+    const connected = new Promise((resolve, reject) => {
+      if (typeof globalThis.io !== "function") {
+        reject(new Error("o!rdr websocket client did not load."));
+        return;
+      }
+      socket = globalThis.io(ORDR_API_ROOT, {
+        path: ORDR_SOCKET_PATH,
+        transports: ["websocket", "polling"],
+        reconnection: true,
+        reconnectionDelay: 1_000,
+        reconnectionDelayMax: 10_000,
+        timeout: 20_000,
+      });
+      const timer = setTimeout(() => reject(new Error("Could not connect to the o!rdr websocket.")), 20_000);
+      socket.once("connect", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      socket.once("connect_error", (error) => {
+        if (!socket.connected) {
+          clearTimeout(timer);
+          reject(new Error(error?.message || "Could not connect to the o!rdr websocket."));
+        }
+      });
+
+      socket.on("render_added_json", (data) => {
+        if (closed || !submitted || renderID) return;
+        const candidateID = Number(data?.renderID);
+        if (!(candidateID > 0) || candidateIDs.size >= MAX_CANDIDATES) return;
+        candidateIDs.add(candidateID);
+        setTimeout(() => verifyCandidate(candidateID), 350);
+      });
+
+      socket.on("render_progress_json", (data) => {
+        if (closed) return;
+        const candidateID = Number(data?.renderID);
+        if (!renderID && submitted && identityMatches(expected, data)) acceptRender(candidateID);
+        if (renderID && candidateID === renderID) emit("progress", data);
+      });
+
+      socket.on("render_done_json", (data) => {
+        if (closed) return;
+        const candidateID = Number(data?.renderID);
+        if (renderID && candidateID === renderID) emit("done", data);
+      });
+
+      socket.on("render_failed_json", (data) => {
+        if (closed) return;
+        const candidateID = Number(data?.renderID);
+        if (renderID && candidateID === renderID) emit("failed", data);
+      });
+    });
+
+    if (renderID) acceptRender(renderID);
+
+    const session = {
+      get renderID() { return renderID; },
+      connected,
+      identify() {
+        if (renderID) return Promise.resolve(renderID);
+        if (!identifyTimer) {
+          identifyTimer = setTimeout(() => {
+            identifyReject?.(new Error("o!rdr received the browser upload but did not expose its render ID in time."));
+            identifyResolve = null;
+            identifyReject = null;
+          }, IDENTIFY_TIMEOUT_MS);
+        }
+        return identifyPromise;
+      },
+      markSubmitted() { submitted = true; },
+      on(type, listener) {
+        listeners[type].add(listener);
+        return () => listeners[type].delete(listener);
+      },
+      close() {
+        if (closed) return;
+        closed = true;
+        if (identifyTimer) clearTimeout(identifyTimer);
+        socket?.disconnect();
+        Object.values(listeners).forEach((set) => set.clear());
+      },
+    };
+    activeSession = session;
+    return session;
   };
 
-  const recoverExistingRender = async (replayHash, username) => {
-    const stored = savedRenderID(replayHash);
-    if (stored) return stored;
-
-    // Error 29 does not reliably return the existing render ID. One client-side
-    // list request is enough to recover the newest active render for this replay's player.
-    const payload = await directJSON(`${ORDR_RENDER_URL}?pageSize=100&page=1`);
-    const target = String(username || "").trim().toLowerCase();
-    const prefix = String(replayHash || "").slice(0, 12).toLowerCase();
-    const candidates = (Array.isArray(payload?.renders) ? payload.renders : [])
-      .filter((render) => Number(render?.renderID) > 0)
-      .map((render) => {
-        const serialized = JSON.stringify(render).toLowerCase();
-        const replayUsername = String(render?.replayUsername || "").trim().toLowerCase();
-        const progress = String(render?.progress || "").toLowerCase();
-        let score = 0;
-        if (prefix && serialized.includes(prefix)) score += 100;
-        if (target && replayUsername === target) score += 40;
-        if (target && serialized.includes(target)) score += 20;
-        if (!/failed|error/.test(progress) && Number(render?.errorCode || 0) === 0) score += 10;
-        if (!/done|complete|finished/.test(progress)) score += 10;
-        return { renderID: Number(render.renderID), score };
-      })
-      .filter((candidate) => candidate.score >= 50)
-      .sort((left, right) => right.score - left.score || right.renderID - left.renderID);
-
-    const renderID = candidates[0]?.renderID || null;
-    if (renderID) saveRenderID(replayHash, renderID);
-    return renderID;
-  };
-
-  createRender = async function clientSideCreateRender(file, replayHash, username) {
+  createRender = async function browserCreateRender(file, replayHash, username) {
+    const expected = expectedIdentity(username);
     const existing = savedRenderID(replayHash);
+    const session = createSession(expected, replayHash, existing);
+    await session.connected;
+
     if (existing) {
       setPipelineProgress(39, `reusing browser render #${existing}`);
       return { ok: true, renderID: existing, replayHash, player: username, reused: true };
     }
 
-    setPipelineProgress(35, "submitting replay directly from your browser");
     const form = new FormData();
     form.append("replayFile", file, safeUploadName(username, replayHash));
     form.append("skin", "whitecatCK1.0");
@@ -177,78 +262,46 @@
     form.append("customSkin", "false");
     form.append("generateThumbnail", "true");
 
-    try {
-      const payload = await directJSON(ORDR_RENDER_URL, { method: "POST", body: form });
-      const renderID = Number(payload?.renderID);
-      if (!(renderID > 0)) throw new Error("o!rdr did not return a render ID.");
-      saveRenderID(replayHash, renderID);
-      return { ok: true, renderID, replayHash, player: username };
-    } catch (error) {
-      if (Number(error?.errorCode) === 29) {
-        const renderID = await recoverExistingRender(replayHash, username);
-        if (renderID) {
-          setPipelineProgress(39, `reattached to existing render #${renderID}`);
-          return { ok: true, renderID, replayHash, player: username, reused: true };
-        }
-      }
+    setPipelineProgress(35, "sending replay from your browser");
+    session.markSubmitted();
 
-      if (isRateLimit(error)) {
-        const renderID = await recoverExistingRender(replayHash, username).catch(() => null);
-        if (renderID) {
-          setPipelineProgress(39, `reattached to existing render #${renderID}`);
-          return { ok: true, renderID, replayHash, player: username, reused: true };
-        }
-        throw new Error("o!rdr rate-limited this browser's IP. The upload is no longer going through the shared server; wait for the per-client cooldown and retry.");
-      }
-      throw error;
-    }
+    // o!rdr does not expose CORS response headers for third-party sites. no-cors
+    // still sends the multipart request from the user's IP; the documented
+    // Socket.IO events and our read-only status endpoint provide the render ID.
+    await fetch(ORDR_RENDER_URL, {
+      method: "POST",
+      mode: "no-cors",
+      credentials: "omit",
+      body: form,
+    });
+
+    setPipelineProgress(38, "upload sent · waiting for o!rdr acknowledgment");
+    const renderID = await session.identify();
+    setPipelineProgress(40, `o!rdr #${renderID} · added to queue`);
+    return { ok: true, renderID, replayHash, player: username };
   };
 
-  const reportedPercent = (progress) => {
-    const match = String(progress || "").match(/(\d{1,3}(?:\.\d+)?)\s*%/);
-    return match ? Math.max(0, Math.min(100, Number(match[1]))) : null;
-  };
-
-  const progressState = (renderID, progress, phase = "progress") => {
-    const text = String(progress || "working").trim();
-    const folded = text.toLowerCase();
-    const explicit = reportedPercent(text);
-    let percent = 48;
-
-    if (phase === "done") percent = 60;
-    else if (folded.includes("queue") || folded.includes("waiting")) percent = 44;
-    else if (explicit !== null) percent = 49 + explicit * 0.1;
-    else if (folded.includes("upload") || folded.includes("final")) percent = 58;
-    else if (folded.includes("render") || folded.includes("encode") || folded.includes("process")) percent = 53;
-
-    return { percent, detail: `o!rdr #${renderID} · ${text}` };
-  };
-
-  waitForRender = function clientSideWaitForRender(renderID, runID) {
-    return new Promise((resolve, reject) => {
+  waitForRender = function browserWaitForRender(renderID, runID) {
+    return new Promise(async (resolve, reject) => {
       const numericRenderID = Number(renderID);
-      const startedAt = Date.now();
-      let socket = null;
+      const session = activeSession?.renderID === numericRenderID
+        ? activeSession
+        : createSession({ player: "", accuracy: null }, "", numericRenderID);
       let settled = false;
       let checking = false;
       let fallbackTimer = null;
       let timeoutTimer = null;
-      let lastProgress = "Queued";
+      let latestDescription = null;
+      let latestProgress = "Queued";
       let videoHint = null;
-      let nextFallback = STATUS_FALLBACK_MS;
-
-      const matches = (data) => Number(data?.renderID) === numericRenderID;
+      const unsubscribers = [];
 
       const cleanup = () => {
         if (fallbackTimer) clearTimeout(fallbackTimer);
         if (timeoutTimer) clearTimeout(timeoutTimer);
-        if (socket) {
-          socket.off("render_added_json");
-          socket.off("render_progress_json");
-          socket.off("render_done_json");
-          socket.off("render_failed_json");
-          socket.disconnect();
-        }
+        unsubscribers.forEach((unsubscribe) => unsubscribe());
+        session.close();
+        if (activeSession === session) activeSession = null;
       };
 
       const finish = (callback, value) => {
@@ -258,24 +311,40 @@
         callback(value);
       };
 
-      const scheduleFallback = (delay = nextFallback) => {
-        if (settled) return;
-        if (fallbackTimer) clearTimeout(fallbackTimer);
-        fallbackTimer = setTimeout(checkSnapshot, delay);
+      const usableSocketResult = () => {
+        const url = typeof videoHint === "string" ? videoHint : null;
+        if (!url || !latestDescription) return null;
+        return {
+          ok: true,
+          renderID: numericRenderID,
+          ready: true,
+          failed: false,
+          progress: "Done.",
+          description: latestDescription,
+          videoURL: url,
+          renderMetadata: { description: latestDescription },
+        };
       };
 
-      const checkSnapshot = async () => {
+      const scheduleFallback = (delay = STATUS_FALLBACK_MS) => {
+        if (settled) return;
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        fallbackTimer = setTimeout(checkStatus, delay);
+      };
+
+      const checkStatus = async (finalCheck = false) => {
         if (settled || checking) return;
         if (runID !== activeRun) {
           finish(reject, new Error("Analysis cancelled."));
           return;
         }
         checking = true;
+        let nextDelay = finalCheck ? 3_000 : STATUS_FALLBACK_MS;
         try {
-          const snapshot = await directRenderSnapshot(numericRenderID, videoHint);
-          nextFallback = STATUS_FALLBACK_MS;
-          lastProgress = snapshot.progress || lastProgress;
-          const state = progressState(numericRenderID, lastProgress, snapshot.ready ? "done" : "progress");
+          const snapshot = await statusSnapshot(numericRenderID);
+          latestProgress = snapshot.progress || latestProgress;
+          latestDescription = snapshot.description || snapshot.title || latestDescription;
+          const state = progressState(numericRenderID, latestProgress, snapshot.ready ? "done" : "progress");
           setPipelineProgress(state.percent, state.detail);
           if (snapshot.failed) {
             finish(reject, new Error(`o!rdr failed with code ${snapshot.errorCode}`));
@@ -285,73 +354,59 @@
             finish(resolve, snapshot);
             return;
           }
-          if (videoHint) nextFallback = 3_000;
+          const socketResult = usableSocketResult();
+          if (finalCheck && socketResult) {
+            finish(resolve, socketResult);
+            return;
+          }
         } catch (error) {
-          nextFallback = isRateLimit(error) ? RATE_LIMIT_BACKOFF_MS : STATUS_FALLBACK_MS;
+          nextDelay = isRateLimit(error) ? RATE_LIMIT_BACKOFF_MS : STATUS_FALLBACK_MS;
+          const socketResult = usableSocketResult();
+          if (finalCheck && socketResult) {
+            finish(resolve, socketResult);
+            return;
+          }
           const detail = isRateLimit(error)
-            ? "public status endpoint rate-limited · websocket still tracking"
+            ? "status endpoint cooling down · websocket still tracking"
             : "status check interrupted · websocket still tracking";
           setPipelineProgress(47, `o!rdr #${numericRenderID} · ${detail}`);
         } finally {
           checking = false;
         }
-        scheduleFallback();
+        scheduleFallback(nextDelay);
       };
 
-      const onProgress = (data) => {
-        if (!matches(data) || settled) return;
-        lastProgress = data.progress || lastProgress;
-        const state = progressState(numericRenderID, lastProgress, "progress");
+      unsubscribers.push(session.on("progress", (data) => {
+        latestProgress = data?.progress || latestProgress;
+        latestDescription = data?.description || data?.title || latestDescription;
+        const state = progressState(numericRenderID, latestProgress, "progress");
         setPipelineProgress(state.percent, state.detail);
-      };
+      }));
 
-      const onDone = (data) => {
-        if (!matches(data) || settled) return;
-        videoHint = data?.videoUrl || data?.videoURL || true;
-        lastProgress = "render complete · resolving metadata and video";
-        const state = progressState(numericRenderID, lastProgress, "done");
+      unsubscribers.push(session.on("done", (data) => {
+        videoHint = data?.videoUrl || data?.videoURL || null;
+        latestProgress = "render complete · resolving metadata";
+        const state = progressState(numericRenderID, latestProgress, "done");
         setPipelineProgress(state.percent, state.detail);
-        if (checking) scheduleFallback(3_000);
-        else checkSnapshot();
-      };
+        setTimeout(() => checkStatus(true), 900);
+      }));
 
-      const onFailed = (data) => {
-        if (!matches(data) || settled) return;
-        const message = data.errorMessage || `o!rdr failed with code ${data.errorCode}`;
+      unsubscribers.push(session.on("failed", (data) => {
+        const message = data?.errorMessage || `o!rdr failed with code ${data?.errorCode}`;
         finish(reject, new Error(message));
-      };
-
-      if (typeof globalThis.io === "function") {
-        socket = globalThis.io(ORDR_API_ROOT, {
-          path: ORDR_SOCKET_PATH,
-          transports: ["websocket", "polling"],
-          reconnection: true,
-          reconnectionDelay: 1_000,
-          reconnectionDelayMax: 10_000,
-          timeout: 20_000,
-        });
-        socket.on("render_added_json", (data) => {
-          if (!matches(data) || settled) return;
-          lastProgress = "added to queue";
-          const state = progressState(numericRenderID, lastProgress, "progress");
-          setPipelineProgress(state.percent, state.detail);
-        });
-        socket.on("render_progress_json", onProgress);
-        socket.on("render_done_json", onDone);
-        socket.on("render_failed_json", onFailed);
-        socket.on("connect_error", () => {
-          setPipelineProgress(47, `o!rdr #${numericRenderID} · websocket reconnecting`);
-          scheduleFallback(5_000);
-        });
-      } else {
-        setPipelineProgress(47, `o!rdr #${numericRenderID} · websocket unavailable · using direct status fallback`);
-      }
+      }));
 
       timeoutTimer = setTimeout(() => {
-        finish(reject, new Error(`o!rdr did not finish within thirty minutes (last state: ${lastProgress}).`));
-      }, Math.max(1_000, TIMEOUT_MS - (Date.now() - startedAt)));
+        finish(reject, new Error(`o!rdr did not finish within thirty minutes (last state: ${latestProgress}).`));
+      }, RENDER_TIMEOUT_MS);
 
-      checkSnapshot();
+      try {
+        await session.connected;
+      } catch (error) {
+        finish(reject, error);
+        return;
+      }
+      checkStatus();
     });
   };
 })();
