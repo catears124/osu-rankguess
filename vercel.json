@@ -8,16 +8,8 @@
   },
   "crons": [
     {
-      "path": "/api/cron/seed-gallery/0",
-      "schedule": "5 2 * * *"
-    },
-    {
-      "path": "/api/cron/seed-gallery/1",
-      "schedule": "5 10 * * *"
-    },
-    {
-      "path": "/api/cron/seed-gallery/2",
-      "schedule": "5 18 * * *"
+      "path": "/api/cron/seed-gallery",
+      "schedule": "*/15 * * * *"
     }
   ],
   "redirects": [
