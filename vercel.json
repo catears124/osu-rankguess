@@ -6,12 +6,6 @@
       "includeFiles": "model/**"
     }
   },
-  "crons": [
-    {
-      "path": "/api/cron/seed-gallery",
-      "schedule": "*/15 * * * *"
-    }
-  ],
   "redirects": [
     {
       "source": "/",
