@@ -1,10 +1,9 @@
 name: default browser theme
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/default-browser-theme.yml
+  workflow_dispatch:
+  pull_request_target:
+    types: [opened, synchronize]
 
 permissions:
   contents: write
@@ -16,7 +15,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Remove forced browser theme from all four snapshots
         shell: bash
         run: |
@@ -24,18 +22,18 @@ jobs:
           git config user.name "catears124"
           git config user.email "72218235+catears124@users.noreply.github.com"
 
-          # Rebuild the four clean commits and discard this temporary workflow.
           original_tip="de4daece5c1643920aae9b2cc65e40a9e2649767"
           mapfile -t commits < <(git rev-list --reverse "$original_tip")
+          test "${#commits[@]}" -eq 4
 
-          if [ "${#commits[@]}" -ne 4 ]; then
-            echo "Expected 4 source commits, found ${#commits[@]}" >&2
-            exit 1
-          fi
+          git checkout --orphan theme-history-ready
+          git rm -rf . >/dev/null 2>&1 || true
+          git clean -fdx
 
-          parent=""
-          for old in "${commits[@]}"; do
-            git checkout --detach "$old"
+          for index in "${!commits[@]}"; do
+            old="${commits[$index]}"
+            git checkout "$old" -- .
+            rm -rf .github/workflows
 
             if [ -f public/index.html ]; then
               python - <<'PY'
@@ -52,20 +50,21 @@ PY
             fi
 
             git add -A
-            tree="$(git write-tree)"
             export GIT_AUTHOR_NAME="$(git show -s --format=%an "$old")"
             export GIT_AUTHOR_EMAIL="$(git show -s --format=%ae "$old")"
             export GIT_AUTHOR_DATE="$(git show -s --format=%aI "$old")"
             export GIT_COMMITTER_NAME="$(git show -s --format=%cn "$old")"
             export GIT_COMMITTER_EMAIL="$(git show -s --format=%ce "$old")"
             export GIT_COMMITTER_DATE="$(git show -s --format=%cI "$old")"
-            message="$(git show -s --format=%B "$old")"
+            git commit -m "$(git show -s --format=%B "$old")"
 
-            if [ -z "$parent" ]; then
-              parent="$(printf '%s\n' "$message" | git commit-tree "$tree")"
-            else
-              parent="$(printf '%s\n' "$message" | git commit-tree "$tree" -p "$parent")"
+            if [ "$index" -lt 3 ]; then
+              git rm -rf . >/dev/null 2>&1 || true
+              git clean -fdx
             fi
           done
 
-          git push --force origin "$parent:refs/heads/main"
+          test "$(git rev-list --count HEAD)" -eq 4
+          test ! -e .github/workflows/default-browser-theme.yml
+          ! grep -R 'name="theme-color"\|name="color-scheme"' public/index.html
+          git push --force origin HEAD:refs/heads/theme-history-ready
