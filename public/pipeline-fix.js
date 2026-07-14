@@ -1,7 +1,10 @@
-/* Keep duplicate o!rdr jobs attached and make queue/render progress visible. */
+/* Follow o!rdr through its documented Socket.IO events instead of hammering GET. */
 (() => {
   const baseCreateRender = createRender;
-  const duplicatePattern = /already (?:rendering|rendered|in queue)|rendering or in queue/i;
+  const ORDR_SOCKET_URL = "https://apis.issou.best";
+  const ORDR_SOCKET_PATH = "/ordr/ws";
+  const STATUS_FALLBACK_MS = 30_000;
+  const TIMEOUT_MS = 30 * 60_000;
 
   const setPipelineProgress = (percent, detail) => {
     const bounded = Math.max(0, Math.min(100, Math.round(percent)));
@@ -15,89 +18,170 @@
     renderStatus.textContent = detail;
   };
 
-  const queueData = (progress) => {
-    const text = String(progress || "");
-    const match = text.match(/#\s*(\d+)(?:\s*(?:of|\/)\s*(\d+))?/i);
-    return {
-      position: match ? Number(match[1]) : null,
-      total: match?.[2] ? Number(match[2]) : null,
-    };
-  };
-
-  const renderPercent = (progress) => {
+  const reportedPercent = (progress) => {
     const match = String(progress || "").match(/(\d{1,3}(?:\.\d+)?)\s*%/);
     return match ? Math.max(0, Math.min(100, Number(match[1]))) : null;
   };
 
-  const progressState = (renderID, payload) => {
-    const progress = String(payload?.progress || "working").trim();
-    const folded = progress.toLowerCase();
-    const queue = queueData(progress);
-    const reportedPercent = renderPercent(progress);
+  const progressState = (renderID, progress, phase = "progress") => {
+    const text = String(progress || "working").trim();
+    const folded = text.toLowerCase();
+    const explicit = reportedPercent(text);
+    let percent = 48;
 
-    if (payload?.ready) {
-      return { percent: 60, detail: `o!rdr #${renderID} · video ready` };
-    }
-    if (folded.includes("finalizing") || folded.includes("waiting for client")) {
-      return { percent: 59, detail: `o!rdr #${renderID} · ${progress}` };
-    }
-    if (folded.includes("queue")) {
-      let percent = 43;
-      if (queue.position && queue.total) {
-        const completion = 1 - Math.min(1, Math.max(0, (queue.position - 1) / Math.max(1, queue.total)));
-        percent = 43 + completion * 6;
-      } else if (queue.position) {
-        percent = 43 + Math.max(0, 6 - Math.min(6, queue.position - 1));
-      }
-      return { percent, detail: `o!rdr #${renderID} · ${progress}` };
-    }
-    if (reportedPercent !== null) {
-      return { percent: 50 + reportedPercent * 0.09, detail: `o!rdr #${renderID} · ${progress}` };
-    }
-    if (folded.includes("render") || folded.includes("process") || folded.includes("encode")) {
-      return { percent: 53, detail: `o!rdr #${renderID} · ${progress}` };
-    }
-    return { percent: 47, detail: `o!rdr #${renderID} · ${progress}` };
+    if (phase === "done") percent = 60;
+    else if (folded.includes("queue") || folded.includes("waiting")) percent = 44;
+    else if (explicit !== null) percent = 49 + explicit * 0.1;
+    else if (folded.includes("upload") || folded.includes("final")) percent = 58;
+    else if (folded.includes("render") || folded.includes("encode") || folded.includes("process")) percent = 53;
+
+    return {
+      percent,
+      detail: `o!rdr #${renderID} · ${text}`,
+    };
   };
 
-  createRender = async function persistentCreateRender(file, replayHash, username) {
-    let lastError = null;
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      try {
-        return await baseCreateRender(file, replayHash, username);
-      } catch (error) {
-        lastError = error;
-        if (!duplicatePattern.test(String(error?.message || error)) || attempt >= 3) throw error;
-        setPipelineProgress(39, `existing o!rdr job found · reconnecting${attempt ? ` (${attempt + 1})` : ""}`);
-        await sleep(3500);
+  const isRateLimit = (error) => /too many requests|http\s*429|rate limit/i.test(String(error?.message || error || ""));
+
+  createRender = async function documentedCreateRender(file, replayHash, username) {
+    try {
+      return await baseCreateRender(file, replayHash, username);
+    } catch (error) {
+      if (isRateLimit(error)) {
+        throw new Error("o!rdr rate limit reached. Configure ORDR_API_KEY; unauthenticated clients are limited to one render request every five minutes.");
       }
+      throw error;
     }
-    throw lastError || new Error("Could not reconnect to the existing o!rdr job.");
   };
 
-  waitForRender = async function persistentWaitForRender(renderID, runID) {
-    let transientFailures = 0;
-    let lastProgress = "Queued";
+  waitForRender = function websocketWaitForRender(renderID, runID) {
+    return new Promise((resolve, reject) => {
+      const numericRenderID = Number(renderID);
+      const startedAt = Date.now();
+      let socket = null;
+      let settled = false;
+      let checking = false;
+      let fallbackTimer = null;
+      let timeoutTimer = null;
+      let lastProgress = "Queued";
+      let consecutiveStatusFailures = 0;
 
-    for (let attempt = 0; attempt < 720; attempt += 1) {
-      if (runID !== activeRun) throw new Error("Analysis cancelled.");
-      try {
-        const payload = await requestJSON(`/api/ordr/status?renderID=${encodeURIComponent(renderID)}`);
-        transientFailures = 0;
-        lastProgress = payload.progress || lastProgress;
-        const state = progressState(renderID, payload);
+      const matches = (data) => Number(data?.renderID) === numericRenderID;
+
+      const cleanup = () => {
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (socket) {
+          socket.off("render_added_json");
+          socket.off("render_progress_json");
+          socket.off("render_done_json");
+          socket.off("render_failed_json");
+          socket.disconnect();
+        }
+      };
+
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback(value);
+      };
+
+      const scheduleFallback = (delay = STATUS_FALLBACK_MS) => {
+        if (settled) return;
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        fallbackTimer = setTimeout(() => checkStatus("fallback"), delay);
+      };
+
+      const checkStatus = async (reason = "initial") => {
+        if (settled || checking) return;
+        if (runID !== activeRun) {
+          finish(reject, new Error("Analysis cancelled."));
+          return;
+        }
+        checking = true;
+        try {
+          const payload = await requestJSON(`/api/ordr/status?renderID=${encodeURIComponent(numericRenderID)}`);
+          consecutiveStatusFailures = 0;
+          lastProgress = payload.progress || lastProgress;
+          const state = progressState(numericRenderID, lastProgress, payload.ready ? "done" : "progress");
+          setPipelineProgress(state.percent, state.detail);
+          if (payload.failed) {
+            finish(reject, new Error(`o!rdr failed with code ${payload.errorCode}`));
+            return;
+          }
+          if (payload.ready) {
+            finish(resolve, payload);
+            return;
+          }
+        } catch (error) {
+          consecutiveStatusFailures += 1;
+          if (!isRateLimit(error) && consecutiveStatusFailures >= 6 && !socket?.connected) {
+            finish(reject, error);
+            return;
+          }
+          const retryText = isRateLimit(error)
+            ? "status API rate-limited · websocket still connected"
+            : "status check interrupted · websocket still connected";
+          setPipelineProgress(47, `o!rdr #${numericRenderID} · ${retryText}`);
+        } finally {
+          checking = false;
+        }
+        scheduleFallback(reason === "done" ? 3_000 : STATUS_FALLBACK_MS);
+      };
+
+      const onProgress = (data) => {
+        if (!matches(data) || settled) return;
+        lastProgress = data.progress || lastProgress;
+        const state = progressState(numericRenderID, lastProgress, "progress");
         setPipelineProgress(state.percent, state.detail);
-        if (payload.failed) throw new Error(`o!rdr failed with code ${payload.errorCode}`);
-        if (payload.ready) return payload;
-      } catch (error) {
-        if (String(error?.message || "").includes("failed with code")) throw error;
-        transientFailures += 1;
-        if (transientFailures >= 12) throw error;
-        setPipelineProgress(47, `o!rdr #${renderID} · connection interrupted · retrying`);
-      }
-      await sleep(2500);
-    }
+      };
 
-    throw new Error(`o!rdr did not finish within thirty minutes (last state: ${lastProgress}).`);
+      const onDone = (data) => {
+        if (!matches(data) || settled) return;
+        lastProgress = "render complete · finalizing metadata";
+        const state = progressState(numericRenderID, lastProgress, "done");
+        setPipelineProgress(state.percent, state.detail);
+        checkStatus("done");
+      };
+
+      const onFailed = (data) => {
+        if (!matches(data) || settled) return;
+        const message = data.errorMessage || `o!rdr failed with code ${data.errorCode}`;
+        finish(reject, new Error(message));
+      };
+
+      if (typeof globalThis.io === "function") {
+        socket = globalThis.io(ORDR_SOCKET_URL, {
+          path: ORDR_SOCKET_PATH,
+          transports: ["websocket", "polling"],
+          reconnection: true,
+          reconnectionDelay: 1_000,
+          reconnectionDelayMax: 10_000,
+          timeout: 20_000,
+        });
+        socket.on("render_added_json", (data) => {
+          if (!matches(data) || settled) return;
+          lastProgress = "added to queue";
+          const state = progressState(numericRenderID, lastProgress, "progress");
+          setPipelineProgress(state.percent, state.detail);
+        });
+        socket.on("render_progress_json", onProgress);
+        socket.on("render_done_json", onDone);
+        socket.on("render_failed_json", onFailed);
+        socket.on("connect_error", () => {
+          setPipelineProgress(47, `o!rdr #${numericRenderID} · websocket reconnecting`);
+          scheduleFallback(5_000);
+        });
+      } else {
+        setPipelineProgress(47, `o!rdr #${numericRenderID} · websocket unavailable · using slow fallback`);
+      }
+
+      timeoutTimer = setTimeout(() => {
+        finish(reject, new Error(`o!rdr did not finish within thirty minutes (last state: ${lastProgress}).`));
+      }, Math.max(1_000, TIMEOUT_MS - (Date.now() - startedAt)));
+
+      checkStatus("initial");
+    });
   };
 })();
