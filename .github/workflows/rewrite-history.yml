@@ -3,8 +3,7 @@ name: Rewrite main history
 on:
   push:
     branches: [main]
-    paths:
-      - .github/workflows/rewrite-history.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -24,9 +23,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # This workflow commit is temporary. Rewrite the app state immediately
-          # before it, so the final tree contains no rewrite machinery.
-          ORIGINAL_HEAD="$(git rev-parse HEAD^)"
+          # Last finished application commit before the temporary rewrite workflow.
+          ORIGINAL_HEAD="c2ccbd9319bbb0fe0d95b6ac4fbed26134dfa605"
+          git cat-file -e "$ORIGINAL_HEAD^{commit}"
 
           mapfile -t SNAPSHOTS < <(
             git log --first-parent \
@@ -65,12 +64,7 @@ jobs:
             rm -f .github/workflows/rewrite-history.yml
             git add -A
 
-            if [ "$total" -eq 1 ]; then
-              message_index=4
-            else
-              message_index=$(( index * 4 / (total - 1) ))
-            fi
-
+            message_index=$(( index * 4 / (total - 1) ))
             GIT_AUTHOR_DATE="$timestamp" \
             GIT_COMMITTER_DATE="$timestamp" \
               git commit -m "${MESSAGES[$message_index]}"
