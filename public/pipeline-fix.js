@@ -4,6 +4,7 @@
   const ORDR_SOCKET_URL = "https://apis.issou.best";
   const ORDR_SOCKET_PATH = "/ordr/ws";
   const STATUS_FALLBACK_MS = 30_000;
+  const RATE_LIMIT_BACKOFF_MS = 60_000;
   const TIMEOUT_MS = 30 * 60_000;
 
   const setPipelineProgress = (percent, detail) => {
@@ -100,6 +101,7 @@
           return;
         }
         checking = true;
+        let nextDelay = reason === "done" ? 4_000 : STATUS_FALLBACK_MS;
         try {
           const payload = await requestJSON(`/api/ordr/status?renderID=${encodeURIComponent(numericRenderID)}`);
           consecutiveStatusFailures = 0;
@@ -116,18 +118,20 @@
           }
         } catch (error) {
           consecutiveStatusFailures += 1;
-          if (!isRateLimit(error) && consecutiveStatusFailures >= 6 && !socket?.connected) {
+          const rateLimited = isRateLimit(error);
+          if (!rateLimited && consecutiveStatusFailures >= 6 && !socket?.connected) {
             finish(reject, error);
             return;
           }
-          const retryText = isRateLimit(error)
+          nextDelay = rateLimited ? RATE_LIMIT_BACKOFF_MS : STATUS_FALLBACK_MS;
+          const retryText = rateLimited
             ? "status API rate-limited · websocket still connected"
             : "status check interrupted · websocket still connected";
           setPipelineProgress(47, `o!rdr #${numericRenderID} · ${retryText}`);
         } finally {
           checking = false;
         }
-        scheduleFallback(reason === "done" ? 3_000 : STATUS_FALLBACK_MS);
+        scheduleFallback(nextDelay);
       };
 
       const onProgress = (data) => {
@@ -142,7 +146,8 @@
         lastProgress = "render complete · finalizing metadata";
         const state = progressState(numericRenderID, lastProgress, "done");
         setPipelineProgress(state.percent, state.detail);
-        checkStatus("done");
+        if (checking) scheduleFallback(4_000);
+        else checkStatus("done");
       };
 
       const onFailed = (data) => {
@@ -171,7 +176,7 @@
         socket.on("render_failed_json", onFailed);
         socket.on("connect_error", () => {
           setPipelineProgress(47, `o!rdr #${numericRenderID} · websocket reconnecting`);
-          scheduleFallback(5_000);
+          scheduleFallback(10_000);
         });
       } else {
         setPipelineProgress(47, `o!rdr #${numericRenderID} · websocket unavailable · using slow fallback`);
