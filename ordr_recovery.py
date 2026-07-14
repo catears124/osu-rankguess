@@ -1,10 +1,12 @@
-"""Recover an existing o!rdr render when the upload API reports a duplicate."""
+"""Recover duplicate o!rdr jobs and expose useful queue progress."""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 
@@ -18,6 +20,7 @@ _DUPLICATE_MARKERS = (
 _RENDER_ID_KEYS = {"renderid", "render_id", "render-id"}
 _RENDER_ID_PATTERN = re.compile(r"(?:render(?:\s*id)?|#)\D{0,12}(\d{3,})", re.IGNORECASE)
 _PERCENT_PATTERN = re.compile(r"(?<!\d)(\d{1,3}(?:\.\d+)?)\s*%")
+_QUEUE_PATTERN = re.compile(r"(?:queue|position|place)\D{0,12}(\d+)", re.IGNORECASE)
 _MOD_BITS = {
     "NF": 1,
     "EZ": 2,
@@ -35,6 +38,7 @@ _MOD_BITS = {
     "AP": 8192,
     "PF": 16384,
 }
+_QUEUE_CACHE: dict[int, tuple[float, int | None, int | None]] = {}
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,9 @@ class ReplayIdentity:
     accuracy_percent: float | None = None
     score: int | None = None
     mods: tuple[str, ...] = ()
+
+
+RawGet = Callable[..., Awaitable[httpx.Response]]
 
 
 def _payload(response: httpx.Response) -> Any:
@@ -66,7 +73,7 @@ def _flatten_text(value: Any) -> str:
 def _render_id(value: Any) -> int | None:
     if isinstance(value, dict):
         for key, item in value.items():
-            normalized = str(key).replace(" ", "").casefold()
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
             if normalized in _RENDER_ID_KEYS or ("render" in normalized and "id" in normalized):
                 try:
                     candidate = int(item)
@@ -179,7 +186,7 @@ def _render_values(render: dict[str, Any]) -> tuple[str, str, tuple[str, ...], l
     else:
         token = re.sub(r"[^A-Z0-9]", "", str(raw_mods).upper())
         mods = tuple(sorted({name for name in _MOD_BITS if name in token}))
-    percentages = []
+    percentages: list[float] = []
     for match in _PERCENT_PATTERN.finditer(text):
         try:
             value = float(match.group(1))
@@ -199,17 +206,18 @@ def _render_values(render: dict[str, Any]) -> tuple[str, str, tuple[str, ...], l
     return text, username, mods, percentages, score
 
 
-def _match_score(render: dict[str, Any], identity: ReplayIdentity) -> float:
+def _match_score(render: dict[str, Any], identity: ReplayIdentity) -> tuple[float, bool]:
     text, username, mods, percentages, score = _render_values(render)
+    folded = text.casefold()
     normalized_text = _normal(text)
     points = 0.0
 
-    if identity.hash_prefix and identity.hash_prefix in text.casefold():
-        points += 100.0
-    if identity.filename and identity.filename.casefold() in text.casefold():
-        points += 100.0
-    if identity.beatmap_hash and identity.beatmap_hash in text.casefold():
-        points += 80.0
+    if identity.hash_prefix and identity.hash_prefix in folded:
+        points += 120.0
+    if identity.filename and identity.filename.casefold() in folded:
+        points += 120.0
+    if identity.beatmap_hash and identity.beatmap_hash in folded:
+        points += 90.0
 
     username_match = bool(identity.username and _normal(identity.username) == _normal(username))
     if username_match:
@@ -222,13 +230,13 @@ def _match_score(render: dict[str, Any], identity: ReplayIdentity) -> float:
     if identity.accuracy_percent is not None and percentages:
         distance = min(abs(value - identity.accuracy_percent) for value in percentages)
         if distance <= 0.015:
-            points += 22.0
+            points += 24.0
             replay_specific = True
-        elif distance <= 0.08:
-            points += 12.0
+        elif distance <= 0.10:
+            points += 13.0
             replay_specific = True
     if identity.score is not None and score == identity.score:
-        points += 24.0
+        points += 28.0
         replay_specific = True
     if identity.mods and mods:
         if set(identity.mods) == set(mods):
@@ -239,50 +247,210 @@ def _match_score(render: dict[str, Any], identity: ReplayIdentity) -> float:
 
     if username_match and replay_specific:
         points += 20.0
-    return points
+    return points, username_match
 
 
-async def _find_recent_render(client: httpx.AsyncClient, identity: ReplayIdentity) -> int | None:
+def _render_list(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        values = payload.get("renders") or payload.get("items") or payload.get("data") or []
+    else:
+        values = payload
+    return [item for item in values if isinstance(item, dict)] if isinstance(values, list) else []
+
+
+async def _raw_get_json(
+    raw_get: RawGet,
+    client: httpx.AsyncClient,
+    params: dict[str, Any],
+) -> Any:
+    try:
+        response = await raw_get(
+            client,
+            ORDR_RENDER_URL,
+            params=params,
+            headers={"Accept": "application/json"},
+        )
+    except httpx.HTTPError:
+        return None
+    if response.status_code != 200:
+        return None
+    return _payload(response)
+
+
+async def _find_recent_render(
+    raw_get: RawGet,
+    client: httpx.AsyncClient,
+    identity: ReplayIdentity,
+    *,
+    deep: bool = False,
+) -> int | None:
     searches: list[dict[str, Any]] = []
-    for value in (identity.hash_prefix, identity.username):
-        if value:
-            searches.append({"search": value, "pageSize": 100})
-    searches.extend({"pageSize": 100, "page": page} for page in range(1, 5))
-
-    seen: set[int] = set()
-    ranked: list[tuple[float, int]] = []
-    for params in searches:
-        try:
-            response = await client.get(
-                ORDR_RENDER_URL,
-                params=params,
-                headers={"Accept": "application/json"},
+    if identity.hash_prefix:
+        searches.append({"search": identity.hash_prefix, "pageSize": 100})
+    if identity.username:
+        searches.extend(
+            (
+                {"search": identity.username, "pageSize": 100},
+                {"username": identity.username, "pageSize": 100},
+                {"replayUsername": identity.username, "pageSize": 100},
             )
-        except httpx.HTTPError:
-            continue
-        if response.status_code != 200:
-            continue
-        payload = _payload(response)
-        renders = payload.get("renders") if isinstance(payload, dict) else payload
-        if not isinstance(renders, list):
-            continue
-        for render in renders:
-            if not isinstance(render, dict):
+        )
+    page_count = 12 if deep else 4
+    searches.extend({"pageSize": 100, "page": page} for page in range(1, page_count + 1))
+
+    candidates: dict[int, tuple[float, bool]] = {}
+    for params in searches:
+        payload = await _raw_get_json(raw_get, client, params)
+        for render in _render_list(payload):
+            render_id = _render_id(render)
+            if not render_id:
                 continue
-            candidate = _render_id(render)
-            if not candidate or candidate in seen:
-                continue
-            seen.add(candidate)
-            score = _match_score(render, identity)
-            if score >= 45.0:
-                ranked.append((score, candidate))
-        if ranked and max(score for score, _ in ranked) >= 80.0:
+            score, username_match = _match_score(render, identity)
+            previous = candidates.get(render_id)
+            if previous is None or score > previous[0]:
+                candidates[render_id] = (score, username_match)
+        if candidates and max(score for score, _ in candidates.values()) >= 80.0:
             break
 
-    if not ranked:
+    if not candidates:
         return None
-    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return ranked[0][1]
+
+    ranked = sorted(
+        ((score, username_match, render_id) for render_id, (score, username_match) in candidates.items()),
+        reverse=True,
+    )
+    best_score, best_username_match, best_id = ranked[0]
+    if best_score >= 45.0:
+        return best_id
+
+    # Queued items frequently expose only the username. A duplicate response proves
+    # that the job exists, so choose the newest exact-username render as a fallback.
+    username_candidates = [render_id for score, matched, render_id in ranked if matched and score >= 24.0]
+    if best_username_match and username_candidates:
+        return max(username_candidates)
+    return None
+
+
+async def _recover_duplicate_render(
+    raw_get: RawGet,
+    client: httpx.AsyncClient,
+    kwargs: dict[str, Any],
+    payload: Any,
+) -> int | None:
+    render_id = _render_id(payload)
+    if render_id:
+        return render_id
+
+    identity = _upload_identity(kwargs)
+    deadline = time.monotonic() + 90.0
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        render_id = await _find_recent_render(
+            raw_get,
+            client,
+            identity,
+            deep=attempt >= 3,
+        )
+        if render_id:
+            return render_id
+        await asyncio.sleep(min(5.0, 1.5 + attempt * 0.5))
+    return None
+
+
+def _integer(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _queue_position(value: Any) -> int | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+            if "queue" in normalized and any(token in normalized for token in ("position", "place", "index", "number")):
+                candidate = _integer(item)
+                if candidate is not None:
+                    return candidate + 1 if "index" in normalized and candidate == 0 else candidate
+        for item in value.values():
+            candidate = _queue_position(item)
+            if candidate is not None:
+                return candidate
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            candidate = _queue_position(item)
+            if candidate is not None:
+                return candidate
+    elif isinstance(value, str):
+        match = _QUEUE_PATTERN.search(value)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _is_pending(render: dict[str, Any]) -> bool:
+    try:
+        if int(render.get("errorCode") or 0) != 0:
+            return False
+    except (TypeError, ValueError):
+        pass
+    text = str(render.get("progress") or "").casefold()
+    if any(token in text for token in ("done", "complete", "finished", "error", "failed")):
+        return False
+    if any(render.get(key) for key in ("videoUrl", "videoURL", "url")):
+        return False
+    return True
+
+
+async def _estimate_queue_position(
+    raw_get: RawGet,
+    client: httpx.AsyncClient,
+    render_id: int,
+) -> tuple[int | None, int | None]:
+    cached = _QUEUE_CACHE.get(render_id)
+    now = time.monotonic()
+    if cached and cached[0] > now:
+        return cached[1], cached[2]
+
+    pending_ids: set[int] = set()
+    for page in range(1, 7):
+        payload = await _raw_get_json(raw_get, client, {"pageSize": 100, "page": page})
+        renders = _render_list(payload)
+        if not renders:
+            break
+        for render in renders:
+            candidate = _render_id(render)
+            if candidate and _is_pending(render):
+                pending_ids.add(candidate)
+        if render_id in pending_ids and len(renders) < 100:
+            break
+
+    if render_id not in pending_ids:
+        result = (None, len(pending_ids) or None)
+    else:
+        ordered = sorted(pending_ids)
+        result = (ordered.index(render_id) + 1, len(ordered))
+    _QUEUE_CACHE[render_id] = (now + 5.0, result[0], result[1])
+    return result
+
+
+def _clean_headers(response: httpx.Response) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in response.headers.items()
+        if key.casefold() not in {"content-length", "content-encoding", "transfer-encoding"}
+    }
+
+
+def _json_response(response: httpx.Response, payload: Any, *, status_code: int | None = None) -> httpx.Response:
+    return httpx.Response(
+        status_code=status_code or response.status_code,
+        json=payload,
+        request=response.request,
+        headers=_clean_headers(response),
+    )
 
 
 def install() -> None:
@@ -290,6 +458,7 @@ def install() -> None:
         return
 
     original_post = httpx.AsyncClient.post
+    original_get = httpx.AsyncClient.get
 
     async def recovered_post(self: httpx.AsyncClient, url: Any, *args: Any, **kwargs: Any) -> httpx.Response:
         response = await original_post(self, url, *args, **kwargs)
@@ -301,26 +470,53 @@ def install() -> None:
         if not any(marker in text for marker in _DUPLICATE_MARKERS):
             return response
 
-        render_id = _render_id(payload)
-        if not render_id:
-            for header in ("x-render-id", "render-id", "x-ordr-render-id"):
-                try:
-                    render_id = int(response.headers.get(header) or 0)
-                except (TypeError, ValueError):
-                    render_id = 0
-                if render_id:
-                    break
-        if not render_id:
-            render_id = await _find_recent_render(self, _upload_identity(kwargs))
+        render_id = await _recover_duplicate_render(original_get, self, kwargs, payload)
         if not render_id:
             return response
 
-        return httpx.Response(
+        return _json_response(
+            response,
+            {"renderID": render_id, "reused": True},
             status_code=201,
-            json={"renderID": render_id, "reused": True},
-            request=response.request,
-            headers={"x-rankguess-reused-render": "1"},
         )
 
+    async def recovered_get(self: httpx.AsyncClient, url: Any, *args: Any, **kwargs: Any) -> httpx.Response:
+        response = await original_get(self, url, *args, **kwargs)
+        if str(url).rstrip("/") != ORDR_RENDER_URL or response.status_code != 200:
+            return response
+
+        params = kwargs.get("params") or {}
+        try:
+            render_id = int(params.get("renderID") or params.get("render_id") or 0)
+        except (AttributeError, TypeError, ValueError):
+            render_id = 0
+        if render_id <= 0:
+            return response
+
+        payload = _payload(response)
+        renders = _render_list(payload)
+        if not renders:
+            return response
+        render = renders[0]
+        progress = str(render.get("progress") or "Queued")
+        if not _is_pending(render):
+            return response
+
+        position = _queue_position(render) or _queue_position(payload)
+        queue_size = None
+        if position is None and "queue" in progress.casefold():
+            position, queue_size = await _estimate_queue_position(original_get, self, render_id)
+        if position is None:
+            return response
+
+        render["queuePosition"] = position
+        if queue_size:
+            render["queueSize"] = queue_size
+            render["progress"] = f"Queued · #{position} of {queue_size}"
+        else:
+            render["progress"] = f"Queued · #{position}"
+        return _json_response(response, payload)
+
     httpx.AsyncClient.post = recovered_post
+    httpx.AsyncClient.get = recovered_get
     httpx.AsyncClient._rankguess_ordr_recovery = True
