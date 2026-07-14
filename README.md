@@ -20,13 +20,14 @@ Required and recommended variables are listed in `.env.example`. The important o
 ```text
 OSU_CLIENT_ID
 OSU_CLIENT_SECRET
-ORDR_API_KEY
 CACHE_SIGNING_SECRET
 CRON_SECRET
 DAILY_CHALLENGE_SALT
 GALLERY_ID_SALT
 POSTGRES_URL
 ```
+
+`ORDR_API_KEY` is optional. The randomized gallery cron submits at most once every 15–60 minutes, comfortably below o!rdr's documented unauthenticated limit of one render request per five minutes. A key can still be added later for verified-bot behavior.
 
 Redeploy after changing environment variables. `/api/health` should report application version `4.0.1`.
 
