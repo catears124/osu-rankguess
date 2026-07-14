@@ -1,0 +1,57 @@
+name: Fix commit dates
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fix-commit-dates.yml
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebuild four daily commits
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT_TREE="$(git rev-parse 1aafa28eb70823e7300254c375cfc9b9c2e2fdec^{tree})"
+          DAY2_TREE="$(git rev-parse cfa3cf6c2067d191b8dc605cf729367352eb282a^{tree})"
+          DAY3_TREE="$(git rev-parse 36a76baabde59b3808041d8841b795df702c8c1f^{tree})"
+          FINAL_TREE="$(git rev-parse 689f97b7e5f6cf813da065a38bc79e69245ff528^{tree})"
+
+          export GIT_AUTHOR_NAME="catears124"
+          export GIT_AUTHOR_EMAIL="72218235+catears124@users.noreply.github.com"
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+
+          C1=$(printf '%s\n' 'first commit' | \
+            GIT_AUTHOR_DATE='2026-07-11T14:16:50-05:00' \
+            GIT_COMMITTER_DATE='2026-07-11T14:16:50-05:00' \
+            git commit-tree "$ROOT_TREE")
+
+          C2=$(printf '%s\n' 'build daily, infinite, and gallery flows' | \
+            GIT_AUTHOR_DATE='2026-07-12T18:00:00-05:00' \
+            GIT_COMMITTER_DATE='2026-07-12T18:00:00-05:00' \
+            git commit-tree "$DAY2_TREE" -p "$C1")
+
+          C3=$(printf '%s\n' 'polish gameplay and replay interactions' | \
+            GIT_AUTHOR_DATE='2026-07-13T18:00:00-05:00' \
+            GIT_COMMITTER_DATE='2026-07-13T18:00:00-05:00' \
+            git commit-tree "$DAY3_TREE" -p "$C2")
+
+          C4=$(printf '%s\n' 'finish client rendering, community data, and deployment' | \
+            GIT_AUTHOR_DATE='2026-07-14T05:38:30-05:00' \
+            GIT_COMMITTER_DATE='2026-07-14T05:38:30-05:00' \
+            git commit-tree "$FINAL_TREE" -p "$C3")
+
+          test "$(git rev-parse "$C4^{tree}")" = "$FINAL_TREE"
+          test "$(git rev-list --count "$C4")" -eq 4
+          git push --force origin "$C4:refs/heads/main"
