@@ -1,0 +1,58 @@
+name: remove readme from history
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/remove-readme-history.yml
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebuild four commits without README.md
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "catears124"
+          git config user.email "72218235+catears124@users.noreply.github.com"
+
+          source_tip="de4daece5c1643920aae9b2cc65e40a9e2649767"
+          mapfile -t commits < <(git rev-list --reverse "$source_tip")
+
+          if [ "${#commits[@]}" -ne 4 ]; then
+            echo "Expected 4 source commits, found ${#commits[@]}" >&2
+            exit 1
+          fi
+
+          parent=""
+          for old in "${commits[@]}"; do
+            git checkout --detach "$old"
+            rm -f README.md Readme.md readme.md
+            git add -A
+            tree="$(git write-tree)"
+
+            export GIT_AUTHOR_NAME="$(git show -s --format=%an "$old")"
+            export GIT_AUTHOR_EMAIL="$(git show -s --format=%ae "$old")"
+            export GIT_AUTHOR_DATE="$(git show -s --format=%aI "$old")"
+            export GIT_COMMITTER_NAME="$(git show -s --format=%cn "$old")"
+            export GIT_COMMITTER_EMAIL="$(git show -s --format=%ce "$old")"
+            export GIT_COMMITTER_DATE="$(git show -s --format=%cI "$old")"
+            message="$(git show -s --format=%B "$old")"
+
+            if [ -z "$parent" ]; then
+              parent="$(printf '%s\n' "$message" | git commit-tree "$tree")"
+            else
+              parent="$(printf '%s\n' "$message" | git commit-tree "$tree" -p "$parent")"
+            fi
+          done
+
+          git push --force origin "$parent:refs/heads/main"
