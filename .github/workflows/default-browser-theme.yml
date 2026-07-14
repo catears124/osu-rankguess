@@ -24,12 +24,11 @@ jobs:
           git config user.name "catears124"
           git config user.email "72218235+catears124@users.noreply.github.com"
 
-          trigger="$(git rev-parse HEAD)"
-          original_tip="$(git rev-parse "${trigger}^1")"
+          original_tip="de4daece5c1643920aae9b2cc65e40a9e2649767"
           mapfile -t commits < <(git rev-list --reverse "$original_tip")
 
           if [ "${#commits[@]}" -ne 4 ]; then
-            echo "Expected 4 commits before the trigger commit, found ${#commits[@]}" >&2
+            echo "Expected 4 source commits, found ${#commits[@]}" >&2
             exit 1
           fi
 
