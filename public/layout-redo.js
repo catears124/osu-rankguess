@@ -59,11 +59,6 @@
 
   window.rankguessUI = { pauseAllVideos, autoplayVideo, restorePlayback };
 
-  document.addEventListener("pointerdown", () => {
-    const video = activeVideo();
-    if (video && (video.paused || video.dataset.autoplayFallback === "muted")) autoplayVideo(video, true).catch(() => {});
-  }, { passive: true });
-
   showView = function finalShowView(name) {
     pauseAllVideos({ unloadDialog: name !== "gallery" });
     originalShowView(name);
