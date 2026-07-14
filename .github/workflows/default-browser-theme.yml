@@ -1,0 +1,71 @@
+name: default browser theme
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/default-browser-theme.yml
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Remove forced browser theme from all four snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "catears124"
+          git config user.email "72218235+catears124@users.noreply.github.com"
+
+          trigger="$(git rev-parse HEAD)"
+          original_tip="$(git rev-parse "${trigger}^1")"
+          mapfile -t commits < <(git rev-list --reverse "$original_tip")
+
+          if [ "${#commits[@]}" -ne 4 ]; then
+            echo "Expected 4 commits before the trigger commit, found ${#commits[@]}" >&2
+            exit 1
+          fi
+
+          parent=""
+          for old in "${commits[@]}"; do
+            git checkout --detach "$old"
+
+            if [ -f public/index.html ]; then
+              python - <<'PY'
+from pathlib import Path
+path = Path("public/index.html")
+text = path.read_text(encoding="utf-8")
+lines = [
+    line for line in text.splitlines()
+    if 'name="theme-color"' not in line
+    and 'name="color-scheme"' not in line
+]
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+            fi
+
+            git add -A
+            tree="$(git write-tree)"
+            export GIT_AUTHOR_NAME="$(git show -s --format=%an "$old")"
+            export GIT_AUTHOR_EMAIL="$(git show -s --format=%ae "$old")"
+            export GIT_AUTHOR_DATE="$(git show -s --format=%aI "$old")"
+            export GIT_COMMITTER_NAME="$(git show -s --format=%cn "$old")"
+            export GIT_COMMITTER_EMAIL="$(git show -s --format=%ce "$old")"
+            export GIT_COMMITTER_DATE="$(git show -s --format=%cI "$old")"
+            message="$(git show -s --format=%B "$old")"
+
+            if [ -z "$parent" ]; then
+              parent="$(printf '%s\n' "$message" | git commit-tree "$tree")"
+            else
+              parent="$(printf '%s\n' "$message" | git commit-tree "$tree" -p "$parent")"
+            fi
+          done
+
+          git push --force origin "$parent:refs/heads/main"
