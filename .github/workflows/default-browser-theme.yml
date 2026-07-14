@@ -24,6 +24,7 @@ jobs:
           git config user.name "catears124"
           git config user.email "72218235+catears124@users.noreply.github.com"
 
+          # Rebuild the four clean commits and discard this temporary workflow.
           original_tip="de4daece5c1643920aae9b2cc65e40a9e2649767"
           mapfile -t commits < <(git rev-list --reverse "$original_tip")
 
