@@ -68,5 +68,8 @@ try:
     _community_runtime.Request = _FastAPIRequest
     _community_runtime.JSONResponse = _FastAPIJSONResponse
     _community_runtime.install()
+
+    import community_display as _community_display
+    _community_display.install()
 except Exception:  # pragma: no cover - never block application startup for optional community features.
     pass
