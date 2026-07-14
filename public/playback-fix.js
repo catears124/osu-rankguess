@@ -92,11 +92,8 @@
   };
 })();
 
-/* Finish-state UX: never leave the daily chart loading, and let the result modal minimize. */
+/* Finish-state UX: initialize the daily chart and let the result modal minimize. */
 (() => {
-  if (document.documentElement.dataset.roundFinishFix === "1") return;
-  document.documentElement.dataset.roundFinishFix = "1";
-
   const COMMUNITY_TARGET = 24;
   const COMMUNITY_BINS = 12;
   const baseUpdateChallengeRound = updateChallengeRound;
@@ -133,7 +130,7 @@
     const edges = [1];
     for (let index = 1; index <= COMMUNITY_BINS; index += 1) {
       const edge = Math.round(10 ** (logMaximum * index / COMMUNITY_BINS));
-      edges.push(Math.max(edges.at(-1) + 1, Math.min(maximum, edge)));
+      edges.push(Math.max(edges[edges.length - 1] + 1, Math.min(maximum, edge)));
     }
     edges[edges.length - 1] = maximum;
     return edges;
@@ -168,7 +165,7 @@
     const actualLog = Math.log10(actual);
     const predictedLog = Math.log10(predicted);
     const logMaximum = Math.log10(maximum);
-    const random = seededRandom(`${round.item?.id || "daily"}:${challengeDate || "today"}:community-v2`);
+    const random = seededRandom(`${round.item?.id || "daily"}:${challengeDate || "today"}:community-v3`);
 
     for (let index = 0; index < needed; index += 1) {
       const draw = random();
@@ -221,7 +218,7 @@
       const payload = await requestJSON(`/api/challenge/${encodeURIComponent(round.item.id)}/distribution?${query}`);
       source = payload.distribution || source;
     } catch {
-      // The deterministic cold-start distribution is already available below.
+      // The initialized distribution is already available below.
     }
 
     const normalized = normalizeDistribution(source, round, challengeDate);
@@ -235,12 +232,13 @@
     const backdrop = panel?.querySelector(".result-backdrop");
     const dialog = backdrop?.querySelector(".result-dialog");
     const originalNext = backdrop?.querySelector(".next-challenge");
-    if (!backdrop || !dialog || !originalNext || backdrop.dataset.dismissReady === "1") return;
-    backdrop.dataset.dismissReady = "1";
+    if (!backdrop || !dialog || !originalNext || backdrop.dataset.dismissReady === "2") return;
+    backdrop.dataset.dismissReady = "2";
 
     const showResults = () => {
       panel.querySelector(".result-after-dock")?.remove();
       backdrop.hidden = false;
+      backdrop.style.removeProperty("display");
       document.body.classList.add("result-open");
       requestAnimationFrame(() => dialog.focus({ preventScroll: true }));
     };
@@ -248,6 +246,7 @@
     const dismiss = () => {
       if (backdrop.hidden) return;
       backdrop.hidden = true;
+      backdrop.style.display = "none";
       document.body.classList.remove("result-open");
       panel.querySelector(".result-after-dock")?.remove();
 
@@ -261,11 +260,18 @@
       panel.appendChild(dock);
       dock.querySelector(".result-show")?.addEventListener("click", showResults);
       dock.querySelector(".result-next")?.addEventListener("click", () => originalNext.click());
+
+      const video = panel.closest(".polish-shell")?.querySelector(".challenge-video");
+      if (video?.paused) video.play().catch(() => {});
     };
 
     backdrop.addEventListener("click", (event) => {
-      if (event.target === backdrop) dismiss();
-    });
+      if (!dialog.contains(event.target)) {
+        event.preventDefault();
+        event.stopPropagation();
+        dismiss();
+      }
+    }, true);
   };
 
   updateChallengeRound = function enhancedFinishState(round, mode, challengeDate) {
