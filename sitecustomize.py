@@ -59,3 +59,9 @@ try:
     _ordr_recovery.install()
 except Exception:  # pragma: no cover - never block application startup for a recovery shim.
     pass
+
+try:
+    import community_runtime as _community_runtime
+    _community_runtime.install()
+except Exception:  # pragma: no cover - never block application startup for optional community features.
+    pass
