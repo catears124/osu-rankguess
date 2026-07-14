@@ -179,6 +179,63 @@
     list.innerHTML = (round.guesses || []).map((guess) => `<li class="duel-turn ${guess?.correct ? "player-hit" : ""}"><div class="guess-summary"><span>${directionLabel(guess)}:</span><strong>${formatRank(guess?.guessRank)}</strong></div></li>`).join("");
   };
 
+  const communityDistributionHTML = (round, mode) => {
+    if (mode !== "daily") return "";
+    const distribution = round.distribution;
+    const bins = Array.isArray(distribution?.bins) ? distribution.bins : [];
+    if (!bins.length) {
+      return `<section class="community-distribution loading" data-community-distribution>
+        <div class="community-distribution-head"><span>community distribution</span><small>loading…</small></div>
+      </section>`;
+    }
+
+    const observed = Number(distribution.observedCount ?? distribution.count) || 0;
+    const baseline = Number(distribution.baselineCount) || 0;
+    const maximum = Math.max(1, ...bins.map((bin) => Number(bin?.count) || 0));
+    const actual = Number(round.actualRank) || 0;
+    const firstGuess = Number(round.guesses?.[0]?.guessRank) || 0;
+    const bars = bins.map((bin) => {
+      const lower = Number(bin?.lower) || 1;
+      const upper = Number(bin?.upper) || lower;
+      const count = Math.max(0, Number(bin?.count) || 0);
+      const height = count > 0 ? Math.max(7, count / maximum * 100) : 0;
+      const classes = [
+        actual >= lower && actual <= upper ? "actual" : "",
+        firstGuess >= lower && firstGuess <= upper ? "yours" : "",
+      ].filter(Boolean).join(" ");
+      const observedInBin = Math.max(0, Number(bin?.observedCount) || 0);
+      const title = `${formatRank(lower)}–${formatRank(upper)} · ${observedInBin} real`;
+      return `<span class="community-bar ${classes}" title="${escapeHTML(title)}"><i style="height:${height.toFixed(2)}%"></i></span>`;
+    }).join("");
+    const countLabel = `${observed.toLocaleString()} real ${observed === 1 ? "guess" : "guesses"}`;
+    const smoothingLabel = baseline > 0 ? " · baseline-smoothed" : "";
+
+    return `<section class="community-distribution" data-community-distribution>
+      <div class="community-distribution-head"><span>community distribution</span><small>${countLabel}${smoothingLabel}</small></div>
+      <div class="community-chart" aria-label="Distribution of first guesses from the community">
+        <div class="community-bars">${bars}</div>
+      </div>
+      <div class="community-axis"><span>${formatRank(1)}</span><span>${formatRank(rankPopulation)}</span></div>
+      <p><i></i> actual range <b></b> your first-guess range${baseline > 0 ? " · baseline fades as real guesses arrive" : ""}</p>
+    </section>`;
+  };
+
+  const hydrateCommunityDistribution = async (round, mode, challengeDate, panel) => {
+    if (mode !== "daily" || Array.isArray(round.distribution?.bins)) return;
+    try {
+      const query = new URLSearchParams({ mode: "daily" });
+      if (challengeDate) query.set("challengeDate", challengeDate);
+      const payload = await requestJSON(`/api/challenge/${encodeURIComponent(round.item.id)}/distribution?${query}`);
+      round.distribution = payload.distribution || null;
+      const host = panel.querySelector("[data-community-distribution]");
+      if (host) host.outerHTML = communityDistributionHTML(round, mode);
+      saveDailyState();
+    } catch {
+      const host = panel.querySelector("[data-community-distribution]");
+      if (host) host.remove();
+    }
+  };
+
   const resultHTML = (round, mode) => {
     const verdict = verdictFor(round);
     const turns = (round.guesses || []).map((guess, index) => {
@@ -200,6 +257,7 @@
           <div class="result-turn result-turn-head"><span>turn</span><span>you</span><span>rankbot</span></div>
           ${turns}
         </div>
+        ${communityDistributionHTML(round, mode)}
         <button class="primary-button next-challenge" type="button">${mode === "daily" ? "next" : "next replay"}</button>
       </section>
     </div>`;
@@ -288,6 +346,7 @@
     if (!panel) return;
     panel.hidden = false;
     panel.innerHTML = resultHTML(round, mode);
+    hydrateCommunityDistribution(round, mode, challengeDate, panel);
     const dialog = panel.querySelector(".result-dialog");
     requestAnimationFrame(() => dialog?.focus({ preventScroll: true }));
     panel.querySelector(".next-challenge")?.addEventListener("click", () => {
