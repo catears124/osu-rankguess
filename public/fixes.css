@@ -61,4 +61,8 @@ body[data-view="infinite"] main,body[data-view="infinite"] #view-infinite,body[d
 .community-distribution p i,.community-distribution p b{display:inline-block;width:8px;height:8px;flex:0 0 auto}
 .community-distribution p i{background:var(--pink)}
 .community-distribution p b{border:1px solid var(--green)}
+.version-stamp{display:none!important}
+#osuAuthLink,#osuAuthLink[hidden]{display:inline-flex!important;grid-column:3;justify-self:end;align-items:center;min-height:36px;padding:0 8px;color:var(--pink);font:800 12px/1 var(--font)!important;white-space:nowrap}
+#osuAuthLink:hover{color:var(--pink-bright)}
+@media (max-width:760px){#osuAuthLink,#osuAuthLink[hidden]{font-size:10px!important;padding:0 2px}.site-header{gap:10px}}
 @media (max-width:620px){.result-dialog{padding-right:22px;padding-left:22px}.community-distribution-head{align-items:flex-start;flex-direction:column;gap:5px}.community-distribution-head small{text-align:left}.community-bars{gap:2px}.community-chart{height:68px}.result-after-dock{right:16px;bottom:max(16px,env(safe-area-inset-bottom));left:16px;min-width:0;gap:12px}.result-after-actions button{min-width:72px!important;padding:0 11px!important}.result-after-actions .result-next{min-width:82px!important}}
