@@ -12,6 +12,9 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+from fastapi import HTTPException
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse
 
 _INSTALLED = False
 
@@ -66,7 +69,7 @@ def _configured() -> bool:
     return bool(os.getenv("OSU_CLIENT_ID") and os.getenv("OSU_CLIENT_SECRET"))
 
 
-def _redirect_uri(request: Any) -> str:
+def _redirect_uri(request: Request) -> str:
     configured = (os.getenv("OSU_OAUTH_REDIRECT_URI") or "").strip()
     if configured:
         return configured
@@ -77,9 +80,6 @@ def register_routes(app: Any) -> None:
     """Register OAuth routes directly on an existing FastAPI application."""
     if getattr(app.state, "rankguess_oauth_routes", False):
         return
-
-    from fastapi import HTTPException, Request
-    from fastapi.responses import JSONResponse, RedirectResponse
 
     app.state.rankguess_oauth_routes = True
 
