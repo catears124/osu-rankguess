@@ -1,0 +1,74 @@
+name: apply final runtime fix
+
+on:
+  push:
+    branches:
+      - final-runtime-fix
+    paths:
+      - .github/workflows/apply-final-runtime-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: final-runtime-fix
+          fetch-depth: 0
+
+      - name: Patch application entrypoint and assets
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          app_path = Path("app.py")
+          app_text = app_path.read_text(encoding="utf-8")
+          marker = "from seo_oauth_runtime import register_routes as _register_oauth_routes"
+          if marker not in app_text:
+              needle = "app.add_middleware(GZipMiddleware, minimum_size=1_000)\n"
+              replacement = (
+                  needle
+                  + "\n"
+                  + "from seo_oauth_runtime import register_routes as _register_oauth_routes\n"
+                  + "_register_oauth_routes(app)\n"
+              )
+              if needle not in app_text:
+                  raise SystemExit("Could not find FastAPI middleware marker in app.py")
+              app_text = app_text.replace(needle, replacement, 1)
+              app_path.write_text(app_text, encoding="utf-8")
+
+          index_path = Path("public/index.html")
+          index_text = index_path.read_text(encoding="utf-8")
+          css_line = '  <link rel="stylesheet" href="/runtime-final.css?v=1" />\n'
+          if css_line not in index_text:
+              needle = '  <link rel="stylesheet" href="/fixes.css?v=5" />\n'
+              if needle not in index_text:
+                  raise SystemExit("Could not find fixes.css in public/index.html")
+              index_text = index_text.replace(needle, needle + css_line, 1)
+
+          js_line = '  <script src="/runtime-final.js?v=1" defer></script>\n'
+          if js_line not in index_text:
+              needle = '  <script src="/seo.js?v=1" defer></script>\n'
+              if needle not in index_text:
+                  raise SystemExit("Could not find seo.js in public/index.html")
+              index_text = index_text.replace(needle, needle + js_line, 1)
+          index_path.write_text(index_text, encoding="utf-8")
+
+          vercel_path = Path("vercel.json")
+          vercel = json.loads(vercel_path.read_text(encoding="utf-8"))
+          vercel.setdefault("functions", {}).setdefault("app.py", {})["includeFiles"] = "model/**"
+          vercel_path.write_text(json.dumps(vercel, indent=2) + "\n", encoding="utf-8")
+          PY
+
+      - name: Commit patched tree
+        run: |
+          git rm .github/workflows/apply-final-runtime-fix.yml
+          git config user.name catears124
+          git config user.email 72218235+catears124@users.noreply.github.com
+          git add app.py public/index.html vercel.json public/runtime-final.css public/runtime-final.js seo_oauth_runtime.py
+          git commit -m "wire final runtime fixes"
+          git push origin HEAD:final-runtime-fix
