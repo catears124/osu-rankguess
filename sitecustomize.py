@@ -75,7 +75,13 @@ except Exception:  # pragma: no cover - never block application startup for opti
     pass
 
 try:
+    import cron_runtime as _cron_runtime
+    _cron_runtime.install()
+except Exception:  # pragma: no cover - cron routes must never block application startup.
+    pass
+
+try:
     import seo_oauth_runtime as _seo_oauth_runtime
     _seo_oauth_runtime.install()
-except Exception:  # pragma: no cover - OAuth is optional and must never block startup.
+except Exception:  # pragma: no cover - OAuth setup must never block startup.
     pass

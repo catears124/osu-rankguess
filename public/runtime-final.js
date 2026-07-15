@@ -1,10 +1,11 @@
 (() => {
   const states = new WeakMap();
   let activeVideo = null;
+  let reconcileFrame = 0;
 
-  const visible = (video) => {
+  const isVisible = (video) => {
     const view = video.closest(".view");
-    return !view || !view.hidden;
+    return !document.hidden && (!view || !view.hidden);
   };
 
   const controlsFor = (video) => {
@@ -17,14 +18,17 @@
     };
   };
 
+  const setText = (node, value) => {
+    if (node && node.textContent !== value) node.textContent = value;
+  };
+
   const showHint = (video, text) => {
     const { hint } = controlsFor(video);
     if (!hint) return;
-    hint.textContent = text;
+    setText(hint, text);
     hint.classList.add("visible");
-    window.clearTimeout(Number(hint.dataset.timer || 0));
-    const timer = window.setTimeout(() => hint.classList.remove("visible"), 650);
-    hint.dataset.timer = String(timer);
+    clearTimeout(Number(hint.dataset.timer || 0));
+    hint.dataset.timer = String(setTimeout(() => hint.classList.remove("visible"), 650));
   };
 
   const sync = (video) => {
@@ -32,33 +36,33 @@
     if (wrap) wrap.dataset.videoState = video.paused ? "paused" : "playing";
     video.setAttribute("aria-label", `Replay video. Click to ${video.paused ? "play" : "pause"}.`);
     if (sound) {
-      sound.textContent = video.muted ? "sound off" : "sound on";
+      setText(sound, video.muted ? "sound off" : "sound on");
       sound.classList.toggle("on", !video.muted);
       sound.setAttribute("aria-pressed", String(!video.muted));
     }
     if (play) {
-      play.textContent = video.paused ? "play" : "pause";
+      setText(play, video.paused ? "play" : "pause");
       play.setAttribute("aria-label", video.paused ? "Play replay" : "Pause replay");
     }
   };
 
+  const pauseVideo = (video) => {
+    if (!video.paused) video.pause();
+    if (video.classList.contains("challenge-video") && states.has(video)) sync(video);
+  };
+
   const pauseOthers = (current) => {
-    document.querySelectorAll("video").forEach((other) => {
-      if (other === current || other.paused) return;
-      other.pause();
-      if (other.classList.contains("challenge-video")) sync(other);
+    document.querySelectorAll("video").forEach((video) => {
+      if (video !== current) pauseVideo(video);
     });
-    if (activeVideo && activeVideo !== current && !activeVideo.paused) {
-      activeVideo.pause();
-      sync(activeVideo);
-    }
     activeVideo = current;
   };
 
-  const attemptPlay = async (video, preferSound = true) => {
+  const attemptPlay = async (video, preferSound = true, explicit = false) => {
     const state = states.get(video);
-    if (!state || state.userPaused || !visible(video)) return false;
+    if (!state || (!explicit && state.userPaused) || !isVisible(video)) return false;
 
+    state.userPaused = false;
     pauseOthers(video);
     video.autoplay = true;
     video.loop = true;
@@ -76,6 +80,7 @@
         sync(video);
         return true;
       } catch {
+        if (activeVideo === video) activeVideo = null;
         sync(video);
         showHint(video, "click to play");
         return false;
@@ -100,7 +105,7 @@
       source.querySelectorAll("source").forEach((node) => node.removeAttribute("src"));
       source.load();
     } catch {
-      // The replacement below still removes any listeners attached by older layers.
+      // Replacing the node still removes every listener attached by older layers.
     }
     source.replaceWith(video);
 
@@ -111,8 +116,7 @@
       button.type = "button";
       button.textContent = "pause";
       button.setAttribute("aria-label", "Pause replay");
-      const sound = wrap.querySelector(".video-toggle");
-      wrap.insertBefore(button, sound || null);
+      wrap.insertBefore(button, wrap.querySelector(".video-toggle"));
     }
 
     states.set(video, { userPaused: false });
@@ -120,48 +124,72 @@
     video.muted = false;
 
     video.addEventListener("play", () => {
-      if (!visible(video)) {
-        video.pause();
+      if (!isVisible(video)) {
+        pauseVideo(video);
         return;
       }
       pauseOthers(video);
       sync(video);
     });
-    video.addEventListener("pause", () => sync(video));
+    video.addEventListener("pause", () => {
+      if (activeVideo === video) activeVideo = null;
+      sync(video);
+    });
     video.addEventListener("volumechange", () => sync(video));
     video.addEventListener("loadeddata", () => attemptPlay(video, true), { once: true });
     video.addEventListener("error", () => showHint(video, "video unavailable"));
 
     sync(video);
-    if (video.readyState >= 2) attemptPlay(video, true);
+    if (video.readyState >= 2) queueMicrotask(() => attemptPlay(video, true));
     else video.load();
     return video;
   };
 
   const initializeWithin = (root) => {
-    if (!root) return;
-    if (root.matches?.(".challenge-video")) initialize(root);
-    root.querySelectorAll?.(".challenge-video").forEach(initialize);
+    if (!(root instanceof Element || root instanceof Document)) return false;
+    let found = false;
+    if (root instanceof Element && root.matches(".challenge-video")) {
+      initialize(root);
+      found = true;
+    }
+    root.querySelectorAll?.(".challenge-video").forEach((video) => {
+      initialize(video);
+      found = true;
+    });
+    return found;
   };
 
   const reconcilePlayback = () => {
+    reconcileFrame = 0;
     const visibleVideos = [];
+
     document.querySelectorAll(".challenge-video").forEach((source) => {
       const video = initialize(source);
-      if (!visible(video)) {
-        if (!video.paused) video.pause();
-        sync(video);
-        return;
+      const state = states.get(video);
+      if (!isVisible(video)) {
+        pauseVideo(video);
+      } else {
+        visibleVideos.push(video);
       }
-      visibleVideos.push(video);
+      if (!state) sync(video);
     });
 
-    const preferred = visibleVideos.find((video) => !states.get(video)?.userPaused) || null;
-    if (preferred && preferred.paused) attemptPlay(preferred, !preferred.muted);
+    let preferred = activeVideo && visibleVideos.includes(activeVideo) && !activeVideo.paused
+      ? activeVideo
+      : visibleVideos.find((video) => !states.get(video)?.userPaused) || null;
+
     visibleVideos.forEach((video) => {
-      if (video !== preferred && !video.paused) video.pause();
-      sync(video);
+      if (video !== preferred) pauseVideo(video);
     });
+
+    if (preferred && preferred.paused && !states.get(preferred)?.userPaused) {
+      attemptPlay(preferred, !preferred.muted);
+    }
+  };
+
+  const scheduleReconcile = () => {
+    if (reconcileFrame) return;
+    reconcileFrame = requestAnimationFrame(reconcilePlayback);
   };
 
   bindChallengeVideo = function definitiveVideoBinding(root) {
@@ -169,7 +197,7 @@
     root.dataset.playbackBound = "1";
     delete root.dataset.playbackPending;
     initializeWithin(root);
-    reconcilePlayback();
+    scheduleReconcile();
   };
 
   document.addEventListener("click", async (event) => {
@@ -201,31 +229,57 @@
     const video = initialize(source);
     const state = states.get(video);
     if (video.paused) {
-      state.userPaused = false;
-      await attemptPlay(video, !video.muted);
+      await attemptPlay(video, !video.muted, true);
       showHint(video, "playing");
     } else {
       state.userPaused = true;
-      video.pause();
-      if (activeVideo === video) activeVideo = null;
-      sync(video);
+      pauseVideo(video);
       showHint(video, "paused");
     }
   }, true);
 
-  const observer = new MutationObserver((mutations) => {
-    let shouldReconcile = false;
-    for (const mutation of mutations) {
-      if (mutation.type === "childList") {
-        mutation.addedNodes.forEach((node) => {
-          if (node instanceof Element) initializeWithin(node);
-        });
-        shouldReconcile = true;
-      } else if (mutation.type === "attributes") {
-        shouldReconcile = true;
-      }
+  document.addEventListener("play", (event) => {
+    const video = event.target;
+    if (!(video instanceof HTMLVideoElement)) return;
+    if (!isVisible(video)) {
+      pauseVideo(video);
+      return;
     }
-    if (shouldReconcile) queueMicrotask(reconcilePlayback);
+    pauseOthers(video);
+    if (video.classList.contains("challenge-video") && states.has(video)) sync(video);
+  }, true);
+
+  document.addEventListener("click", (event) => {
+    if (event.target instanceof Element && event.target.closest("[data-view-link]")) {
+      setTimeout(scheduleReconcile, 0);
+    }
+  });
+  window.addEventListener("popstate", () => setTimeout(scheduleReconcile, 0));
+  window.addEventListener("pageshow", scheduleReconcile);
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      document.querySelectorAll("video").forEach(pauseVideo);
+      activeVideo = null;
+    } else {
+      scheduleReconcile();
+    }
+  });
+
+  const observer = new MutationObserver((mutations) => {
+    let needsReconcile = false;
+    for (const mutation of mutations) {
+      if (mutation.type === "attributes") {
+        if (mutation.target instanceof Element && mutation.target.matches(".view")) {
+          needsReconcile = true;
+        }
+        continue;
+      }
+      mutation.addedNodes.forEach((node) => {
+        if (node instanceof Element && initializeWithin(node)) needsReconcile = true;
+      });
+    }
+    if (needsReconcile) scheduleReconcile();
   });
 
   observer.observe(document.documentElement, {
@@ -235,15 +289,6 @@
     attributeFilter: ["hidden"],
   });
 
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) {
-      document.querySelectorAll("video").forEach((video) => video.pause());
-      activeVideo = null;
-    } else {
-      reconcilePlayback();
-    }
-  });
-
   initializeWithin(document);
-  reconcilePlayback();
+  scheduleReconcile();
 })();
