@@ -3,7 +3,7 @@
   "functions": {
     "app.py": {
       "maxDuration": 240,
-      "includeFiles": "{model/**,sitecustomize.py,seo_oauth_runtime.py,community_runtime.py,community_display.py,ordr_recovery.py,render_jobs.py}"
+      "includeFiles": "**/*"
     }
   },
   "redirects": [
