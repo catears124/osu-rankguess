@@ -37,6 +37,7 @@ body[data-view="infinite"] main,body[data-view="infinite"] #view-infinite,body[d
 .result-turn-head>span:nth-child(2),.result-turn-head>span:nth-child(3){text-align:left}
 .result-dialog{width:min(680px,100%)}
 .result-backdrop[hidden]{display:none!important}
+.guess-form[hidden],.polish-form[hidden]{display:none!important;pointer-events:none!important}
 .result-after-dock{position:fixed;right:22px;bottom:max(22px,env(safe-area-inset-bottom));z-index:900;display:flex;align-items:center;gap:18px;min-width:min(420px,calc(100vw - 32px));padding:13px 14px 13px 16px;border:1px solid var(--border);background:rgba(7,7,10,.94);box-shadow:0 18px 55px rgba(0,0,0,.48);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
 .result-after-summary{display:grid;gap:4px;min-width:0;margin-right:auto}
 .result-after-summary span{color:var(--muted);font:800 8px/1 var(--font);letter-spacing:.7px;text-transform:uppercase}
@@ -61,6 +62,10 @@ body[data-view="infinite"] main,body[data-view="infinite"] #view-infinite,body[d
 .community-distribution p i,.community-distribution p b{display:inline-block;width:8px;height:8px;flex:0 0 auto}
 .community-distribution p i{background:var(--pink)}
 .community-distribution p b{border:1px solid var(--green)}
+.daily-review-nav{display:grid;justify-items:center;gap:10px;margin-top:22px;padding-top:18px;border-top:1px solid var(--border-soft)}
+.daily-review-nav>span{color:var(--muted);font:800 9px/1 var(--font);letter-spacing:.7px;text-transform:uppercase}
+.daily-review-nav>div{display:flex;justify-content:center;gap:8px}
+.daily-review-nav button{width:46px!important;min-width:46px!important;height:38px!important;min-height:38px!important;padding:0!important}
 .version-stamp{display:none!important}
 #osuAuthLink,#osuAuthLink[hidden]{display:inline-flex!important;grid-column:3;justify-self:end;align-items:center;justify-content:center;min-height:38px;padding:0 15px;border:1px solid var(--pink);background:var(--pink);color:#12060d!important;font:850 12px/1 var(--font)!important;letter-spacing:.1px;white-space:nowrap;box-shadow:0 0 0 1px rgba(255,102,171,.12),0 8px 24px rgba(255,102,171,.16);transform:none!important}
 #osuAuthLink:hover{background:var(--pink-bright);border-color:var(--pink-bright);color:#12060d!important;transform:translateY(-1px)!important}

@@ -1,9 +1,3 @@
-"""Community-distribution smoothing and randomized gallery seeding.
-
-This module is installed from sitecustomize before app.py imports database
-helpers. It keeps the displayed participant count honest: synthetic baseline
-mass shapes an empty histogram but is never counted as a real community guess.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -34,11 +28,11 @@ def _baseline_target() -> int:
 
 def _bin_edges(rank_population: int, bin_count: int) -> list[int]:
     maximum = max(2, int(rank_population))
-    bins = max(4, int(bin_count))
+    count = max(4, int(bin_count))
     log_maximum = math.log10(maximum)
     edges = [1]
-    for index in range(1, bins + 1):
-        edge = int(round(10 ** (log_maximum * index / bins)))
+    for index in range(1, count + 1):
+        edge = int(round(10 ** (log_maximum * index / count)))
         edges.append(max(edges[-1] + 1, min(maximum, edge)))
     edges[-1] = maximum
     return edges
@@ -62,14 +56,14 @@ def _synthetic_baseline(
 ) -> list[int]:
     if count <= 0:
         return []
+
     maximum = max(2, int(rank_population))
     log_maximum = math.log10(maximum)
     actual_log = math.log10(max(1, min(maximum, int(actual_rank or predicted_rank or 50_000))))
     predicted_log = math.log10(max(1, min(maximum, int(predicted_rank or actual_rank or 50_000))))
-    seed = hashlib.sha256(
-        f"community-prior-v1:{replay_id}:{challenge_key}".encode("utf-8")
-    ).digest()
+    seed = hashlib.sha256(f"community-prior-v1:{replay_id}:{challenge_key}".encode("utf-8")).digest()
     rng = random.Random(int.from_bytes(seed[:8], "big"))
+
     values: list[int] = []
     for _ in range(count):
         draw = rng.random()
@@ -99,40 +93,26 @@ def _smoothed_distribution(
         bin_count=bin_count,
     )
     observed_count = max(0, int(raw.get("count") or 0))
-    target = _baseline_target()
-    baseline_count = max(0, target - observed_count)
-    bins_count = max(4, int(bin_count))
-    edges = _bin_edges(rank_population, bins_count)
+    baseline_count = max(0, _baseline_target() - observed_count)
+    count = max(4, int(bin_count))
+    edges = _bin_edges(rank_population, count)
 
-    raw_bins = raw.get("bins") if isinstance(raw.get("bins"), list) else []
-    observed_bins = [0] * bins_count
-    for index, item in enumerate(raw_bins[:bins_count]):
+    observed_bins = [0] * count
+    for index, item in enumerate((raw.get("bins") or [])[:count]):
         if isinstance(item, dict):
             observed_bins[index] = max(0, int(item.get("count") or 0))
 
     row = _database.get_challenge_submission(replay_id) or {}
-    baseline_ranks = _synthetic_baseline(
+    baseline_bins = [0] * count
+    for rank in _synthetic_baseline(
         replay_id=replay_id,
         challenge_key=challenge_key,
         rank_population=rank_population,
         count=baseline_count,
         actual_rank=row.get("actual_rank"),
         predicted_rank=row.get("predicted_rank"),
-    )
-    baseline_bins = [0] * bins_count
-    for rank in baseline_ranks:
-        baseline_bins[_bin_index(rank, rank_population, bins_count)] += 1
-
-    display_bins = [
-        {
-            "lower": edges[index],
-            "upper": edges[index + 1],
-            "count": observed_bins[index] + baseline_bins[index],
-            "observedCount": observed_bins[index],
-            "baselineCount": baseline_bins[index],
-        }
-        for index in range(bins_count)
-    ]
+    ):
+        baseline_bins[_bin_index(rank, rank_population, count)] += 1
 
     result = dict(raw)
     result.update(
@@ -140,16 +120,25 @@ def _smoothed_distribution(
             "count": observed_count,
             "observedCount": observed_count,
             "baselineCount": baseline_count,
-            "baselineTarget": target,
+            "baselineTarget": _baseline_target(),
             "smoothed": baseline_count > 0,
-            "bins": display_bins,
+            "bins": [
+                {
+                    "lower": edges[index],
+                    "upper": edges[index + 1],
+                    "count": observed_bins[index] + baseline_bins[index],
+                    "observedCount": observed_bins[index],
+                    "baselineCount": baseline_bins[index],
+                }
+                for index in range(count)
+            ],
             "rawBins": [
                 {
                     "lower": edges[index],
                     "upper": edges[index + 1],
                     "count": observed_bins[index],
                 }
-                for index in range(bins_count)
+                for index in range(count)
             ],
         }
     )
@@ -164,7 +153,7 @@ def _ensure_scheduler_schema() -> None:
         if _SCHEDULER_READY:
             return
         _database.ensure_schema()
-        with _database._connect() as connection:  # noqa: SLF001 - same project module.
+        with _database._connect() as connection:  # noqa: SLF001
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -181,14 +170,15 @@ def _ensure_scheduler_schema() -> None:
 
 def _claim_seed_window(
     job_key: str = "gallery-random-seed",
-    minimum_minutes: int = 15,
-    maximum_minutes: int = 60,
+    minimum_minutes: int = 20,
+    maximum_minutes: int = 120,
 ) -> dict[str, Any]:
     _ensure_scheduler_schema()
-    minimum = max(1, int(minimum_minutes))
+    minimum = max(20, int(minimum_minutes))
     maximum = max(minimum, int(maximum_minutes))
     delay = minimum + secrets.randbelow(maximum - minimum + 1)
-    with _database._connect() as connection:  # noqa: SLF001 - same project module.
+
+    with _database._connect() as connection:  # noqa: SLF001
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -235,10 +225,10 @@ def _claim_seed_window(
             }
 
 
-def _schedule_retry(job_key: str = "gallery-random-seed", minutes: int = 15) -> None:
+def _schedule_retry(job_key: str = "gallery-random-seed", minutes: int = 20) -> None:
     try:
         _ensure_scheduler_schema()
-        with _database._connect() as connection:  # noqa: SLF001 - same project module.
+        with _database._connect() as connection:  # noqa: SLF001
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -247,7 +237,7 @@ def _schedule_retry(job_key: str = "gallery-random-seed", minutes: int = 15) -> 
                         updated_at = NOW()
                     WHERE job_key = %s
                     """,
-                    (max(1, int(minutes)), job_key),
+                    (max(20, int(minutes)), job_key),
                 )
     except Exception:
         pass
@@ -300,6 +290,7 @@ def _install_fastapi_route() -> None:
                         "ok": True,
                         "skipped": True,
                         "reason": "not_due",
+                        "schedule": "random-20-120m",
                         "nextRunAt": _iso(claim.get("nextRunAt")),
                         "lastRunAt": _iso(claim.get("lastRunAt")),
                     }
@@ -319,14 +310,6 @@ def _install_fastapi_route() -> None:
                         app_module.GALLERY_SEED_TARGET = previous_target
             except Exception as exc:
                 await asyncio.to_thread(_schedule_retry)
-                print(
-                    {
-                        "event": "random_gallery_seed_failed",
-                        "slot": slot,
-                        "error": repr(exc),
-                    },
-                    flush=True,
-                )
                 raise HTTPException(
                     status_code=502,
                     detail={"code": "gallery_seed_failed", "message": str(exc)},
@@ -334,7 +317,7 @@ def _install_fastapi_route() -> None:
 
             result.update(
                 {
-                    "schedule": "random-15-60m",
+                    "schedule": "random-20-120m",
                     "delayMinutes": claim["delayMinutes"],
                     "nextRunAt": _iso(claim.get("nextRunAt")),
                     "slot": slot,
