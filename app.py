@@ -155,6 +155,9 @@ app = FastAPI(
 )
 app.add_middleware(GZipMiddleware, minimum_size=1_000)
 
+from seo_oauth_runtime import register_routes as _register_oauth_routes
+_register_oauth_routes(app)
+
 _session: ort.InferenceSession | None = None
 _model_bundle: dict[str, Any] | None = None
 _session_lock = asyncio.Lock()
