@@ -62,12 +62,41 @@
     history[mode === "push" ? "pushState" : "replaceState"]({ view }, "", route);
   };
 
+  const originalBindChallengeVideo = bindChallengeVideo;
+  const bindVisibleChallengeVideo = (root) => {
+    if (!root || root.dataset.playbackBound === "1") return;
+    root.dataset.playbackBound = "1";
+    delete root.dataset.playbackPending;
+    originalBindChallengeVideo(root);
+  };
+
+  bindChallengeVideo = function routeSafeVideoBinding(root) {
+    const owningView = root?.closest?.(".view");
+    if (owningView?.hidden) {
+      root.dataset.playbackPending = "1";
+      const video = root.querySelector(".challenge-video");
+      if (video) {
+        video.autoplay = false;
+        video.muted = true;
+        video.pause();
+      }
+      return;
+    }
+    bindVisibleChallengeVideo(root);
+  };
+
   const originalShowView = showView;
+  const bindPendingVideo = (view) => {
+    const activeRoot = document.querySelector(`.view[data-view="${view}"] .challenge-root`);
+    if (activeRoot?.dataset.playbackPending === "1") bindVisibleChallengeVideo(activeRoot);
+  };
+
   const renderView = (name, mode = "replace") => {
     const view = routeForView[name] ? name : "daily";
     originalShowView(view);
     cleanLocation(view, mode);
     updateMetadata(view);
+    bindPendingVideo(view);
   };
 
   showView = function cleanRouteShowView(name) {
@@ -94,13 +123,18 @@
 
   const initialView = currentView();
   cleanLocation(initialView, "replace");
-  renderView(initialView, "replace");
+  updateMetadata(initialView);
+  if (document.body.dataset.view !== initialView) {
+    originalShowView(initialView);
+    bindPendingVideo(initialView);
+  }
 
   window.addEventListener("popstate", () => {
     const view = currentView();
     originalShowView(view);
     cleanLocation(view, "replace");
     updateMetadata(view);
+    bindPendingVideo(view);
   });
 
   window.addEventListener("pageshow", () => {
@@ -135,9 +169,7 @@
   fetch("/api/auth/status", { cache: "no-store" })
     .then((response) => response.ok ? response.json() : null)
     .then((status) => {
-      if (!status?.configured) return;
-      authLink.hidden = false;
-      if (status.authenticated && status.user?.username) {
+      if (status?.authenticated && status.user?.username) {
         authLink.textContent = status.user.username;
         authLink.href = "/api/auth/logout";
         authLink.title = "Sign out of osu!";
