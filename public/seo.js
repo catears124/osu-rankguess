@@ -1,4 +1,4 @@
-/* Clean routes, route-specific metadata, sharing, and optional osu! sign-in. */
+/* Clean routes, route-specific metadata, sharing, and required osu! sign-in for replay uploads. */
 (() => {
   const routeForView = {
     daily: "/daily",
@@ -20,7 +20,7 @@
     },
     analyze: {
       title: "osu! Replay Rank Predictor | Submit an .osr Replay",
-      description: "Upload an osu!standard .osr replay and estimate the player's global rank from replay telemetry, beatmap difficulty, score context, and an ONNX ensemble.",
+      description: "Sign in with osu!, upload an osu!standard .osr replay, and estimate the player's global rank from replay telemetry, beatmap difficulty, score context, and an ONNX ensemble.",
     },
     gallery: {
       title: "osu! Replay Rank Prediction Gallery | osu!rankguess",
@@ -47,6 +47,20 @@
     setMeta('link[rel="canonical"]', "href", canonical);
   };
 
+  const pauseAllMedia = () => {
+    document.querySelectorAll("video, audio").forEach((media) => {
+      try { media.pause(); } catch {}
+    });
+  };
+
+  const resetStaleDaily = (view) => {
+    if (view !== "daily" || typeof dailyPayload === "undefined" || !dailyPayload?.date) return;
+    const todayUTC = new Date().toISOString().slice(0, 10);
+    if (dailyPayload.date === todayUTC) return;
+    dailyPayload = null;
+    if (typeof dailyState !== "undefined") dailyState = null;
+  };
+
   const viewFromHash = () => {
     const value = location.hash.replace(/^#/, "");
     return value === "submit" ? "analyze" : value;
@@ -65,6 +79,8 @@
   const originalShowView = showView;
   const renderView = (name, mode = "replace") => {
     const view = routeForView[name] ? name : "daily";
+    pauseAllMedia();
+    resetStaleDaily(view);
     originalShowView(view);
     cleanLocation(view, mode);
     updateMetadata(view);
@@ -99,9 +115,7 @@
 
   window.addEventListener("popstate", () => {
     const view = currentView();
-    originalShowView(view);
-    cleanLocation(view, "replace");
-    updateMetadata(view);
+    renderView(view, "replace");
   });
 
   window.addEventListener("pageshow", () => {
@@ -129,18 +143,52 @@
   const authLink = document.querySelector("#osuAuthLink");
   if (!authLink) return;
 
+  const replayInput = document.querySelector("#replayInput");
+  const dropzone = document.querySelector("#dropzone");
+  const runButton = document.querySelector("#runButton");
+  const dropTitle = document.querySelector("#dropTitle");
+  const dropSubtitle = document.querySelector("#dropSubtitle");
+  const fileChip = document.querySelector("#fileChip");
+
+  const applySubmitAuthentication = (status) => {
+    const authenticated = Boolean(status?.authenticated);
+    document.body.dataset.osuAuthenticated = authenticated ? "true" : "false";
+
+    if (replayInput) replayInput.disabled = !authenticated;
+    if (dropzone) {
+      dropzone.setAttribute("aria-disabled", String(!authenticated));
+      dropzone.classList.toggle("auth-required", !authenticated);
+    }
+
+    if (!authenticated) {
+      if (runButton) runButton.disabled = true;
+      if (dropTitle) dropTitle.textContent = status?.configured === false
+        ? "osu! sign-in is unavailable"
+        : "sign in with osu! to submit";
+      if (dropSubtitle) dropSubtitle.textContent = "login is required before .osr parsing";
+      return;
+    }
+
+    if (fileChip?.hidden !== false) {
+      if (dropTitle) dropTitle.textContent = "choose .osr file";
+      if (dropSubtitle) dropSubtitle.textContent = "tap here or drop it";
+    }
+  };
+
   authLink.hidden = false;
   authLink.textContent = "sign in with osu!";
   authLink.href = "/api/auth/osu";
+  applySubmitAuthentication(null);
 
   fetch("/api/auth/status", { cache: "no-store" })
     .then((response) => response.ok ? response.json() : null)
     .then((status) => {
+      applySubmitAuthentication(status);
       if (status?.authenticated && status.user?.username) {
         authLink.textContent = status.user.username;
         authLink.href = "/api/auth/logout";
         authLink.title = "Sign out of osu!";
       }
     })
-    .catch(() => {});
+    .catch(() => applySubmitAuthentication(null));
 })();
