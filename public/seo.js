@@ -70,6 +70,22 @@
     updateMetadata(view);
   });
 
+  window.addEventListener("click", async (event) => {
+    const button = event.target instanceof Element ? event.target.closest("#shareDaily") : null;
+    if (!button) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const grid = document.querySelector(".share-grid")?.innerText?.trim() || "";
+    const date = document.querySelector(".daily-summary .kicker")?.textContent?.trim() || "";
+    const text = `osu!rankguess ${date}\n${grid}\n${location.origin}/daily`;
+    try {
+      await copyText(text);
+      button.textContent = "copied";
+    } catch {
+      button.textContent = "copy failed";
+    }
+  }, true);
+
   const authLink = document.querySelector("#osuAuthLink");
   if (!authLink) return;
 
