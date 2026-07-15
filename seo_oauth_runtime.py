@@ -1,4 +1,4 @@
-"""Optional osu! OAuth routes for osu!rankguess."""
+"""osu! OAuth routes and replay-upload authentication for osu!rankguess."""
 from __future__ import annotations
 
 import base64
@@ -17,6 +17,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse
 
 _INSTALLED = False
+_AUTHENTICATED_UPLOAD_PATHS = frozenset({
+    "/api/replay/cache",
+    "/api/ordr/render",
+})
 
 
 def _b64encode(value: bytes) -> str:
@@ -65,6 +69,11 @@ def _decode_user(value: str | None) -> dict[str, Any] | None:
         return None
 
 
+def authenticated_user(request: Request) -> dict[str, Any] | None:
+    """Return the signed osu! user stored in the browser session, if valid."""
+    return _decode_user(request.cookies.get("rankguess_osu_user"))
+
+
 def _configured() -> bool:
     return bool(os.getenv("OSU_CLIENT_ID") and os.getenv("OSU_CLIENT_SECRET"))
 
@@ -77,20 +86,39 @@ def _redirect_uri(request: Request) -> str:
 
 
 def register_routes(app: Any) -> None:
-    """Register OAuth routes directly on an existing FastAPI application."""
+    """Register OAuth routes and protect replay-upload parsing endpoints."""
     if getattr(app.state, "rankguess_oauth_routes", False):
         return
 
     app.state.rankguess_oauth_routes = True
 
+    @app.middleware("http")
+    async def require_osu_for_replay_uploads(request: Request, call_next):
+        if (
+            request.method.upper() == "POST"
+            and request.url.path in _AUTHENTICATED_UPLOAD_PATHS
+            and authenticated_user(request) is None
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "detail": {
+                        "code": "osu_auth_required",
+                        "message": "Sign in with osu! before analyzing a replay.",
+                    }
+                },
+            )
+        return await call_next(request)
+
     @app.get("/api/auth/status", include_in_schema=False)
     async def osu_auth_status(request: Request) -> JSONResponse:
-        user = _decode_user(request.cookies.get("rankguess_osu_user"))
+        user = authenticated_user(request)
         return JSONResponse(
             {
                 "configured": _configured(),
                 "authenticated": user is not None,
                 "user": user,
+                "replayUploadRequiresAuthentication": True,
             }
         )
 
@@ -164,7 +192,7 @@ def register_routes(app: Any) -> None:
             "countryCode": profile.get("country_code"),
             "exp": int(time.time()) + 7 * 24 * 60 * 60,
         }
-        response = RedirectResponse(url="/daily", status_code=302)
+        response = RedirectResponse(url="/submit", status_code=302)
         response.delete_cookie("rankguess_oauth_state", path="/")
         response.set_cookie(
             "rankguess_osu_user",
