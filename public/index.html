@@ -6,11 +6,28 @@
   <meta name="theme-color" content="#050506" />
   <meta name="color-scheme" content="dark" />
   <meta name="format-detection" content="telephone=no" />
-  <meta name="description" content="Guess osu! global ranks from replay clips, play the daily three, or analyze your own .osr." />
-  <title>osu!rankguess</title>
+  <meta name="description" content="Play a daily osu! rank guessing game, submit an .osr replay for ML rank prediction, or browse real replay predictions in the gallery." />
+  <meta name="keywords" content="osu rank guesser, osu guess the rank, osu rank guessing game, osu replay analyzer, osu rank predictor, osu daily challenge, osu standard replay, osr replay" />
+  <meta name="author" content="catears124" />
+  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
+  <link rel="canonical" href="https://osu-rankguess.vercel.app/daily" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="osu!rankguess" />
+  <meta property="og:title" content="osu!rankguess Daily | Guess the osu! Player Rank" />
+  <meta property="og:description" content="Watch osu!standard replay clips, guess each player's global rank, and compete against an ML rank predictor." />
+  <meta property="og:url" content="https://osu-rankguess.vercel.app/daily" />
+  <meta property="og:image" content="https://osu-rankguess.vercel.app/favicon.svg" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="osu!rankguess Daily | Guess the osu! Player Rank" />
+  <meta name="twitter:description" content="Watch osu!standard replay clips, guess each player's global rank, and compete against an ML rank predictor." />
+  <meta name="twitter:image" content="https://osu-rankguess.vercel.app/favicon.svg" />
+  <title>osu!rankguess Daily | Guess the osu! Player Rank</title>
   <link rel="icon" href="/favicon.svg" />
+  <link rel="manifest" href="/site.webmanifest" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="preconnect" href="https://osu.ppy.sh" />
+  <link rel="preconnect" href="https://apis.issou.best" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" />
   <link rel="stylesheet" href="/styles.css?v=15" />
   <link rel="stylesheet" href="/refine.css?v=17" />
@@ -18,19 +35,57 @@
   <link rel="stylesheet" href="/duel.css?v=1" />
   <link rel="stylesheet" href="/clean.css?v=2" />
   <link rel="stylesheet" href="/polish.css?v=3" />
-  <link rel="stylesheet" href="/fixes.css?v=4" />
+  <link rel="stylesheet" href="/fixes.css?v=5" />
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": ["WebApplication", "Game"],
+    "name": "osu!rankguess",
+    "url": "https://osu-rankguess.vercel.app/daily",
+    "applicationCategory": "GameApplication",
+    "operatingSystem": "Any",
+    "browserRequirements": "Requires JavaScript and a modern web browser",
+    "description": "A daily osu! rank guessing game and replay rank predictor for osu!standard gameplay.",
+    "isAccessibleForFree": true,
+    "author": {
+      "@type": "Person",
+      "name": "catears124",
+      "url": "https://github.com/catears124"
+    },
+    "sameAs": [
+      "https://github.com/catears124/osu-rankguess",
+      "https://github.com/catears124/osu-3k"
+    ],
+    "featureList": [
+      "Daily osu! rank guessing game",
+      "Unlimited replay rank guessing",
+      "osu!standard .osr replay rank prediction",
+      "Public prediction gallery",
+      "Optional osu! account sign-in"
+    ]
+  }
+  </script>
 </head>
 <body data-view="daily">
   <header class="site-header">
-    <a class="brand" href="#daily" data-view-link="daily"><span>osu!</span>rankguess</a>
+    <a class="brand" href="/daily" data-view-link="daily"><span>osu!</span>rankguess</a>
     <nav class="main-nav" aria-label="Main navigation">
-      <button class="nav-link active" type="button" data-view-link="daily">daily</button>
-      <button class="nav-link" type="button" data-view-link="infinite">infinite</button>
-      <button class="nav-link" type="button" data-view-link="analyze">analyze</button>
-      <button class="nav-link" type="button" data-view-link="gallery">gallery</button>
+      <a class="nav-link active" href="/daily" data-view-link="daily">daily</a>
+      <a class="nav-link" href="/infinite" data-view-link="infinite">infinite</a>
+      <a class="nav-link" href="/submit" data-view-link="analyze">submit</a>
+      <a class="nav-link" href="/gallery" data-view-link="gallery">gallery</a>
     </nav>
+    <a class="nav-link auth-link" id="osuAuthLink" href="/api/auth/osu" hidden>sign in with osu!</a>
     <span class="version-stamp">beta</span>
   </header>
+
+  <noscript>
+    <section>
+      <h1>osu!rankguess</h1>
+      <p>Guess osu! player ranks from replay clips, analyze an osu!standard .osr replay with a machine-learning model, and browse actual versus predicted ranks in the public gallery.</p>
+      <p>This application requires JavaScript to play videos, submit guesses, and run replay analysis.</p>
+    </section>
+  </noscript>
 
   <main>
     <section class="view active" id="view-daily" data-view="daily">
@@ -164,7 +219,10 @@
   <script src="/game.js?v=1" defer></script>
   <script src="/clean.js?v=2" defer></script>
   <script src="/polish.js?v=3" defer></script>
-  <script src="/fixes.js?v=2" defer></script>
-  <script src="/playback-fix.js?v=1" defer></script>
+  <script src="/fixes.js?v=5" defer></script>
+  <script src="/playback-fix.js?v=2" defer></script>
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js" crossorigin="anonymous" defer></script>
+  <script src="/pipeline-fix.js?v=3" defer></script>
+  <script src="/seo.js?v=1" defer></script>
 </body>
 </html>
