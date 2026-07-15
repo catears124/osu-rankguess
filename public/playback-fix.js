@@ -1,4 +1,4 @@
-/* Keep autoplay silent and only show the play prompt after an explicit pause. */
+/* Start challenge videos with sound on and keep click-to-pause behavior. */
 (() => {
   bindChallengeVideo = function fixedClickPlayback(root) {
     const video = root.querySelector(".challenge-video");
@@ -9,10 +9,11 @@
 
     let userPaused = false;
     video.autoplay = true;
-    video.defaultMuted = true;
-    video.muted = true;
+    video.defaultMuted = false;
+    video.muted = false;
     video.loop = true;
-    sound.textContent = "sound off";
+    sound.textContent = "sound on";
+    sound.classList.add("on");
 
     const hideHint = () => {
       if (!hint) return;
@@ -21,7 +22,7 @@
     };
 
     const showPlayHint = () => {
-      if (!hint || !userPaused) return;
+      if (!hint) return;
       hint.textContent = "click to play";
       hint.classList.add("visible");
     };
@@ -35,6 +36,7 @@
 
     const start = async () => {
       try {
+        video.muted = false;
         await video.play();
         userPaused = false;
         hideHint();
@@ -287,4 +289,42 @@
     attachResultDismiss(round, mode, panel);
     refreshCommunity(round, mode, challengeDate, panel);
   };
+})();
+
+/* Copy the daily result directly instead of opening the native share sheet. */
+(() => {
+  const copyTextDirectly = async (text) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  };
+
+  document.addEventListener("click", async (event) => {
+    const button = event.target instanceof Element ? event.target.closest("#shareDaily") : null;
+    if (!button) return;
+
+    event.preventDefault();
+    event.stopImmediatePropagation();
+
+    const grid = document.querySelector(".share-grid")?.innerText?.trim() || "";
+    const date = document.querySelector(".daily-summary .kicker")?.textContent?.trim() || "";
+    const text = `osu!rankguess ${date}\n${grid}\n${location.origin}/#daily`;
+
+    try {
+      await copyTextDirectly(text);
+      button.textContent = "copied";
+    } catch {
+      button.textContent = "copy failed";
+    }
+  }, true);
 })();
