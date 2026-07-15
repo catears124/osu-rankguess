@@ -62,41 +62,12 @@
     history[mode === "push" ? "pushState" : "replaceState"]({ view }, "", route);
   };
 
-  const originalBindChallengeVideo = bindChallengeVideo;
-  const bindVisibleChallengeVideo = (root) => {
-    if (!root || root.dataset.playbackBound === "1") return;
-    root.dataset.playbackBound = "1";
-    delete root.dataset.playbackPending;
-    originalBindChallengeVideo(root);
-  };
-
-  bindChallengeVideo = function routeSafeVideoBinding(root) {
-    const owningView = root?.closest?.(".view");
-    if (owningView?.hidden) {
-      root.dataset.playbackPending = "1";
-      const video = root.querySelector(".challenge-video");
-      if (video) {
-        video.autoplay = false;
-        video.muted = true;
-        video.pause();
-      }
-      return;
-    }
-    bindVisibleChallengeVideo(root);
-  };
-
   const originalShowView = showView;
-  const bindPendingVideo = (view) => {
-    const activeRoot = document.querySelector(`.view[data-view="${view}"] [data-playback-pending="1"]`);
-    if (activeRoot) bindVisibleChallengeVideo(activeRoot);
-  };
-
   const renderView = (name, mode = "replace") => {
     const view = routeForView[name] ? name : "daily";
     originalShowView(view);
     cleanLocation(view, mode);
     updateMetadata(view);
-    bindPendingVideo(view);
   };
 
   showView = function cleanRouteShowView(name) {
@@ -124,17 +95,13 @@
   const initialView = currentView();
   cleanLocation(initialView, "replace");
   updateMetadata(initialView);
-  if (document.body.dataset.view !== initialView) {
-    originalShowView(initialView);
-    bindPendingVideo(initialView);
-  }
+  if (document.body.dataset.view !== initialView) originalShowView(initialView);
 
   window.addEventListener("popstate", () => {
     const view = currentView();
     originalShowView(view);
     cleanLocation(view, "replace");
     updateMetadata(view);
-    bindPendingVideo(view);
   });
 
   window.addEventListener("pageshow", () => {
