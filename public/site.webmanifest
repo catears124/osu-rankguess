@@ -1,0 +1,18 @@
+{
+  "name": "osu!rankguess",
+  "short_name": "rankguess",
+  "description": "Guess osu! player ranks from replay clips or analyze an osu!standard replay with a machine-learning rank predictor.",
+  "start_url": "/daily",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#050506",
+  "theme_color": "#050506",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
