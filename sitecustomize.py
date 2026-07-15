@@ -73,3 +73,9 @@ try:
     _community_display.install()
 except Exception:  # pragma: no cover - never block application startup for optional community features.
     pass
+
+try:
+    import seo_oauth_runtime as _seo_oauth_runtime
+    _seo_oauth_runtime.install()
+except Exception:  # pragma: no cover - OAuth is optional and must never block startup.
+    pass
