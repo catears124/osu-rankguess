@@ -1,0 +1,270 @@
+name: checks
+
+on:
+  push:
+    branches:
+      - lock-in-daily-review
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile Python
+        run: python -m compileall -q app.py database.py seo_oauth_runtime.py backend runtime
+
+      - name: Check browser scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+          done < <(find public -maxdepth 1 -name '*.js' -print0 | sort -z)
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --quiet \
+            "fastapi>=0.117.1,<1.0" \
+            "httpx>=0.28.1,<1.0" \
+            "numpy>=2.0,<3.0" \
+            "onnxruntime>=1.22,<2.0" \
+            "rosu-pp-py>=4.0.2,<5" \
+            "python-multipart>=0.0.20,<1.0" \
+            "psycopg[binary]>=3.2,<4.0" \
+            "uvicorn>=0.35,<1.0"
+
+      - name: Smoke-test imports and routes
+        run: |
+          mkdir -p /tmp/import-smoke
+          python - <<'PY'
+          import json
+          import sys
+          import traceback
+          from pathlib import Path
+
+          report = {
+              "cwd": str(Path.cwd()),
+              "sysPath": list(sys.path),
+              "rootFiles": {
+                  name: Path(name).exists()
+                  for name in (
+                      "app.py",
+                      "database.py",
+                      "seo_oauth_runtime.py",
+                      "replay_features.py",
+                      "render_jobs.py",
+                      "sitecustomize.py",
+                  )
+              },
+          }
+          try:
+              import app
+              import database
+
+              report["appFile"] = getattr(app, "__file__", None)
+              report["databaseFile"] = getattr(database, "__file__", None)
+              report["moduleAliases"] = {
+                  name: getattr(sys.modules.get(name), "__file__", None)
+                  for name in (
+                      "database",
+                      "replay_features",
+                      "render_jobs",
+                      "community_runtime",
+                      "cron_runtime",
+                      "seo_oauth_runtime",
+                      "ordr_recovery",
+                  )
+              }
+
+              assert Path("database.py").exists()
+              assert Path("seo_oauth_runtime.py").exists()
+              assert not Path("replay_features.py").exists()
+              assert not Path("render_jobs.py").exists()
+              assert not Path("sitecustomize.py").exists()
+              assert Path("backend/database.py").exists()
+              assert Path("backend/replay_features.py").exists()
+              assert Path("backend/render_jobs.py").exists()
+              assert Path("runtime/bootstrap.py").exists()
+
+              routes = {route.path for route in app.app.routes}
+              report["routes"] = sorted(routes)
+              for path in (
+                  "/api/auth/status",
+                  "/api/challenge/daily",
+                  "/api/challenge/{replay_id}/distribution",
+                  "/api/cron/seed-gallery",
+                  "/api/cron/tick",
+              ):
+                  assert path in routes, path
+
+              distribution = database.challenge_guess_distribution(
+                  replay_id="local-smoke-replay",
+                  mode="daily",
+                  challenge_key="2026-07-15",
+                  rank_population=5_500_000,
+              )
+              report["distribution"] = distribution
+              assert len(distribution["bins"]) == 12, distribution
+              assert distribution["observedCount"] == 0, distribution
+              assert distribution["baselineCount"] > 0, distribution
+              report["ok"] = True
+          except Exception as error:
+              report["ok"] = False
+              report["error"] = repr(error)
+              report["traceback"] = traceback.format_exc()
+              raise
+          finally:
+              Path("/tmp/import-smoke/report.json").write_text(
+                  json.dumps(report, indent=2, sort_keys=True, default=str),
+                  encoding="utf-8",
+              )
+          PY
+
+      - name: Upload import diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: import-smoke
+          path: /tmp/import-smoke/report.json
+          if-no-files-found: warn
+
+      - name: Install browser test runtime
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Test completed daily review flow
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ui-smoke
+          python scripts/devserver.py 8000 >/tmp/ui-smoke/devserver.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent http://127.0.0.1:8000/api/health >/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+
+          python - <<'PY'
+          import json
+          import traceback
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+
+          report = {"console": [], "pageErrors": [], "steps": []}
+          page = None
+          browser = None
+          try:
+              actual_ranks = [12_345, 850, 233_000]
+              with sync_playwright() as playwright:
+                  browser = playwright.chromium.launch()
+                  page = browser.new_page(viewport={"width": 1440, "height": 1000})
+                  page.on("console", lambda message: report["console"].append(f"{message.type}: {message.text}"))
+                  page.on("pageerror", lambda error: report["pageErrors"].append(str(error)))
+                  page.goto("http://127.0.0.1:8000/index.html", wait_until="domcontentloaded")
+                  page.wait_for_selector("#dailyRoot .polish-shell")
+                  report["steps"].append("daily mounted")
+
+                  for index, actual_rank in enumerate(actual_ranks):
+                      rank_input = page.locator("#dailyRoot .rank-number-input")
+                      rank_input.fill(str(actual_rank))
+                      page.locator("#dailyRoot .guess-submit").click()
+                      page.wait_for_selector("#dailyRoot .result-backdrop:not([hidden])")
+                      report["steps"].append(f"round {index + 1} revealed")
+
+                      community = page.locator("#dailyRoot .community-distribution")
+                      community.wait_for()
+                      report[f"round{index + 1}Community"] = {
+                          "class": community.get_attribute("class"),
+                          "text": community.inner_text(),
+                      }
+                      assert "loading" not in (community.get_attribute("class") or "")
+                      assert "loading" not in community.inner_text().lower()
+
+                      if index == 0:
+                          backdrop = page.locator("#dailyRoot .result-backdrop")
+                          backdrop.click(position={"x": 4, "y": 4})
+                          page.wait_for_selector("#dailyRoot .result-after-dock")
+                          assert page.locator("#dailyRoot .guess-form").is_hidden()
+                          assert page.locator("#dailyRoot .challenge-video").count() == 1
+                          page.locator("#dailyRoot .result-show").click()
+                          page.wait_for_selector("#dailyRoot .result-backdrop:not([hidden])")
+                          report["steps"].append("result dismissed and reopened")
+
+                      page.locator("#dailyRoot .result-backdrop .next-challenge").click()
+
+                  page.wait_for_selector("#dailyRoot .daily-summary")
+                  report["steps"].append("daily summary")
+                  review_buttons = page.locator("#dailyRoot [data-review-daily]")
+                  report["reviewButtonCount"] = review_buttons.count()
+                  assert review_buttons.count() == 3
+                  review_buttons.nth(0).click()
+
+                  page.wait_for_selector("#dailyRoot .result-backdrop:not([hidden])")
+                  report["reviewGuessList"] = page.locator("#dailyRoot .guess-list").inner_text()
+                  report["reviewResultTurns"] = page.locator("#dailyRoot .result-turn:not(.result-turn-head)").count()
+                  assert page.locator("#dailyRoot .guess-form").is_hidden()
+                  assert "#12,345" in report["reviewGuessList"]
+                  assert report["reviewResultTurns"] == 1
+                  assert "loading" not in page.locator("#dailyRoot .community-distribution").inner_text().lower()
+
+                  daily_buttons = page.locator("#dailyRoot [data-daily-index]")
+                  report["dailyButtons"] = [
+                      {"disabled": daily_buttons.nth(index).is_disabled(), "text": daily_buttons.nth(index).inner_text()}
+                      for index in range(daily_buttons.count())
+                  ]
+                  assert daily_buttons.count() == 3
+                  assert all(not daily_buttons.nth(index).is_disabled() for index in range(3))
+
+                  page.locator("#dailyRoot .result-backdrop").click(position={"x": 4, "y": 4})
+                  page.wait_for_selector("#dailyRoot .result-after-dock")
+                  assert page.locator("#dailyRoot .guess-form").is_hidden()
+                  assert page.locator("#dailyRoot .video-play").count() == 1
+                  report["ok"] = True
+          except Exception as error:
+              report["ok"] = False
+              report["error"] = repr(error)
+              report["traceback"] = traceback.format_exc()
+              raise
+          finally:
+              if page is not None:
+                  try:
+                      page.screenshot(path="/tmp/ui-smoke/page.png", full_page=True)
+                      Path("/tmp/ui-smoke/page.html").write_text(page.content(), encoding="utf-8")
+                  except Exception as capture_error:
+                      report["captureError"] = repr(capture_error)
+              if browser is not None:
+                  try:
+                      browser.close()
+                  except Exception:
+                      pass
+              Path("/tmp/ui-smoke/report.json").write_text(
+                  json.dumps(report, indent=2, sort_keys=True),
+                  encoding="utf-8",
+              )
+          PY
+
+      - name: Upload browser diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-smoke
+          path: /tmp/ui-smoke
+          if-no-files-found: warn
