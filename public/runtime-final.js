@@ -1,5 +1,6 @@
 (() => {
   const states = new WeakMap();
+  let activeVideo = null;
 
   const visible = (video) => {
     const view = video.closest(".view");
@@ -41,10 +42,24 @@
     }
   };
 
+  const pauseOthers = (current) => {
+    document.querySelectorAll("video").forEach((other) => {
+      if (other === current || other.paused) return;
+      other.pause();
+      if (other.classList.contains("challenge-video")) sync(other);
+    });
+    if (activeVideo && activeVideo !== current && !activeVideo.paused) {
+      activeVideo.pause();
+      sync(activeVideo);
+    }
+    activeVideo = current;
+  };
+
   const attemptPlay = async (video, preferSound = true) => {
     const state = states.get(video);
     if (!state || state.userPaused || !visible(video)) return false;
 
+    pauseOthers(video);
     video.autoplay = true;
     video.loop = true;
     video.playsInline = true;
@@ -77,6 +92,16 @@
     video.loop = true;
     video.playsInline = true;
     video.preload = "auto";
+
+    try {
+      source.pause();
+      source.muted = true;
+      source.removeAttribute("src");
+      source.querySelectorAll("source").forEach((node) => node.removeAttribute("src"));
+      source.load();
+    } catch {
+      // The replacement below still removes any listeners attached by older layers.
+    }
     source.replaceWith(video);
 
     const wrap = video.closest(".video-wrap");
@@ -94,7 +119,14 @@
     video.defaultMuted = false;
     video.muted = false;
 
-    video.addEventListener("play", () => sync(video));
+    video.addEventListener("play", () => {
+      if (!visible(video)) {
+        video.pause();
+        return;
+      }
+      pauseOthers(video);
+      sync(video);
+    });
     video.addEventListener("pause", () => sync(video));
     video.addEventListener("volumechange", () => sync(video));
     video.addEventListener("loadeddata", () => attemptPlay(video, true), { once: true });
@@ -112,11 +144,32 @@
     root.querySelectorAll?.(".challenge-video").forEach(initialize);
   };
 
+  const reconcilePlayback = () => {
+    const visibleVideos = [];
+    document.querySelectorAll(".challenge-video").forEach((source) => {
+      const video = initialize(source);
+      if (!visible(video)) {
+        if (!video.paused) video.pause();
+        sync(video);
+        return;
+      }
+      visibleVideos.push(video);
+    });
+
+    const preferred = visibleVideos.find((video) => !states.get(video)?.userPaused) || null;
+    if (preferred && preferred.paused) attemptPlay(preferred, !preferred.muted);
+    visibleVideos.forEach((video) => {
+      if (video !== preferred && !video.paused) video.pause();
+      sync(video);
+    });
+  };
+
   bindChallengeVideo = function definitiveVideoBinding(root) {
     if (!root) return;
     root.dataset.playbackBound = "1";
     delete root.dataset.playbackPending;
     initializeWithin(root);
+    reconcilePlayback();
   };
 
   document.addEventListener("click", async (event) => {
@@ -154,34 +207,25 @@
     } else {
       state.userPaused = true;
       video.pause();
+      if (activeVideo === video) activeVideo = null;
       sync(video);
       showHint(video, "paused");
     }
   }, true);
 
-  const refreshVisibility = (view) => {
-    view.querySelectorAll(".challenge-video").forEach((source) => {
-      const video = initialize(source);
-      const state = states.get(video);
-      if (view.hidden) {
-        video.pause();
-      } else if (!state.userPaused) {
-        attemptPlay(video, !video.muted);
-      }
-      sync(video);
-    });
-  };
-
   const observer = new MutationObserver((mutations) => {
+    let shouldReconcile = false;
     for (const mutation of mutations) {
       if (mutation.type === "childList") {
         mutation.addedNodes.forEach((node) => {
           if (node instanceof Element) initializeWithin(node);
         });
-      } else if (mutation.type === "attributes" && mutation.target instanceof Element) {
-        refreshVisibility(mutation.target);
+        shouldReconcile = true;
+      } else if (mutation.type === "attributes") {
+        shouldReconcile = true;
       }
     }
+    if (shouldReconcile) queueMicrotask(reconcilePlayback);
   });
 
   observer.observe(document.documentElement, {
@@ -191,5 +235,15 @@
     attributeFilter: ["hidden"],
   });
 
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      document.querySelectorAll("video").forEach((video) => video.pause());
+      activeVideo = null;
+    } else {
+      reconcilePlayback();
+    }
+  });
+
   initializeWithin(document);
+  reconcilePlayback();
 })();
