@@ -12,7 +12,10 @@
 
   const bestRatio = (guesses, actualRank) => {
     if (!Array.isArray(guesses) || !guesses.length) return Infinity;
-    return Math.min(...guesses.map((guess) => rankRatio(guess?.guessRank, actualRank)));
+    const ratios = guesses
+      .filter(Boolean)
+      .map((guess) => rankRatio(guess?.guessRank, actualRank));
+    return ratios.length ? Math.min(...ratios) : Infinity;
   };
 
   const firstHit = (guesses) => Array.isArray(guesses)
@@ -39,6 +42,75 @@
   };
 
   const ratioText = (value) => Number.isFinite(value) ? `${value.toFixed(2)}×` : "—";
+
+  const verdictFor = (round) => {
+    const winner = winnerFor(round);
+    const playerHit = firstHit(round.guesses);
+    const botHit = firstHit(round.botGuesses);
+    const playerRatio = bestRatio(round.guesses, round.actualRank);
+    const botRatio = bestRatio(round.botGuesses, round.actualRank);
+    const heading = winner === "player" ? "you win" : winner === "bot" ? "rankbot wins" : "tie";
+
+    if (playerHit >= 0 || botHit >= 0) {
+      if (playerHit >= 0 && botHit >= 0) {
+        if (playerHit < botHit) {
+          return {
+            winner,
+            heading,
+            comparison: "you were faster",
+            detail: `you turn ${playerHit + 1} · rankbot turn ${botHit + 1}`,
+          };
+        }
+        if (botHit < playerHit) {
+          return {
+            winner,
+            heading,
+            comparison: "rankbot was faster",
+            detail: `rankbot turn ${botHit + 1} · you turn ${playerHit + 1}`,
+          };
+        }
+        if (winner === "player") {
+          return {
+            winner,
+            heading,
+            comparison: "you were closer",
+            detail: `same turn · you ${ratioText(playerRatio)} · rankbot ${ratioText(botRatio)}`,
+          };
+        }
+        if (winner === "bot") {
+          return {
+            winner,
+            heading,
+            comparison: "rankbot was closer",
+            detail: `same turn · you ${ratioText(playerRatio)} · rankbot ${ratioText(botRatio)}`,
+          };
+        }
+        return { winner, heading, comparison: "same speed and error", detail: `both turn ${playerHit + 1}` };
+      }
+
+      if (playerHit >= 0) {
+        return {
+          winner,
+          heading,
+          comparison: "you were faster",
+          detail: `you solved on turn ${playerHit + 1} · rankbot did not`,
+        };
+      }
+      return {
+        winner,
+        heading,
+        comparison: "rankbot was faster",
+        detail: `rankbot solved on turn ${botHit + 1} · you did not`,
+      };
+    }
+
+    return {
+      winner,
+      heading,
+      comparison: winner === "player" ? "you were closer" : winner === "bot" ? "rankbot was closer" : "same error",
+      detail: `you ${ratioText(playerRatio)} · rankbot ${ratioText(botRatio)}`,
+    };
+  };
 
   const estimateActual = (guessRank, result) => {
     if (Number(result?.actualRank) > 0) return Number(result.actualRank);
@@ -68,6 +140,7 @@
     let lower = 1;
     let upper = rankPopulation;
     for (const guess of round.botGuesses || []) {
+      if (!guess) continue;
       const value = clamp(Math.round(Number(guess?.guessRank) || 1), 1, rankPopulation);
       if (guess?.direction === "better") upper = Math.min(upper, Math.max(1, value - 1));
       if (guess?.direction === "worse") lower = Math.max(lower, Math.min(rankPopulation, value + 1));
@@ -82,7 +155,8 @@
     }
 
     const { lower, upper } = botRange(round);
-    const previous = clamp(Math.round(Number(round.botGuesses.at(-1)?.guessRank) || openingGuess || 50_000), lower, upper);
+    const previousGuess = [...(round.botGuesses || [])].reverse().find(Boolean);
+    const previous = clamp(Math.round(Number(previousGuess?.guessRank) || openingGuess || 50_000), lower, upper);
     const left = rankToSoftPosition(lower) / SLIDER_STEPS;
     const right = rankToSoftPosition(upper) / SLIDER_STEPS;
     const previousPosition = rankToSoftPosition(previous) / SLIDER_STEPS;
@@ -105,16 +179,65 @@
     list.innerHTML = (round.guesses || []).map((guess) => `<li class="duel-turn ${guess?.correct ? "player-hit" : ""}"><div class="guess-summary"><span>${directionLabel(guess)}:</span><strong>${formatRank(guess?.guessRank)}</strong></div></li>`).join("");
   };
 
+  const communityDistributionHTML = (round, mode) => {
+    if (mode !== "daily") return "";
+    const distribution = round.distribution;
+    const bins = Array.isArray(distribution?.bins) ? distribution.bins : [];
+    if (!bins.length) {
+      return `<section class="community-distribution loading" data-community-distribution>
+        <div class="community-distribution-head"><span>community distribution</span><small>loading…</small></div>
+      </section>`;
+    }
+
+    const observed = Number(distribution.observedCount ?? distribution.count) || 0;
+    const baseline = Number(distribution.baselineCount) || 0;
+    const maximum = Math.max(1, ...bins.map((bin) => Number(bin?.count) || 0));
+    const actual = Number(round.actualRank) || 0;
+    const firstGuess = Number(round.guesses?.[0]?.guessRank) || 0;
+    const bars = bins.map((bin) => {
+      const lower = Number(bin?.lower) || 1;
+      const upper = Number(bin?.upper) || lower;
+      const count = Math.max(0, Number(bin?.count) || 0);
+      const height = count > 0 ? Math.max(7, count / maximum * 100) : 0;
+      const classes = [
+        actual >= lower && actual <= upper ? "actual" : "",
+        firstGuess >= lower && firstGuess <= upper ? "yours" : "",
+      ].filter(Boolean).join(" ");
+      const observedInBin = Math.max(0, Number(bin?.observedCount) || 0);
+      const title = `${formatRank(lower)}–${formatRank(upper)} · ${observedInBin} real`;
+      return `<span class="community-bar ${classes}" title="${escapeHTML(title)}"><i style="height:${height.toFixed(2)}%"></i></span>`;
+    }).join("");
+    const countLabel = `${observed.toLocaleString()} real ${observed === 1 ? "guess" : "guesses"}`;
+    const smoothingLabel = baseline > 0 ? " · baseline-smoothed" : "";
+
+    return `<section class="community-distribution" data-community-distribution>
+      <div class="community-distribution-head"><span>community distribution</span><small>${countLabel}${smoothingLabel}</small></div>
+      <div class="community-chart" aria-label="Distribution of first guesses from the community">
+        <div class="community-bars">${bars}</div>
+      </div>
+      <div class="community-axis"><span>${formatRank(1)}</span><span>${formatRank(rankPopulation)}</span></div>
+      <p><i></i> actual range <b></b> your first-guess range${baseline > 0 ? " · baseline fades as real guesses arrive" : ""}</p>
+    </section>`;
+  };
+
+  const hydrateCommunityDistribution = async (round, mode, challengeDate, panel) => {
+    if (mode !== "daily" || Array.isArray(round.distribution?.bins)) return;
+    try {
+      const query = new URLSearchParams({ mode: "daily" });
+      if (challengeDate) query.set("challengeDate", challengeDate);
+      const payload = await requestJSON(`/api/challenge/${encodeURIComponent(round.item.id)}/distribution?${query}`);
+      round.distribution = payload.distribution || null;
+      const host = panel.querySelector("[data-community-distribution]");
+      if (host) host.outerHTML = communityDistributionHTML(round, mode);
+      saveDailyState();
+    } catch {
+      const host = panel.querySelector("[data-community-distribution]");
+      if (host) host.remove();
+    }
+  };
+
   const resultHTML = (round, mode) => {
-    const winner = winnerFor(round);
-    const playerRatio = bestRatio(round.guesses, round.actualRank);
-    const botRatio = bestRatio(round.botGuesses, round.actualRank);
-    const heading = winner === "player" ? "you win" : winner === "bot" ? "rankbot wins" : "tie";
-    const comparison = winner === "player"
-      ? "closer than rankbot"
-      : winner === "bot"
-        ? "rankbot was closer"
-        : "same error";
+    const verdict = verdictFor(round);
     const turns = (round.guesses || []).map((guess, index) => {
       const botGuess = round.botGuesses?.[index];
       return `<div class="result-turn"><span>${String(index + 1).padStart(2, "0")}</span><strong>${formatRank(guess?.guessRank)}</strong><strong>${formatRank(botGuess?.guessRank)}</strong></div>`;
@@ -125,15 +248,16 @@
         <span class="result-kicker">actual rank</span>
         <strong class="result-actual">${formatRank(round.actualRank)}</strong>
         <small class="result-player">${escapeHTML(round.player || "player")}</small>
-        <div class="result-verdict ${winner}">
-          <span id="roundResultTitle">${heading}</span>
-          <strong>${comparison}</strong>
-          <small>you ${ratioText(playerRatio)} · rankbot ${ratioText(botRatio)}</small>
+        <div class="result-verdict ${verdict.winner}">
+          <span id="roundResultTitle">${verdict.heading}</span>
+          <strong>${verdict.comparison}</strong>
+          <small>${verdict.detail}</small>
         </div>
         <div class="result-turns" aria-label="Final guesses">
           <div class="result-turn result-turn-head"><span>turn</span><span>you</span><span>rankbot</span></div>
           ${turns}
         </div>
+        ${communityDistributionHTML(round, mode)}
         <button class="primary-button next-challenge" type="button">${mode === "daily" ? "next" : "next replay"}</button>
       </section>
     </div>`;
@@ -171,15 +295,18 @@
       logError: Number(result.logError) || 0,
     };
 
-    const openingGuess = Number(round.botOpening || round.botGuesses?.[0]?.guessRank || result.botGuess) || 50_000;
+    const openingGuess = Number(round.botOpening || round.botGuesses?.find(Boolean)?.guessRank || result.botGuess) || 50_000;
     round.botOpening = openingGuess;
-    const botGuessRank = chooseBotGuess(round, attempt, openingGuess);
-    const botGuess = evaluateGuess(botGuessRank, actualEstimate);
+    const botAlreadySolved = firstHit(round.botGuesses) >= 0;
+    const botGuess = botAlreadySolved
+      ? null
+      : evaluateGuess(chooseBotGuess(round, attempt, openingGuess), actualEstimate);
 
     round.guesses.push(playerGuess);
     round.botGuesses.push(botGuess);
 
-    const shouldReveal = playerGuess.correct || botGuess.correct || attempt >= MAX_ATTEMPTS;
+    // Rankbot can finish early, but the player always keeps all five turns.
+    const shouldReveal = playerGuess.correct || attempt >= MAX_ATTEMPTS;
     if (shouldReveal && !(Number(result.actualRank) > 0)) {
       result = await requestJSON("/api/challenge/guess", {
         method: "POST",
@@ -219,6 +346,7 @@
     if (!panel) return;
     panel.hidden = false;
     panel.innerHTML = resultHTML(round, mode);
+    hydrateCommunityDistribution(round, mode, challengeDate, panel);
     const dialog = panel.querySelector(".result-dialog");
     requestAnimationFrame(() => dialog?.focus({ preventScroll: true }));
     panel.querySelector(".next-challenge")?.addEventListener("click", () => {
