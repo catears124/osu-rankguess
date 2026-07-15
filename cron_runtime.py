@@ -16,6 +16,8 @@ _JOB_KEY = "gallery-random-seed-v2"
 _MINIMUM_MINUTES = 20
 _MAXIMUM_MINUTES = 120
 _RETRY_MINUTES = 20
+_ORIGINAL_CLAIM_SEED_WINDOW = _community._claim_seed_window  # noqa: SLF001
+_ORIGINAL_SCHEDULE_RETRY = _community._schedule_retry  # noqa: SLF001
 
 
 def _iso(value: Any) -> str | None:
@@ -37,16 +39,30 @@ def _daily_status() -> dict[str, Any]:
     }
 
 
+def _claim_seed_window(
+    job_key: str = "gallery-random-seed",
+    minimum_minutes: int = _MINIMUM_MINUTES,
+    maximum_minutes: int = _MAXIMUM_MINUTES,
+) -> dict[str, Any]:
+    """Use the requested 20-minute to two-hour window for every cron caller."""
+    minimum = max(_MINIMUM_MINUTES, int(minimum_minutes))
+    maximum = max(minimum, int(maximum_minutes))
+    return _ORIGINAL_CLAIM_SEED_WINDOW(job_key, minimum, maximum)
+
+
+def _schedule_retry(
+    job_key: str = "gallery-random-seed",
+    minutes: int = _RETRY_MINUTES,
+) -> None:
+    _ORIGINAL_SCHEDULE_RETRY(job_key, max(_RETRY_MINUTES, int(minutes)))
+
+
 def _claim_window() -> dict[str, Any]:
-    return _community._claim_seed_window(  # noqa: SLF001 - same application runtime.
-        _JOB_KEY,
-        _MINIMUM_MINUTES,
-        _MAXIMUM_MINUTES,
-    )
+    return _claim_seed_window(_JOB_KEY, _MINIMUM_MINUTES, _MAXIMUM_MINUTES)
 
 
-def _schedule_retry() -> None:
-    _community._schedule_retry(_JOB_KEY, _RETRY_MINUTES)  # noqa: SLF001
+def _retry_current_job() -> None:
+    _schedule_retry(_JOB_KEY, _RETRY_MINUTES)
 
 
 def _install_fastapi_route() -> None:
@@ -118,7 +134,7 @@ def _install_fastapi_route() -> None:
                         app_module.GALLERY_SEED_TARGET = previous_target
                 daily_after = await asyncio.to_thread(_daily_status)
             except Exception as exc:
-                await asyncio.to_thread(_schedule_retry)
+                await asyncio.to_thread(_retry_current_job)
                 print(
                     json.dumps(
                         {
@@ -162,5 +178,7 @@ def install() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
+    _community._claim_seed_window = _claim_seed_window  # noqa: SLF001
+    _community._schedule_retry = _schedule_retry  # noqa: SLF001
     _install_fastapi_route()
     _INSTALLED = True
