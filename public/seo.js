@@ -87,8 +87,8 @@
 
   const originalShowView = showView;
   const bindPendingVideo = (view) => {
-    const activeRoot = document.querySelector(`.view[data-view="${view}"] .challenge-root`);
-    if (activeRoot?.dataset.playbackPending === "1") bindVisibleChallengeVideo(activeRoot);
+    const activeRoot = document.querySelector(`.view[data-view="${view}"] [data-playback-pending="1"]`);
+    if (activeRoot) bindVisibleChallengeVideo(activeRoot);
   };
 
   const renderView = (name, mode = "replace") => {
