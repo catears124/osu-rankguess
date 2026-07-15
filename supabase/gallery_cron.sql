@@ -2,8 +2,9 @@
 --   rankguess_site_url    https://your-production-domain.example
 --   rankguess_cron_secret the same value as Vercel's CRON_SECRET
 --
--- Supabase calls the endpoint every five minutes. The application keeps actual
--- gallery submissions 15 to 60 minutes apart with an atomic Postgres gate.
+-- Supabase calls the endpoint every ten minutes. The application keeps actual
+-- gallery submissions randomly spaced 20 to 120 minutes apart with an atomic
+-- Postgres gate, and prewarms the current UTC daily challenge on every tick.
 
 create extension if not exists pg_cron;
 create extension if not exists pg_net;
@@ -26,7 +27,7 @@ $$;
 
 select cron.schedule(
     'rankguess-seed-gallery',
-    '*/5 * * * *',
+    '3,13,23,33,43,53 * * * *',
     $cron$
     select net.http_get(
         url := rtrim(
@@ -37,7 +38,7 @@ select cron.schedule(
                  limit 1
             ),
             '/'
-        ) || '/api/cron/seed-gallery',
+        ) || '/api/cron/tick',
         headers := jsonb_build_object(
             'Authorization',
             'Bearer ' || (
@@ -49,7 +50,7 @@ select cron.schedule(
             'Accept',
             'application/json'
         ),
-        timeout_milliseconds := 200000
+        timeout_milliseconds := 230000
     );
     $cron$
 );
