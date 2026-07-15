@@ -9,8 +9,31 @@
   "redirects": [
     {
       "source": "/",
-      "destination": "/index.html",
-      "permanent": false
+      "destination": "/daily",
+      "permanent": true
+    },
+    {
+      "source": "/index.html",
+      "destination": "/daily",
+      "permanent": true
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/daily",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/infinite",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/submit",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/gallery",
+      "destination": "/index.html"
     }
   ],
   "headers": [
@@ -33,6 +56,15 @@
         {
           "key": "Cache-Control",
           "value": "no-store, max-age=0"
+        }
+      ]
+    },
+    {
+      "source": "/(robots.txt|sitemap.xml|site.webmanifest)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=3600"
         }
       ]
     }
