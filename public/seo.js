@@ -1,4 +1,4 @@
-/* Clean routes, route-specific metadata, and optional osu! sign-in. */
+/* Clean routes, route-specific metadata, sharing, and optional osu! sign-in. */
 (() => {
   const routeForView = {
     daily: "/daily",
@@ -6,7 +6,9 @@
     analyze: "/submit",
     gallery: "/gallery",
   };
-  const viewForRoute = Object.fromEntries(Object.entries(routeForView).map(([view, route]) => [route, view]));
+  const viewForRoute = Object.fromEntries(
+    Object.entries(routeForView).map(([view, route]) => [route, view]),
+  );
   const metadata = {
     daily: {
       title: "osu!rankguess Daily | Guess the osu! Player Rank",
@@ -45,12 +47,31 @@
     setMeta('link[rel="canonical"]', "href", canonical);
   };
 
+  const viewFromHash = () => {
+    const value = location.hash.replace(/^#/, "");
+    return value === "submit" ? "analyze" : value;
+  };
+
+  const currentView = () => viewForRoute[location.pathname]
+    || (routeForView[viewFromHash()] ? viewFromHash() : null)
+    || "daily";
+
+  const cleanLocation = (view, mode = "replace") => {
+    const route = routeForView[view] || routeForView.daily;
+    if (location.pathname === route && !location.hash) return;
+    history[mode === "push" ? "pushState" : "replaceState"]({ view }, "", route);
+  };
+
   const originalShowView = showView;
-  showView = function cleanRouteShowView(name) {
+  const renderView = (name, mode = "replace") => {
     const view = routeForView[name] ? name : "daily";
     originalShowView(view);
-    history.replaceState({ view }, "", routeForView[view]);
+    cleanLocation(view, mode);
     updateMetadata(view);
+  };
+
+  showView = function cleanRouteShowView(name) {
+    renderView(name, "replace");
   };
 
   document.querySelectorAll("[data-view-link]").forEach((link) => {
@@ -58,15 +79,33 @@
     if (route) link.setAttribute("href", route);
   });
 
-  const initialView = viewForRoute[location.pathname]
-    || (location.hash ? ({ submit: "analyze" }[location.hash.slice(1)] || location.hash.slice(1)) : null)
-    || "daily";
-  showView(initialView);
+  document.addEventListener("click", (event) => {
+    const link = event.target instanceof Element
+      ? event.target.closest("[data-view-link]")
+      : null;
+    if (!link) return;
+    const view = link.dataset.viewLink;
+    if (!routeForView[view]) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    renderView(view, location.pathname === routeForView[view] ? "replace" : "push");
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }, true);
+
+  const initialView = currentView();
+  cleanLocation(initialView, "replace");
+  renderView(initialView, "replace");
 
   window.addEventListener("popstate", () => {
-    const view = viewForRoute[location.pathname] || "daily";
+    const view = currentView();
     originalShowView(view);
-    history.replaceState({ view }, "", routeForView[view]);
+    cleanLocation(view, "replace");
+    updateMetadata(view);
+  });
+
+  window.addEventListener("pageshow", () => {
+    const view = currentView();
+    cleanLocation(view, "replace");
     updateMetadata(view);
   });
 
@@ -89,6 +128,10 @@
   const authLink = document.querySelector("#osuAuthLink");
   if (!authLink) return;
 
+  authLink.hidden = false;
+  authLink.textContent = "sign in with osu!";
+  authLink.href = "/api/auth/osu";
+
   fetch("/api/auth/status", { cache: "no-store" })
     .then((response) => response.ok ? response.json() : null)
     .then((status) => {
@@ -98,9 +141,6 @@
         authLink.textContent = status.user.username;
         authLink.href = "/api/auth/logout";
         authLink.title = "Sign out of osu!";
-      } else {
-        authLink.textContent = "sign in with osu!";
-        authLink.href = "/api/auth/osu";
       }
     })
     .catch(() => {});
