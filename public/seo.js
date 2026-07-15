@@ -149,18 +149,19 @@
   const dropTitle = document.querySelector("#dropTitle");
   const dropSubtitle = document.querySelector("#dropSubtitle");
   const fileChip = document.querySelector("#fileChip");
+  let submitAuthenticated = false;
 
   const applySubmitAuthentication = (status) => {
-    const authenticated = Boolean(status?.authenticated);
-    document.body.dataset.osuAuthenticated = authenticated ? "true" : "false";
+    submitAuthenticated = Boolean(status?.authenticated);
+    document.body.dataset.osuAuthenticated = submitAuthenticated ? "true" : "false";
 
-    if (replayInput) replayInput.disabled = !authenticated;
+    if (replayInput) replayInput.disabled = !submitAuthenticated;
     if (dropzone) {
-      dropzone.setAttribute("aria-disabled", String(!authenticated));
-      dropzone.classList.toggle("auth-required", !authenticated);
+      dropzone.setAttribute("aria-disabled", String(!submitAuthenticated));
+      dropzone.classList.toggle("auth-required", !submitAuthenticated);
     }
 
-    if (!authenticated) {
+    if (!submitAuthenticated) {
       if (runButton) runButton.disabled = true;
       if (dropTitle) dropTitle.textContent = status?.configured === false
         ? "osu! sign-in is unavailable"
@@ -174,6 +175,17 @@
       if (dropSubtitle) dropSubtitle.textContent = "tap here or drop it";
     }
   };
+
+  if (dropzone) {
+    ["click", "dragenter", "dragover", "drop"].forEach((type) => {
+      dropzone.addEventListener(type, (event) => {
+        if (submitAuthenticated) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (type === "click") location.assign("/api/auth/osu");
+      }, true);
+    });
+  }
 
   authLink.hidden = false;
   authLink.textContent = "sign in with osu!";
