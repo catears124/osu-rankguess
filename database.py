@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 
+from fastapi import FastAPI as _FastAPI
 from starlette.requests import Request as _Request
 from starlette.responses import JSONResponse as _JSONResponse
 
@@ -37,3 +38,36 @@ sys.modules.setdefault("cron_runtime", _cron)
 _cron.Request = _Request
 _cron.JSONResponse = _JSONResponse
 _cron.install()
+
+
+def _install_cron_route_contract_check() -> None:
+    """Fail startup if FastAPI turns a Request object into a query parameter."""
+    if getattr(_FastAPI, "_rankguess_cron_route_contract_check", False):
+        return
+
+    original_init = _FastAPI.__init__
+    cron_paths = {"/api/cron/seed-gallery", "/api/cron/tick"}
+
+    def checked_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        title = kwargs.get("title") or getattr(self, "title", "")
+        if title != "osu!rankguess":
+            return
+        for route in self.routes:
+            if getattr(route, "path", None) not in cron_paths:
+                continue
+            dependant = getattr(route, "dependant", None)
+            query_names = {
+                field.name
+                for field in (getattr(dependant, "query_params", None) or [])
+            }
+            if "request" in query_names:
+                raise RuntimeError(
+                    f"{route.path} registered Request as a query parameter"
+                )
+
+    _FastAPI.__init__ = checked_init
+    _FastAPI._rankguess_cron_route_contract_check = True
+
+
+_install_cron_route_contract_check()
