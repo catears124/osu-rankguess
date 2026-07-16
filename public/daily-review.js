@@ -140,20 +140,19 @@
         firstGuess >= lower && firstGuess <= upper ? "yours" : "",
       ].filter(Boolean).join(" ");
       const observed = Math.max(0, Number(item.observedCount) || 0);
-      const title = `${formatRank(lower)}–${formatRank(upper)} · ${observed} real`;
+      const title = `${formatRank(lower)}–${formatRank(upper)} · ${observed} ${observed === 1 ? "guess" : "guesses"}`;
       return `<span class="community-bar ${classes}" title="${escapeHTML(title)}"><i style="height:${height.toFixed(2)}%"></i></span>`;
     }).join("");
     const observed = Math.max(0, Number(distribution.observedCount) || 0);
-    const baseline = Math.max(0, Number(distribution.baselineCount) || 0);
-    const countLabel = `${observed.toLocaleString()} real ${observed === 1 ? "guess" : "guesses"}`;
+    const countLabel = `${observed.toLocaleString()} ${observed === 1 ? "guess" : "guesses"}`;
 
     return `<section class="community-distribution" data-community-distribution>
-      <div class="community-distribution-head"><span>community distribution</span><small>${countLabel}${baseline ? " · baseline-smoothed" : ""}</small></div>
+      <div class="community-distribution-head"><span>community distribution</span><small>${countLabel}</small></div>
       <div class="community-chart" aria-label="Distribution of first guesses from the community">
         <div class="community-bars">${bars}</div>
       </div>
       <div class="community-axis"><span>${formatRank(1)}</span><span>${formatRank(rankPopulation)}</span></div>
-      <p><i></i> actual range <b></b> your first-guess range${baseline ? " · baseline fades as real guesses arrive" : ""}</p>
+      <p><i></i> actual range <b></b> your first-guess range</p>
     </section>`;
   };
 
