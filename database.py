@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import sys
 
+from starlette.requests import Request as _Request
+from starlette.responses import JSONResponse as _JSONResponse
+
 from backend.database import *
 from backend.database import _connect
 from backend import replay_features as _replay_features
@@ -20,8 +23,17 @@ _ordr.install()
 
 from runtime import community as _community
 sys.modules.setdefault("community_runtime", _community)
+# These runtime modules define FastAPI routes inside installer functions while
+# using postponed annotations. FastAPI resolves those annotation strings from
+# the module globals, not the installer's local import scope. Publish the
+# concrete Starlette classes before any FastAPI application is constructed so
+# `request: Request` is injected rather than exposed as a required query field.
+_community.Request = _Request
+_community.JSONResponse = _JSONResponse
 _community.install()
 
 from runtime import cron as _cron
 sys.modules.setdefault("cron_runtime", _cron)
+_cron.Request = _Request
+_cron.JSONResponse = _JSONResponse
 _cron.install()
