@@ -139,12 +139,11 @@
         actual >= lower && actual <= upper ? "actual" : "",
         firstGuess >= lower && firstGuess <= upper ? "yours" : "",
       ].filter(Boolean).join(" ");
-      const observed = Math.max(0, Number(item.observedCount) || 0);
-      const title = `${formatRank(lower)}–${formatRank(upper)} · ${observed} ${observed === 1 ? "guess" : "guesses"}`;
+      const title = `${formatRank(lower)}–${formatRank(upper)} · ${count} ${count === 1 ? "guess" : "guesses"}`;
       return `<span class="community-bar ${classes}" title="${escapeHTML(title)}"><i style="height:${height.toFixed(2)}%"></i></span>`;
     }).join("");
-    const observed = Math.max(0, Number(distribution.observedCount) || 0);
-    const countLabel = `${observed.toLocaleString()} ${observed === 1 ? "guess" : "guesses"}`;
+    const displayed = bins.reduce((sum, item) => sum + Math.max(0, Number(item.count) || 0), 0);
+    const countLabel = `${displayed.toLocaleString()} ${displayed === 1 ? "guess" : "guesses"}`;
 
     return `<section class="community-distribution" data-community-distribution>
       <div class="community-distribution-head"><span>community distribution</span><small>${countLabel}</small></div>
