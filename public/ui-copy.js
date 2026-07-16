@@ -1,7 +1,5 @@
-/* Final user-facing copy and community-count cleanup. */
+/* Final user-facing submit and gallery copy cleanup. */
 (() => {
-  const roundByPanel = new WeakMap();
-
   const genericText = (value) => String(value || "")
     .replace(/o!rdr\s*#(\d+)/gi, "render #$1")
     .replace(/o!rdr/gi, "render service")
@@ -66,41 +64,6 @@
     }
   };
 
-  const displayedGuessCount = (round) => (Array.isArray(round?.distribution?.bins)
-    ? round.distribution.bins.reduce((sum, item) => sum + Math.max(0, Number(item?.count) || 0), 0)
-    : 0);
-
-  const patchCommunityCount = (panel, round) => {
-    const section = panel?.querySelector?.("[data-community-distribution]");
-    const bins = Array.isArray(round?.distribution?.bins) ? round.distribution.bins : [];
-    if (!section || !bins.length) return;
-
-    const total = displayedGuessCount(round);
-    const label = section.querySelector(".community-distribution-head small");
-    const labelText = `${total.toLocaleString()} ${total === 1 ? "guess" : "guesses"}`;
-    if (label && label.textContent !== labelText) label.textContent = labelText;
-
-    section.querySelectorAll(".community-bar").forEach((bar, index) => {
-      const item = bins[index];
-      if (!item) return;
-      const count = Math.max(0, Number(item.count) || 0);
-      const title = `${formatRank(item.lower)}–${formatRank(item.upper)} · ${count} ${count === 1 ? "guess" : "guesses"}`;
-      if (bar.title !== title) bar.title = title;
-    });
-  };
-
-  if (typeof updateChallengeRound === "function") {
-    const baseUpdateChallengeRound = updateChallengeRound;
-    updateChallengeRound = function finalCopyUpdateChallengeRound(round, mode, challengeDate) {
-      baseUpdateChallengeRound(round, mode, challengeDate);
-      const panel = round?.root?.querySelector?.(".reveal-panel");
-      if (panel) {
-        roundByPanel.set(panel, round);
-        patchCommunityCount(panel, round);
-      }
-    };
-  }
-
   if (typeof renderPrediction === "function") {
     const baseRenderPrediction = renderPrediction;
     renderPrediction = function genericRenderPrediction(payload) {
@@ -122,11 +85,6 @@
         sanitizeTextWithin(node);
         if (node instanceof Element) removeGalleryVideoLinks(node);
       });
-
-      const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-      const panel = target?.closest?.(".reveal-panel");
-      const round = panel ? roundByPanel.get(panel) : null;
-      if (panel && round) patchCommunityCount(panel, round);
     }
     cleanSubmitCopy();
     removeGalleryVideoLinks();
