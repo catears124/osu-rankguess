@@ -121,10 +121,13 @@ jobs:
 
           description="HTTP ${HTTP_CODE:-unknown}: ${RESPONSE_TEXT:-no response captured}"
           description="${description:0:140}"
-          payload="$(python -c 'import json, os; print(json.dumps({"state": os.environ["STATUS_STATE"], "context": "gallery-cron", "description": os.environ["STATUS_DESCRIPTION"], "target_url": os.environ["STATUS_URL"]}))' \
+          status_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          payload="$(
             STATUS_STATE="${state}" \
             STATUS_DESCRIPTION="${description}" \
-            STATUS_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
+            STATUS_URL="${status_url}" \
+            python -c 'import json, os; print(json.dumps({"state": os.environ["STATUS_STATE"], "context": "gallery-cron", "description": os.environ["STATUS_DESCRIPTION"], "target_url": os.environ["STATUS_URL"]}))'
+          )"
 
           curl \
             --fail-with-body \
