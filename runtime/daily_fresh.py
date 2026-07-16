@@ -235,6 +235,31 @@ def _band_for_slot(challenge_date: date, slot: int) -> int:
     return order[slot % _DAILY_COUNT]
 
 
+async def _find_daily_candidate(
+    app_module: Any,
+    band: int,
+    challenge_date: date,
+    selection_key: str,
+) -> dict[str, Any]:
+    original_stable_number = app_module._stable_number  # noqa: SLF001
+
+    def widened_stable_number(label: str, minimum: int, maximum: int) -> int:
+        if band == 2 and label.startswith(f"fresh-page:{selection_key}:"):
+            return original_stable_number(label, 1000, 4000)
+        return original_stable_number(label, minimum, maximum)
+
+    app_module._stable_number = widened_stable_number  # noqa: SLF001
+    try:
+        return await app_module.find_seed_candidate(
+            band,
+            challenge_date,
+            selection_key=selection_key,
+        )
+    finally:
+        if app_module._stable_number is widened_stable_number:  # noqa: SLF001
+            app_module._stable_number = original_stable_number  # noqa: SLF001
+
+
 async def _start_pending_job(app_module: Any, slot: int) -> dict[str, Any]:
     existing = await asyncio.to_thread(_pending_job)
     if existing:
@@ -268,10 +293,11 @@ async def _start_pending_job(app_module: Any, slot: int) -> dict[str, Any]:
         f"daily:{challenge_date.isoformat()}:{daily_slot}:"
         f"band-{band}:{secrets.token_hex(10)}"
     )
-    candidate = await app_module.find_seed_candidate(
+    candidate = await _find_daily_candidate(
+        app_module,
         band,
         challenge_date,
-        selection_key=selection_key,
+        selection_key,
     )
     cached = candidate["cached"]
     render_id = await app_module.submit_ordr_bytes(
