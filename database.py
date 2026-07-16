@@ -39,6 +39,10 @@ _cron.Request = _Request
 _cron.JSONResponse = _JSONResponse
 _cron.install()
 
+from runtime import daily_fresh as _daily_fresh
+sys.modules.setdefault("daily_fresh_runtime", _daily_fresh)
+_daily_fresh.install()
+
 from runtime import cron_oidc as _cron_oidc
 sys.modules.setdefault("cron_oidc_runtime", _cron_oidc)
 _cron_oidc.install()
