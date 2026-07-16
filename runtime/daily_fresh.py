@@ -248,16 +248,31 @@ async def _find_daily_candidate(
             return original_stable_number(label, 1000, 4000)
         return original_stable_number(label, minimum, maximum)
 
+    candidate: dict[str, Any] | None = None
+    failure: Exception | None = None
     app_module._stable_number = widened_stable_number  # noqa: SLF001
     try:
-        return await app_module.find_seed_candidate(
+        candidate = await app_module.find_seed_candidate(
             band,
             challenge_date,
             selection_key=selection_key,
         )
+    except Exception as exc:
+        failure = exc
     finally:
         if app_module._stable_number is widened_stable_number:  # noqa: SLF001
             app_module._stable_number = original_stable_number  # noqa: SLF001
+
+    if candidate is not None:
+        return candidate
+    if band == 2:
+        return await app_module.find_seed_candidate(
+            band,
+            challenge_date,
+            selection_key=f"{selection_key}:fallback",
+        )
+    assert failure is not None
+    raise failure
 
 
 async def _start_pending_job(app_module: Any, slot: int) -> dict[str, Any]:
