@@ -39,6 +39,10 @@ _cron.Request = _Request
 _cron.JSONResponse = _JSONResponse
 _cron.install()
 
+from runtime import cron_oidc as _cron_oidc
+sys.modules.setdefault("cron_oidc_runtime", _cron_oidc)
+_cron_oidc.install()
+
 
 def _install_cron_route_contract_check() -> None:
     """Fail startup if FastAPI turns a Request object into a query parameter."""
