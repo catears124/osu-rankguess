@@ -1,6 +1,9 @@
 name: gallery and daily cron
 
 on:
+  push:
+    branches:
+      - main
   schedule:
     - cron: "3,13,23,33,43,53 * * * *"
   workflow_dispatch:
@@ -15,9 +18,14 @@ concurrency:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
-      - name: Trigger randomized gallery ingestion
+      - name: Allow production deployment to settle
+        if: github.event_name == 'push'
+        shell: bash
+        run: sleep 35
+
+      - name: Trigger resumable gallery ingestion
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
           SITE_URL: https://osu-rankguess.vercel.app
@@ -29,14 +37,27 @@ jobs:
             exit 1
           fi
 
-          curl \
-            --fail-with-body \
+          response_file="$(mktemp)"
+          trap 'rm -f "${response_file}"' EXIT
+
+          http_code="$(curl \
             --show-error \
             --silent \
             --retry 2 \
             --retry-all-errors \
             --connect-timeout 15 \
             --max-time 230 \
+            --output "${response_file}" \
+            --write-out '%{http_code}' \
             --header "Authorization: Bearer ${CRON_SECRET}" \
             --header "Accept: application/json" \
-            "${SITE_URL}/api/cron/tick"
+            --header "User-Agent: osu-rankguess-cron/${GITHUB_RUN_ID}" \
+            "${SITE_URL}/api/cron/tick")"
+
+          cat "${response_file}"
+          echo
+
+          if [[ "${http_code}" -lt 200 || "${http_code}" -ge 300 ]]; then
+            echo "::error::Cron endpoint returned HTTP ${http_code}."
+            exit 1
+          fi
