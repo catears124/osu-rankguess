@@ -11,6 +11,7 @@ on:
 permissions:
   contents: read
   id-token: write
+  statuses: write
 
 concurrency:
   group: rankguess-background-cron
@@ -24,16 +25,26 @@ jobs:
       - name: Allow production deployment to settle
         if: github.event_name == 'push'
         shell: bash
-        run: sleep 35
+        run: sleep 45
 
       - name: Trigger resumable gallery ingestion
+        id: cron
         env:
           SITE_URL: https://osu-rankguess.vercel.app
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
+
+          write_result() {
+            local code="$1"
+            local text="$2"
+            text="$(printf '%s' "${text}" | tr '\r\n' ' ' | tr -s ' ' | cut -c1-100)"
+            echo "http_code=${code}" >> "${GITHUB_OUTPUT}"
+            echo "response=${text}" >> "${GITHUB_OUTPUT}"
+          }
 
           if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
+            write_result "oidc-unavailable" "GitHub OIDC environment variables are missing"
             echo "::error::GitHub OIDC is unavailable. The workflow requires id-token: write."
             exit 1
           fi
@@ -45,10 +56,17 @@ jobs:
             --connect-timeout 15 \
             --max-time 30 \
             --header "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=osu-rankguess-cron")"
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=osu-rankguess-cron" 2>&1)"
+          oidc_curl_exit=$?
+          if [[ "${oidc_curl_exit}" -ne 0 ]]; then
+            write_result "oidc-error" "${oidc_response}"
+            echo "::error::Could not request a GitHub OIDC token."
+            exit 1
+          fi
 
-          oidc_token="$(python -c 'import json, sys; print(json.load(sys.stdin).get("value", ""))' <<<"${oidc_response}")"
+          oidc_token="$(python -c 'import json, sys; print(json.load(sys.stdin).get("value", ""))' <<<"${oidc_response}" 2>/dev/null)"
           if [[ -z "${oidc_token}" ]]; then
+            write_result "oidc-empty" "GitHub OIDC provider returned no token"
             echo "::error::GitHub OIDC provider returned no token."
             exit 1
           fi
@@ -70,11 +88,51 @@ jobs:
             --header "Accept: application/json" \
             --header "User-Agent: osu-rankguess-cron/${GITHUB_RUN_ID}" \
             "${SITE_URL}/api/cron/tick")"
+          endpoint_curl_exit=$?
 
           cat "${response_file}"
           echo
+          response_text="$(cat "${response_file}")"
+          write_result "${http_code:-000}" "${response_text:-no response body}"
 
+          if [[ "${endpoint_curl_exit}" -ne 0 ]]; then
+            echo "::error::Cron endpoint request failed before a valid HTTP response."
+            exit 1
+          fi
           if [[ "${http_code}" -lt 200 || "${http_code}" -ge 300 ]]; then
             echo "::error::Cron endpoint returned HTTP ${http_code}."
             exit 1
           fi
+
+      - name: Publish gallery cron status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CRON_OUTCOME: ${{ steps.cron.outcome }}
+          HTTP_CODE: ${{ steps.cron.outputs.http_code }}
+          RESPONSE_TEXT: ${{ steps.cron.outputs.response }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="failure"
+          if [[ "${CRON_OUTCOME}" == "success" ]]; then
+            state="success"
+          fi
+
+          description="HTTP ${HTTP_CODE:-unknown}: ${RESPONSE_TEXT:-no response captured}"
+          description="${description:0:140}"
+          payload="$(python -c 'import json, os; print(json.dumps({"state": os.environ["STATUS_STATE"], "context": "gallery-cron", "description": os.environ["STATUS_DESCRIPTION"], "target_url": os.environ["STATUS_URL"]}))' \
+            STATUS_STATE="${state}" \
+            STATUS_DESCRIPTION="${description}" \
+            STATUS_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
+
+          curl \
+            --fail-with-body \
+            --show-error \
+            --silent \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --data "${payload}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}"
