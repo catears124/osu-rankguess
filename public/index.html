@@ -135,12 +135,12 @@
           <div class="card-label">pipeline</div>
           <ol class="steps">
             <li data-default-detail="Read replay telemetry"><span>01</span><div><strong>parse replay</strong><small>Read replay telemetry</small></div></li>
-            <li data-default-detail="Send replay to o!rdr"><span>02</span><div><strong>submit render</strong><small>Send replay to o!rdr</small></div></li>
+            <li data-default-detail="Send replay for rendering"><span>02</span><div><strong>submit render</strong><small>Send replay for rendering</small></div></li>
             <li data-default-detail="Wait for the video"><span>03</span><div><strong>render clip</strong><small>Wait for the video</small></div></li>
             <li data-default-detail="Resolve map and score data"><span>04</span><div><strong>resolve metadata</strong><small>Resolve map and score data</small></div></li>
             <li data-default-detail="Run the rank ensemble"><span>05</span><div><strong>predict rank</strong><small>Run the rank ensemble</small></div></li>
           </ol>
-          <p class="tiny-note">Keep this tab open while o!rdr finishes.</p>
+          <p class="tiny-note">Keep this tab open while the replay renders.</p>
         </section>
       </div>
 
@@ -162,7 +162,7 @@
           <video id="replayVideo" controls autoplay playsinline preload="auto"></video>
           <div class="map-line">
             <div><strong id="mapTitle">—</strong><span id="mapMeta">—</span></div>
-            <a id="videoLink" href="#" target="_blank" rel="noreferrer">open video</a>
+            <a id="videoLink" href="#" hidden aria-hidden="true" tabindex="-1"></a>
           </div>
           <dl class="stats-grid">
             <div><dt>top %</dt><dd id="topPercent">—</dd></div>
@@ -227,5 +227,6 @@
   <script src="/seo.js?v=3" defer></script>
   <script src="/runtime-final.js?v=3" defer></script>
   <script src="/infinite-fix.js?v=1" defer></script>
+  <script src="/ui-copy.js?v=1" defer></script>
 </body>
 </html>
