@@ -24,7 +24,7 @@ jobs:
           python-version: "3.12"
 
       - name: Compile Python
-        run: python -m compileall -q app.py database.py seo_oauth_runtime.py backend runtime
+        run: python -m compileall -q app.py database.py seo_oauth_runtime.py backend runtime tests
 
       - name: Check browser scripts
         shell: bash
@@ -53,6 +53,7 @@ jobs:
           import json
           import sys
           import traceback
+          from datetime import date, timedelta
           from pathlib import Path
 
           report = {
@@ -73,6 +74,7 @@ jobs:
           try:
               import app
               import database
+              from runtime import daily_diversity, daily_fresh
 
               report["appFile"] = getattr(app, "__file__", None)
               report["databaseFile"] = getattr(database, "__file__", None)
@@ -84,6 +86,7 @@ jobs:
                       "render_jobs",
                       "community_runtime",
                       "cron_runtime",
+                      "daily_diversity_runtime",
                       "seo_oauth_runtime",
                       "ordr_recovery",
                   )
@@ -98,6 +101,19 @@ jobs:
               assert Path("backend/replay_features.py").exists()
               assert Path("backend/render_jobs.py").exists()
               assert Path("runtime/bootstrap.py").exists()
+              assert Path("runtime/daily_diversity.py").exists()
+              assert Path("tests/ui_devserver.py").exists()
+              assert daily_fresh._find_daily_candidate is daily_diversity._find_daily_candidate
+
+              start = date(2026, 1, 1)
+              wide_windows = {
+                  daily_diversity._rank_window(start + timedelta(days=offset), 2)
+                  for offset in range(366)
+              }
+              assert wide_windows == set(daily_diversity._WIDE_WINDOWS), wide_windows
+              assert daily_diversity._rank_window(start, 0) == ("elite", 1, 2_500)
+              assert daily_diversity._rank_window(start, 1) == ("established", 5_000, 20_000)
+              report["dailyRankWindows"] = sorted(wide_windows)
 
               routes = {route.path for route in app.app.routes}
               report["routes"] = sorted(routes)
@@ -151,7 +167,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/ui-smoke
-          python scripts/devserver.py 8000 >/tmp/ui-smoke/devserver.log 2>&1 &
+          python tests/ui_devserver.py 8000 >/tmp/ui-smoke/devserver.log 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
 
