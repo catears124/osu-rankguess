@@ -222,5 +222,8 @@ def install() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
+    # Keep both references aligned: production calls through daily_fresh while
+    # the import smoke test intentionally verifies the installed override.
+    _daily_diversity._find_daily_candidate = _find_daily_candidate  # noqa: SLF001
     _daily_fresh._find_daily_candidate = _find_daily_candidate  # noqa: SLF001
     _INSTALLED = True
