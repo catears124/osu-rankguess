@@ -1,4 +1,4 @@
-/* Gallery-backed Infinite, spoiler-first gallery, and real clip prefetching. */
+/* Gallery-backed Infinite, spoiler-first gallery, replay sharing, and real clip prefetching. */
 (() => {
   const UI = window.rankguessUI;
   const previousShowView = showView;
@@ -11,6 +11,8 @@
   let recent = [];
   let previewObserver = null;
   let galleryRefreshPromise = null;
+  let activeGalleryItem = null;
+  let syncingSharedReplay = false;
 
   const prefetchBin = document.createElement("div");
   prefetchBin.setAttribute("aria-hidden", "true");
@@ -22,6 +24,9 @@
     : Infinity;
 
   const freshURL = (path) => `${path}${path.includes("?") ? "&" : "?"}_=${Date.now()}`;
+  const sharedReplayID = () => new URLSearchParams(location.search).get("replay")?.trim() || "";
+  const replayPath = (item) => `/gallery?replay=${encodeURIComponent(item.id)}`;
+  const replayURL = (item) => new URL(replayPath(item), location.origin).href;
 
   loadGallery = function refreshedGallery(reset = false) {
     if (reset && galleryRefreshPromise) return galleryRefreshPromise;
@@ -200,6 +205,26 @@
     button.addEventListener("click", loadInfinite);
   }
 
+  async function shareReplay(item, button) {
+    if (!item?.id) return;
+    const url = replayURL(item);
+    const shareData = {
+      title: "osu!rankguess replay",
+      text: "Can you guess this osu! player's rank?",
+      url,
+    };
+    try {
+      if (navigator.share) await navigator.share(shareData);
+      else await copyText(url);
+      if (button) button.textContent = navigator.share ? "shared" : "copied";
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      await copyText(url);
+      if (button) button.textContent = "copied";
+    }
+    if (button) setTimeout(() => { if (button.isConnected) button.textContent = "share"; }, 1600);
+  }
+
   galleryCard = function spoilerCard(item) {
     const map = item.beatmap || {};
     const cover = item.thumbnailURL || `/api/gallery/${encodeURIComponent(item.id)}/thumbnail`;
@@ -208,8 +233,9 @@
     const errorWidth = Number.isFinite(errorRatio) ? Math.min(100, Math.max(4, Math.log10(Math.max(1, errorRatio)) / 2 * 100)) : 4;
     return `<article class="gallery-card ${spoilersHidden ? "spoiler" : ""}" data-gallery-id="${escapeHTML(item.id)}" tabindex="0" role="button" aria-label="Open replay">
       <button class="gallery-thumb" type="button" aria-label="Open replay"><video class="gallery-preview" data-src="${escapeHTML(item.videoURL)}" muted playsinline preload="none"></video><img src="${escapeHTML(cover)}" alt="" loading="lazy" decoding="async" /><span>watch</span></button>
-      <div class="gallery-copy"><p class="gallery-eyebrow">replay</p><h2>${spoilersHidden ? "mystery player" : escapeHTML(item.player || "Unknown player")}</h2><p>${spoilersHidden ? "open to reveal map and ranks" : escapeHTML(`${map.artist ? `${map.artist} — ` : ""}${map.title || "Unknown map"}`)}</p>${spoilersHidden ? "" : `<small>${escapeHTML(`${map.version || "Unknown difficulty"} · ${Number(item.star || 0).toFixed(2)}★ · ${(item.mods || ["NM"]).join("")}`)}</small>`}</div>
-      ${spoilersHidden ? '<div class="spoiler-strip">ranks hidden until opened</div>' : `<div class="gallery-ranks"><div><span>actual</span><strong>${formatRank(item.actualRank)}</strong></div><div><span>model</span><strong>${formatRank(item.predictedRank)}</strong></div></div><div class="gallery-error"><i style="width:${errorWidth}%"></i><span>${escapeHTML(errorLabel)}</span></div>`}
+      <button class="gallery-share" type="button" aria-label="Share this replay">share</button>
+      <div class="gallery-copy"><p class="gallery-eyebrow">replay</p><h2>${spoilersHidden ? "mystery player" : escapeHTML(item.player || "Unknown player")}</h2><p>${spoilersHidden ? "watch first, then reveal when ready" : escapeHTML(`${map.artist ? `${map.artist} — ` : ""}${map.title || "Unknown map"}`)}</p>${spoilersHidden ? "" : `<small>${escapeHTML(`${map.version || "Unknown difficulty"} · ${Number(item.star || 0).toFixed(2)}★ · ${(item.mods || ["NM"]).join("")}`)}</small>`}</div>
+      ${spoilersHidden ? '<div class="spoiler-strip">player and ranks hidden until you reveal</div>' : `<div class="gallery-ranks"><div><span>actual</span><strong>${formatRank(item.actualRank)}</strong></div><div><span>model</span><strong>${formatRank(item.predictedRank)}</strong></div></div><div class="gallery-error"><i style="width:${errorWidth}%"></i><span>${escapeHTML(errorLabel)}</span></div>`}
     </article>`;
   };
 
@@ -228,16 +254,110 @@
     previews.forEach((video) => previewObserver.observe(video));
   }
 
-  openGalleryDialog = function spoilerDialog(item) {
-    if (!item) return;
-    UI.pauseAllVideos({ unloadDialog: true });
+  function dialogCopy(item, revealed) {
     const map = item.beatmap || {};
     const errorRatio = ratio(item);
-    document.querySelector("#galleryDialogBody").innerHTML = `<video src="${escapeHTML(item.videoURL)}" controls autoplay playsinline preload="auto"></video><div class="dialog-copy"><p class="kicker">replay result</p><h1>${escapeHTML(item.player || "Unknown player")}</h1><p>${escapeHTML(`${map.artist ? `${map.artist} — ` : ""}${map.title || "Unknown map"} [${map.version || "?"}]`)}</p><div class="dialog-ranks"><div><span>actual</span><strong>${formatRank(item.actualRank)}</strong></div><div><span>model</span><strong>${formatRank(item.predictedRank)}</strong></div><div><span>ratio</span><strong>${Number.isFinite(errorRatio) ? `${errorRatio.toFixed(2)}×` : "—"}</strong></div></div><a href="${escapeHTML(item.videoURL)}" target="_blank" rel="noreferrer">open video in a new tab</a></div>`;
+    if (!revealed) {
+      return `<div class="dialog-copy gallery-dialog-spoiler" data-revealed="false">
+        <p class="kicker">spoiler mode</p>
+        <h1>mystery replay</h1>
+        <p>Watch the play first. The player, map, actual rank, and model rank stay hidden until you reveal them.</p>
+        <div class="dialog-spoiler-panel"><span>actual + model ranks hidden</span><strong>ready?</strong></div>
+        <div class="dialog-actions"><button class="primary-button narrow" data-gallery-reveal type="button">reveal ranks</button><button class="secondary-button narrow" data-gallery-share type="button">share</button></div>
+      </div>`;
+    }
+    return `<div class="dialog-copy" data-revealed="true">
+      <p class="kicker">replay result</p>
+      <h1>${escapeHTML(item.player || "Unknown player")}</h1>
+      <p>${escapeHTML(`${map.artist ? `${map.artist} — ` : ""}${map.title || "Unknown map"} [${map.version || "?"}]`)}</p>
+      <div class="dialog-ranks"><div><span>actual</span><strong>${formatRank(item.actualRank)}</strong></div><div><span>model</span><strong>${formatRank(item.predictedRank)}</strong></div><div><span>ratio</span><strong>${Number.isFinite(errorRatio) ? `${errorRatio.toFixed(2)}×` : "—"}</strong></div></div>
+      <div class="dialog-actions"><button class="secondary-button narrow" data-gallery-share type="button">share</button></div>
+    </div>`;
+  }
+
+  function bindDialogActions(item) {
+    const body = document.querySelector("#galleryDialogBody");
+    body.querySelector("[data-gallery-reveal]")?.addEventListener("click", () => {
+      const copy = body.querySelector(".dialog-copy");
+      copy.outerHTML = dialogCopy(item, true);
+      bindDialogActions(item);
+    });
+    body.querySelector("[data-gallery-share]")?.addEventListener("click", (event) => shareReplay(item, event.currentTarget));
+  }
+
+  openGalleryDialog = function spoilerDialog(item, options = {}) {
+    if (!item) return;
+    UI.pauseAllVideos({ unloadDialog: true });
+    activeGalleryItem = item;
+    const revealImmediately = options.reveal === true || (options.reveal !== false && !spoilersHidden);
+    const body = document.querySelector("#galleryDialogBody");
+    body.innerHTML = `<video src="${escapeHTML(item.videoURL)}" controls autoplay playsinline preload="auto"></video>${dialogCopy(item, revealImmediately)}`;
+    bindDialogActions(item);
     const dialog = document.querySelector("#galleryDialog");
-    if (dialog.showModal) dialog.showModal(); else dialog.setAttribute("open", "");
+    if (dialog.showModal && !dialog.open) dialog.showModal();
+    else dialog.setAttribute("open", "");
+    if (options.syncURL !== false && location.pathname === "/gallery" && sharedReplayID() !== item.id) {
+      history.pushState({ view: "gallery", replay: item.id }, "", replayPath(item));
+    }
     UI.autoplayVideo(dialog.querySelector("video"), true).catch(() => {});
   };
+
+  async function findGalleryItem(replayID) {
+    const existing = galleryItems.find((item) => item.id === replayID);
+    if (existing) return existing;
+
+    let offset = 0;
+    let total = Infinity;
+    while (offset < total) {
+      const payload = await requestJSON(freshURL(`/api/gallery?limit=60&offset=${offset}`));
+      if (!payload.configured) return null;
+      total = Number(payload.total) || 0;
+      const items = payload.items || [];
+      const found = items.find((item) => item.id === replayID);
+      if (found) {
+        if (!galleryItems.some((item) => item.id === found.id)) galleryItems.push(found);
+        return found;
+      }
+      if (!items.length) break;
+      offset += items.length;
+    }
+    return null;
+  }
+
+  async function syncSharedReplayFromLocation() {
+    if (syncingSharedReplay) return;
+    const replayID = sharedReplayID();
+    const dialog = document.querySelector("#galleryDialog");
+    if (!replayID) {
+      if (dialog?.open) dialog.close();
+      return;
+    }
+
+    syncingSharedReplay = true;
+    try {
+      if (document.body.dataset.view !== "gallery") showView("gallery");
+      if (!galleryLoaded) await loadGallery(true);
+      const item = await findGalleryItem(replayID);
+      if (!item) {
+        history.replaceState({ view: "gallery" }, "", "/gallery");
+        const empty = document.querySelector("#galleryEmpty");
+        if (empty) {
+          empty.textContent = "That shared replay is no longer available.";
+          empty.hidden = false;
+        }
+        return;
+      }
+      if (!dialog?.open || activeGalleryItem?.id !== item.id) openGalleryDialog(item, { reveal: false, syncURL: false });
+    } catch (error) {
+      const empty = document.querySelector("#galleryEmpty");
+      if (empty) {
+        empty.textContent = error.message || "Could not open the shared replay.";
+        empty.hidden = false;
+      }
+    } finally {
+      syncingSharedReplay = false;
+    }
+  }
 
   renderGallery = function spoilerGallery() {
     let items = [...galleryItems];
@@ -250,8 +370,9 @@
       const image = card.querySelector(".gallery-thumb img");
       image?.addEventListener("error", () => image.remove(), { once: true });
       card.querySelector(".gallery-thumb")?.addEventListener("click", () => openGalleryDialog(item));
+      card.querySelector(".gallery-share")?.addEventListener("click", (event) => shareReplay(item, event.currentTarget));
       card.addEventListener("click", (event) => { if (!event.target.closest("button,a,input,select")) openGalleryDialog(item); });
-      card.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openGalleryDialog(item); } });
+      card.addEventListener("keydown", (event) => { if (event.target === card && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); openGalleryDialog(item); } });
     });
     observePreviews();
     document.querySelector("#galleryEmpty").hidden = items.length !== 0;
@@ -281,6 +402,12 @@
   syncToggle();
 
   const dialog = document.querySelector("#galleryDialog");
-  dialog?.addEventListener("close", () => UI.pauseAllVideos({ unloadDialog: true }));
+  dialog?.addEventListener("close", () => {
+    UI.pauseAllVideos({ unloadDialog: true });
+    activeGalleryItem = null;
+    if (location.pathname === "/gallery" && sharedReplayID()) history.replaceState({ view: "gallery" }, "", "/gallery");
+  });
   document.querySelector("#closeGalleryDialog")?.addEventListener("click", () => UI.pauseAllVideos({ unloadDialog: true }));
+  window.addEventListener("popstate", () => setTimeout(syncSharedReplayFromLocation, 0));
+  window.addEventListener("load", syncSharedReplayFromLocation, { once: true });
 })();
