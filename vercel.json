@@ -20,6 +20,10 @@
   ],
   "rewrites": [
     {
+      "source": "/replay/:public_id",
+      "destination": "/api/replay-page/:public_id"
+    },
+    {
       "source": "/daily",
       "destination": "/index.html"
     },
