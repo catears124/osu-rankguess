@@ -20,14 +20,6 @@
   ],
   "rewrites": [
     {
-      "source": "/replay/:public_id/video.mp4",
-      "destination": "/api/replay-video"
-    },
-    {
-      "source": "/replay/:public_id",
-      "destination": "/api/replay-page"
-    },
-    {
       "source": "/daily",
       "destination": "/index.html"
     },
