@@ -13,6 +13,7 @@
   let galleryRefreshPromise = null;
   let activeGalleryItem = null;
   let syncingSharedReplay = false;
+  let pendingSharedReplayID = new URLSearchParams(location.search).get("replay")?.trim() || "";
 
   const prefetchBin = document.createElement("div");
   prefetchBin.setAttribute("aria-hidden", "true");
@@ -24,7 +25,7 @@
     : Infinity;
 
   const freshURL = (path) => `${path}${path.includes("?") ? "&" : "?"}_=${Date.now()}`;
-  const sharedReplayID = () => new URLSearchParams(location.search).get("replay")?.trim() || "";
+  const sharedReplayID = () => new URLSearchParams(location.search).get("replay")?.trim() || pendingSharedReplayID;
   const replayPath = (item) => `/gallery?replay=${encodeURIComponent(item.id)}`;
   const replayURL = (item) => new URL(replayPath(item), location.origin).href;
 
@@ -347,6 +348,10 @@
         }
         return;
       }
+      if (new URLSearchParams(location.search).get("replay") !== item.id) {
+        history.replaceState({ view: "gallery", replay: item.id }, "", replayPath(item));
+      }
+      pendingSharedReplayID = "";
       if (!dialog?.open || activeGalleryItem?.id !== item.id) openGalleryDialog(item, { reveal: false, syncURL: false });
     } catch (error) {
       const empty = document.querySelector("#galleryEmpty");
@@ -405,7 +410,8 @@
   dialog?.addEventListener("close", () => {
     UI.pauseAllVideos({ unloadDialog: true });
     activeGalleryItem = null;
-    if (location.pathname === "/gallery" && sharedReplayID()) history.replaceState({ view: "gallery" }, "", "/gallery");
+    pendingSharedReplayID = "";
+    if (location.pathname === "/gallery" && new URLSearchParams(location.search).get("replay")) history.replaceState({ view: "gallery" }, "", "/gallery");
   });
   document.querySelector("#closeGalleryDialog")?.addEventListener("click", () => UI.pauseAllVideos({ unloadDialog: true }));
   window.addEventListener("popstate", () => setTimeout(syncSharedReplayFromLocation, 0));
