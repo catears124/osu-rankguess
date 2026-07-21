@@ -52,5 +52,13 @@ main{padding-bottom:max(26px,env(safe-area-inset-bottom))}
 #view-analyze .page-heading{margin-bottom:14px}
 #view-analyze .page-heading h1{font-size:clamp(28px,4vw,44px)}
 .result-block{padding-bottom:max(18px,env(safe-area-inset-bottom))}
+.gallery-card{position:relative}
+.gallery-share{position:absolute;top:20px;left:20px;z-index:2;min-height:30px;padding:0 10px;border:1px solid rgba(255,255,255,.38);background:rgba(0,0,0,.78);color:#fff;font:800 9px/1 var(--font)!important;letter-spacing:.6px;text-transform:uppercase}
+.gallery-share:hover,.gallery-share:focus-visible{border-color:var(--pink);color:var(--pink)}
+.dialog-actions{display:flex;flex-wrap:wrap;gap:9px;margin-top:20px}
+.dialog-spoiler-panel{display:grid;gap:7px;margin-top:20px;padding:18px;border:1px solid var(--border);background:var(--panel-2)}
+.dialog-spoiler-panel span{color:var(--muted);font:800 9px/1 var(--font);letter-spacing:.7px;text-transform:uppercase}
+.dialog-spoiler-panel strong{color:#fff;font:850 clamp(24px,4vw,38px)/1 var(--font)}
+.gallery-dialog-spoiler>p:not(.kicker){max-width:680px}
 @media(max-width:760px){.clean-shell{width:calc(100vw - 16px);margin-top:8px}.clean-topline{grid-template-columns:auto auto;justify-content:space-between}.duel-title{display:none}.clean-mapline{display:grid;gap:4px}.clean-mapline strong,.clean-mapline span{white-space:normal}.clean-content{padding-top:8px}.clean-shell .video-wrap{max-height:none}.clean-history .duel-turn-list{grid-template-columns:1fr 1fr}.clean-dock{margin-top:8px}.clean-dock .guess-zone{padding:9px!important}.clean-dock .guess-form{grid-template-columns:1fr}.clean-dock .guess-submit{width:100%;height:46px;margin:0}.duel-result-strip{grid-template-columns:1fr 1fr;gap:10px;min-height:0;padding:12px}.duel-result-strip .next-challenge{grid-column:1/-1;width:100%;min-height:50px;margin-bottom:max(2px,env(safe-area-inset-bottom))!important}}
-@media(max-width:520px){.duel-guess-head{align-items:stretch}.duel-guess-head .live-rank{font-size:28px}.duel-guess-head .rank-number-shell{width:120px}.clean-history .duel-turn-list{grid-template-columns:1fr}.actual-block strong{font-size:42px}.attempt-stack{gap:6px}}
+@media(max-width:520px){.duel-guess-head{align-items:stretch}.duel-guess-head .live-rank{font-size:28px}.duel-guess-head .rank-number-shell{width:120px}.clean-history .duel-turn-list{grid-template-columns:1fr}.actual-block strong{font-size:42px}.attempt-stack{gap:6px}.gallery-share{top:18px;left:18px}.dialog-actions{display:grid;grid-template-columns:1fr}.dialog-actions .narrow{width:100%}}
