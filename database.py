@@ -47,6 +47,10 @@ from runtime import daily_diversity as _daily_diversity
 sys.modules.setdefault("daily_diversity_runtime", _daily_diversity)
 _daily_diversity.install()
 
+from runtime import daily_randomness as _daily_randomness
+sys.modules.setdefault("daily_randomness_runtime", _daily_randomness)
+_daily_randomness.install()
+
 from runtime import cron_oidc as _cron_oidc
 sys.modules.setdefault("cron_oidc_runtime", _cron_oidc)
 _cron_oidc.install()
