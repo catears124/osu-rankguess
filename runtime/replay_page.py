@@ -5,16 +5,19 @@ import html
 import json
 import re
 from string import Template
-from typing import Any
-from urllib.parse import urljoin
+from typing import Any, AsyncIterator
+from urllib.parse import urljoin, urlparse
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from backend import database as _database
 
 _INSTALLED = False
 _PUBLIC_ID = re.compile(r"^[A-Za-z0-9_-]{6,80}$")
+_CONTENT_RANGE = re.compile(r"^bytes\s+\d+-\d+/(\d+|\*)$", re.IGNORECASE)
+_VIDEO_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 _PAGE = Template("""<!doctype html>
 <html lang="en">
 <head>
@@ -25,6 +28,7 @@ _PAGE = Template("""<!doctype html>
   <meta name="robots" content="index, follow, max-video-preview:-1" />
   <title>$title</title>
   <link rel="canonical" href="$canonical" />
+  <link rel="alternate" type="video/mp4" href="$embed_video" />
   <link rel="stylesheet" href="/replay-page.css?v=1" />
   <meta name="description" content="$description" />
   <meta property="og:type" content="video.other" />
@@ -34,9 +38,9 @@ _PAGE = Template("""<!doctype html>
   <meta property="og:url" content="$canonical" />
   <meta property="og:image" content="$thumbnail" />
   <meta property="og:image:secure_url" content="$thumbnail" />
-  <meta property="og:video" content="$video" />
-  <meta property="og:video:url" content="$video" />
-  <meta property="og:video:secure_url" content="$video" />
+  <meta property="og:video" content="$embed_video" />
+  <meta property="og:video:url" content="$embed_video" />
+  <meta property="og:video:secure_url" content="$embed_video" />
   <meta property="og:video:type" content="video/mp4" />
   <meta property="og:video:width" content="960" />
   <meta property="og:video:height" content="540" />
@@ -47,7 +51,7 @@ _PAGE = Template("""<!doctype html>
   <meta name="twitter:player" content="$canonical" />
   <meta name="twitter:player:width" content="960" />
   <meta name="twitter:player:height" content="540" />
-  <meta name="twitter:player:stream" content="$video" />
+  <meta name="twitter:player:stream" content="$embed_video" />
   <meta name="twitter:player:stream:content_type" content="video/mp4" />
 </head>
 <body>
@@ -60,7 +64,7 @@ _PAGE = Template("""<!doctype html>
       </div>
     </header>
     <section class="stage">
-      <video id="replayVideo" src="$video" poster="$thumbnail" controls autoplay playsinline preload="auto"></video>
+      <video id="replayVideo" src="$player_video" poster="$thumbnail" controls autoplay playsinline preload="auto"></video>
       <button class="sound-gate" id="soundGate" type="button" hidden><span>play with sound</span></button>
       <aside class="spoiler" id="spoilerPanel">
         <div id="hiddenState">
@@ -119,15 +123,26 @@ def _safe_json(value: Any) -> str:
     )
 
 
+def _source_video_url(row: dict[str, Any]) -> str:
+    source = str(row.get("video_url") or "").strip()
+    parsed = urlparse(source)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise HTTPException(status_code=404, detail="Replay video is unavailable")
+    return source
+
+
+def _embed_video_url(origin: str, public_id: str) -> str:
+    return f"{origin}/replay/{public_id}/video.mp4"
+
+
 def _render_replay_html(row: dict[str, Any], *, origin: str, public_id: str) -> str:
     canonical = f"{origin}/replay/{public_id}"
-    video_url = _absolute(origin, row.get("video_url"))
+    player_video_url = _source_video_url(row)
+    embed_video_url = _embed_video_url(origin, public_id)
     thumbnail_url = _absolute(
         origin,
         row.get("thumbnail_url") or f"/api/gallery/{public_id}/thumbnail",
     )
-    if not video_url:
-        raise HTTPException(status_code=404, detail="Replay video is unavailable")
 
     replay = {
         "id": public_id,
@@ -141,7 +156,8 @@ def _render_replay_html(row: dict[str, Any], *, origin: str, public_id: str) -> 
             "title": row.get("title") or "Unknown map",
             "version": row.get("version") or "",
         },
-        "videoURL": video_url,
+        "videoURL": player_video_url,
+        "embedVideoURL": embed_video_url,
         "thumbnailURL": thumbnail_url,
         "canonicalURL": canonical,
     }
@@ -151,8 +167,121 @@ def _render_replay_html(row: dict[str, Any], *, origin: str, public_id: str) -> 
         description=esc("Can you guess this osu! player's rank?"),
         canonical=esc(canonical),
         thumbnail=esc(thumbnail_url),
-        video=esc(video_url),
+        player_video=esc(player_video_url),
+        embed_video=esc(embed_video_url),
         data=_safe_json(replay),
+    )
+
+
+async def _published_submission(public_id: str) -> dict[str, Any]:
+    if not _PUBLIC_ID.fullmatch(public_id):
+        raise HTTPException(status_code=404)
+    row = await asyncio.to_thread(_database.get_submission, public_id)
+    if not row or not bool(row.get("published")):
+        raise HTTPException(status_code=404)
+    return row
+
+
+def _upstream_request_headers(request: Request) -> dict[str, str]:
+    headers = {
+        "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.1",
+        "Accept-Encoding": "identity",
+        "User-Agent": "osu-rankguess-replay-embed/1.0",
+    }
+    range_header = (request.headers.get("range") or "").strip()
+    if range_header:
+        headers["Range"] = range_header
+    if_range = (request.headers.get("if-range") or "").strip()
+    if if_range:
+        headers["If-Range"] = if_range
+    return headers
+
+
+def _video_response_headers(upstream: httpx.Response, public_id: str) -> dict[str, str]:
+    headers = {
+        "Accept-Ranges": upstream.headers.get("accept-ranges") or "bytes",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800",
+        "Content-Disposition": f'inline; filename="{public_id}.mp4"',
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "X-Content-Type-Options": "nosniff",
+    }
+    for source, destination in (
+        ("content-length", "Content-Length"),
+        ("content-range", "Content-Range"),
+        ("etag", "ETag"),
+        ("last-modified", "Last-Modified"),
+    ):
+        value = upstream.headers.get(source)
+        if value:
+            headers[destination] = value
+    return headers
+
+
+def _content_range_total(value: str | None) -> int | None:
+    match = _CONTENT_RANGE.fullmatch(str(value or "").strip())
+    if not match or match.group(1) == "*":
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _head_video(source_url: str, public_id: str, request: Request) -> Response:
+    request_headers = _upstream_request_headers(request)
+    async with httpx.AsyncClient(timeout=_VIDEO_TIMEOUT, follow_redirects=True) as client:
+        upstream = await client.head(source_url, headers=request_headers)
+        used_range_probe = False
+        if upstream.status_code not in {200, 206}:
+            probe_headers = dict(request_headers)
+            probe_headers["Range"] = "bytes=0-0"
+            upstream = await client.get(source_url, headers=probe_headers)
+            used_range_probe = True
+        if upstream.status_code not in {200, 206}:
+            raise HTTPException(status_code=502, detail="Replay video host is unavailable")
+        headers = _video_response_headers(upstream, public_id)
+        if used_range_probe:
+            total = _content_range_total(upstream.headers.get("content-range"))
+            if total is not None:
+                headers["Content-Length"] = str(total)
+            headers.pop("Content-Range", None)
+    return Response(status_code=200, headers=headers, media_type="video/mp4")
+
+
+async def _stream_video(source_url: str, public_id: str, request: Request) -> StreamingResponse:
+    client = httpx.AsyncClient(timeout=_VIDEO_TIMEOUT, follow_redirects=True)
+    try:
+        upstream_request = client.build_request(
+            "GET",
+            source_url,
+            headers=_upstream_request_headers(request),
+        )
+        upstream = await client.send(upstream_request, stream=True)
+    except Exception:
+        await client.aclose()
+        raise
+
+    if upstream.status_code not in {200, 206}:
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Replay video host is unavailable")
+
+    headers = _video_response_headers(upstream, public_id)
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        body(),
+        status_code=upstream.status_code,
+        headers=headers,
+        media_type="video/mp4",
     )
 
 
@@ -173,11 +302,7 @@ def _install_route() -> None:
             include_in_schema=False,
         )
         async def replay_page(public_id: str, request: Request) -> HTMLResponse:
-            if not _PUBLIC_ID.fullmatch(public_id):
-                raise HTTPException(status_code=404)
-            row = await asyncio.to_thread(_database.get_submission, public_id)
-            if not row or not bool(row.get("published")):
-                raise HTTPException(status_code=404)
+            row = await _published_submission(public_id)
             body = _render_replay_html(row, origin=_origin(request), public_id=public_id)
             return HTMLResponse(
                 body,
@@ -186,6 +311,18 @@ def _install_route() -> None:
                     "X-Content-Type-Options": "nosniff",
                 },
             )
+
+        @self.api_route(
+            "/api/replay-video/{public_id}",
+            methods=["GET", "HEAD"],
+            include_in_schema=False,
+        )
+        async def replay_video(public_id: str, request: Request) -> Response:
+            row = await _published_submission(public_id)
+            source_url = _source_video_url(row)
+            if request.method == "HEAD":
+                return await _head_video(source_url, public_id, request)
+            return await _stream_video(source_url, public_id, request)
 
     FastAPI.__init__ = patched_init
     FastAPI._rankguess_replay_page_patch = True
