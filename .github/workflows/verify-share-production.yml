@@ -1,0 +1,47 @@
+name: verify production share route
+
+on:
+  push:
+    branches:
+      - agent/fix-share-embed-runtime
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify browser and Discord responses
+        shell: bash
+        run: |
+          set -euo pipefail
+          page='https://www.osurankguess.com/gallery?replay=97a8d21c13676028454fbe45'
+          video='https://www.osurankguess.com/api/replay-video?public_id=97a8d21c13676028454fbe45'
+
+          echo '=== browser page ==='
+          curl --fail-with-body --show-error --silent --location \
+            --user-agent 'Mozilla/5.0' \
+            --dump-header /tmp/browser-headers \
+            --output /tmp/browser-body \
+            "$page"
+          cat /tmp/browser-headers
+          grep -F '<meta property="og:video"' /tmp/browser-body
+          grep -F 'Can you guess their rank?' /tmp/browser-body
+
+          echo '=== Discord page ==='
+          curl --fail-with-body --show-error --silent --location \
+            --user-agent 'Discordbot/2.0' \
+            --dump-header /tmp/discord-headers \
+            --output /tmp/discord-body \
+            "$page"
+          cat /tmp/discord-headers
+          grep -F '<meta property="og:title"' /tmp/discord-body
+          grep -F '<meta property="og:description"' /tmp/discord-body
+          grep -F '<meta property="og:video"' /tmp/discord-body
+
+          echo '=== video HEAD ==='
+          curl --fail-with-body --show-error --silent --location --head \
+            --user-agent 'Discordbot/2.0' \
+            "$video"
