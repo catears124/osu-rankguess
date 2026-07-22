@@ -1,6 +1,6 @@
-/* Keep gallery replays in the gallery popup while copying canonical replay links. */
+/* Keep gallery replays in the gallery popup while copying canonical gallery links. */
 (() => {
-  const replayPathForID = (id) => `/replay/${encodeURIComponent(id)}`;
+  const replayPathForID = (id) => `/gallery?replay=${encodeURIComponent(id)}`;
   const replayURLForID = (id) => new URL(replayPathForID(id), location.origin).href;
   let activePopupItem = null;
 
