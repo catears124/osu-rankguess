@@ -1,9 +1,9 @@
 name: verify production share route
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/fix-share-embed-runtime
+      - main
 
 permissions:
   contents: read
