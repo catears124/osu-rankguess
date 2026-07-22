@@ -30,10 +30,6 @@
     {
       "source": "/submit",
       "destination": "/index.html"
-    },
-    {
-      "source": "/gallery",
-      "destination": "/index.html"
     }
   ],
   "headers": [
