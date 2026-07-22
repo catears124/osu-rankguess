@@ -29,12 +29,15 @@
     const body = document.querySelector("#galleryDialogBody");
     if (!body) return;
     body.querySelectorAll("[data-gallery-share]").forEach((button) => {
-      if (button.textContent !== "copied") button.textContent = "copy link";
-      button.setAttribute("aria-label", "Copy replay link");
+      const currentText = button.textContent.trim();
+      if (currentText !== "copied" && currentText !== "copy link") button.textContent = "copy link";
+      if (button.getAttribute("aria-label") !== "Copy replay link") {
+        button.setAttribute("aria-label", "Copy replay link");
+      }
     });
     const spoilerPanel = body.querySelector(".dialog-spoiler-panel");
     const hiddenValue = spoilerPanel?.querySelector("strong");
-    if (hiddenValue) hiddenValue.textContent = "-";
+    if (hiddenValue && hiddenValue.textContent !== "-") hiddenValue.textContent = "-";
     const label = spoilerPanel?.querySelector("span");
     if (label && !label.querySelector("small")) {
       const hint = document.createElement("small");
