@@ -51,6 +51,14 @@ from runtime import daily_randomness as _daily_randomness
 sys.modules.setdefault("daily_randomness_runtime", _daily_randomness)
 _daily_randomness.install()
 
+from runtime import daily_cron_randomness as _daily_cron_randomness
+sys.modules.setdefault("daily_cron_randomness_runtime", _daily_cron_randomness)
+_daily_cron_randomness.install()
+
+from runtime import replay_page as _replay_page
+sys.modules.setdefault("replay_page_runtime", _replay_page)
+_replay_page.install()
+
 from runtime import cron_oidc as _cron_oidc
 sys.modules.setdefault("cron_oidc_runtime", _cron_oidc)
 _cron_oidc.install()
