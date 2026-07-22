@@ -2,12 +2,18 @@
 (() => {
   const COMMUNITY_BUCKETS = [
     { lower: 1, upper: 99, label: "<100" },
-    { lower: 100, upper: 999, label: "<1k" },
-    { lower: 1_000, upper: 9_999, label: "<10k" },
-    { lower: 10_000, upper: 99_999, label: "<100k" },
-    { lower: 100_000, upper: 499_999, label: "<500k" },
-    { lower: 500_000, upper: 999_999, label: "<1m" },
-    { lower: 1_000_000, upper: 5_500_000, label: "<5.5m" },
+    { lower: 100, upper: 315, label: "" },
+    { lower: 316, upper: 999, label: "<1k" },
+    { lower: 1_000, upper: 3_161, label: "" },
+    { lower: 3_162, upper: 9_999, label: "<10k" },
+    { lower: 10_000, upper: 31_622, label: "" },
+    { lower: 31_623, upper: 99_999, label: "<100k" },
+    { lower: 100_000, upper: 223_606, label: "" },
+    { lower: 223_607, upper: 499_999, label: "<500k" },
+    { lower: 500_000, upper: 707_106, label: "" },
+    { lower: 707_107, upper: 999_999, label: "<1m" },
+    { lower: 1_000_000, upper: 2_345_207, label: "" },
+    { lower: 2_345_208, upper: 5_500_000, label: "<5.5m" },
   ];
   const communityRequests = new WeakMap();
   const baseUpdateChallengeRound = updateChallengeRound;
