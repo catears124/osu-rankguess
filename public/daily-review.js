@@ -1,7 +1,20 @@
 /* Review completed daily rounds without reopening guesses. */
 (() => {
-  const COMMUNITY_TARGET = 24;
-  const COMMUNITY_BINS = 12;
+  const COMMUNITY_BUCKETS = [
+    { lower: 1, upper: 99, label: "<100" },
+    { lower: 100, upper: 315, label: "" },
+    { lower: 316, upper: 999, label: "<1k" },
+    { lower: 1_000, upper: 3_161, label: "" },
+    { lower: 3_162, upper: 9_999, label: "<10k" },
+    { lower: 10_000, upper: 31_622, label: "" },
+    { lower: 31_623, upper: 99_999, label: "<100k" },
+    { lower: 100_000, upper: 223_606, label: "" },
+    { lower: 223_607, upper: 499_999, label: "<500k" },
+    { lower: 500_000, upper: 707_106, label: "" },
+    { lower: 707_107, upper: 999_999, label: "<1m" },
+    { lower: 1_000_000, upper: 2_345_207, label: "" },
+    { lower: 2_345_208, upper: 5_500_000, label: "<5.5m" },
+  ];
   const communityRequests = new WeakMap();
   const baseUpdateChallengeRound = updateChallengeRound;
   const baseRenderDaily = renderDaily;
@@ -27,42 +40,54 @@
     };
   };
 
+  const randomInteger = (random, minimum, maximum) => {
+    const lower = Math.ceil(Number(minimum) || 0);
+    const upper = Math.max(lower, Math.floor(Number(maximum) || 0));
+    return lower + Math.floor(random() * (upper - lower + 1));
+  };
+
+  const communityTargets = (challengeDate) => {
+    const seedDate = challengeDate || dailyPayload?.date || "today";
+    const random = seededRandom(`community-counts-v1:${seedDate}`);
+    const first = randomInteger(random, 16, 31);
+    const secondMinimum = Math.ceil(first * 0.60);
+    const second = randomInteger(random, secondMinimum, Math.max(secondMinimum, first - 1));
+    const thirdMinimum = Math.ceil(second * 0.80);
+    const third = randomInteger(random, thirdMinimum, Math.max(thirdMinimum, second - 1));
+    return [first, second, third];
+  };
+
+  const communityTargetFor = (round, challengeDate) => {
+    const rounds = Array.isArray(dailyState?.rounds) ? dailyState.rounds : [];
+    let index = rounds.indexOf(round);
+    if (index < 0 && round?.item?.id) {
+      index = rounds.findIndex((candidate) => candidate?.item?.id === round.item.id);
+    }
+    return communityTargets(challengeDate)[Math.max(0, Math.min(2, index))] || 16;
+  };
+
   const gaussian = (random) => {
     const left = Math.max(Number.EPSILON, random());
     const right = Math.max(Number.EPSILON, random());
     return Math.sqrt(-2 * Math.log(left)) * Math.cos(2 * Math.PI * right);
   };
 
-  const distributionEdges = () => {
-    const maximum = Math.max(2, Number(rankPopulation) || 5_500_000);
-    const logMaximum = Math.log10(maximum);
-    const edges = [1];
-    for (let index = 1; index <= COMMUNITY_BINS; index += 1) {
-      const edge = Math.round(10 ** (logMaximum * index / COMMUNITY_BINS));
-      edges.push(Math.max(edges.at(-1) + 1, Math.min(maximum, edge)));
-    }
-    edges[edges.length - 1] = maximum;
-    return edges;
-  };
+  const distributionBins = () => COMMUNITY_BUCKETS.map((bucket) => ({
+    ...bucket,
+    count: 0,
+    observedCount: 0,
+    baselineCount: 0,
+  }));
 
   const binForRank = (rank) => {
-    const maximum = Math.max(2, Number(rankPopulation) || 5_500_000);
+    const maximum = Math.max(1, Number(rankPopulation) || 5_500_000);
     const clipped = Math.max(1, Math.min(maximum, Number(rank) || 1));
-    return Math.min(
-      COMMUNITY_BINS - 1,
-      Math.max(0, Math.floor(Math.log10(clipped) / Math.log10(maximum) * COMMUNITY_BINS)),
-    );
+    const index = COMMUNITY_BUCKETS.findIndex((bucket) => clipped <= bucket.upper);
+    return index >= 0 ? index : COMMUNITY_BUCKETS.length - 1;
   };
 
   const normalizeDistribution = (source, round, challengeDate) => {
-    const edges = distributionEdges();
-    const bins = Array.from({ length: COMMUNITY_BINS }, (_, index) => ({
-      lower: edges[index],
-      upper: edges[index + 1],
-      count: 0,
-      observedCount: 0,
-      baselineCount: 0,
-    }));
+    const bins = distributionBins();
 
     const sourceHasSplitCounts = source?.observedCount !== undefined || source?.baselineCount !== undefined;
     for (const item of Array.isArray(source?.bins) ? source.bins : []) {
@@ -73,54 +98,40 @@
       const observed = sourceHasSplitCounts
         ? Math.max(0, Number(item?.observedCount) || 0)
         : count;
-      const baseline = sourceHasSplitCounts
-        ? Math.max(0, Number(item?.baselineCount) || Math.max(0, count - observed))
-        : 0;
-      target.count += count;
+      target.count += observed;
       target.observedCount += observed;
-      target.baselineCount += baseline;
     }
 
-    const observedCount = Math.max(
-      0,
-      Number(source?.observedCount ?? source?.count)
-        || bins.reduce((sum, item) => sum + item.observedCount, 0),
-    );
-    let baselineCount = Math.max(
-      0,
-      Number(source?.baselineCount)
-        || bins.reduce((sum, item) => sum + item.baselineCount, 0),
-    );
-    const displayed = bins.reduce((sum, item) => sum + item.count, 0);
-    const needed = Math.max(0, COMMUNITY_TARGET - displayed);
-    const maximum = Math.max(2, Number(rankPopulation) || 5_500_000);
+    const observedCount = bins.reduce((sum, item) => sum + item.observedCount, 0);
+    const targetCount = communityTargetFor(round, challengeDate);
+    const needed = Math.max(0, targetCount - observedCount);
+    const maximum = Math.max(1, Number(rankPopulation) || 5_500_000);
     const actual = Math.max(1, Math.min(maximum, Number(round.actualRank) || Number(round.predictedRank) || 50_000));
     const predicted = Math.max(1, Math.min(maximum, Number(round.predictedRank) || actual));
     const actualLog = Math.log10(actual);
     const predictedLog = Math.log10(predicted);
     const logMaximum = Math.log10(maximum);
-    const random = seededRandom(`${round.item?.id || "daily"}:${challengeDate || "today"}:community-v4`);
+    const random = seededRandom(`${round.item?.id || "daily"}:${challengeDate || "today"}:community-v6`);
 
     for (let index = 0; index < needed; index += 1) {
       const draw = random();
       let logRank;
-      if (draw < 0.58) logRank = actualLog + gaussian(random) * 0.30;
-      else if (draw < 0.88) logRank = predictedLog + gaussian(random) * 0.36;
+      if (draw < 0.40) logRank = actualLog + gaussian(random) * 0.48;
+      else if (draw < 0.70) logRank = predictedLog + gaussian(random) * 0.56;
       else logRank = random() * logMaximum;
       const rank = Math.max(1, Math.min(maximum, Math.round(10 ** logRank)));
       const bin = bins[binForRank(rank)];
       bin.count += 1;
       bin.baselineCount += 1;
     }
-    baselineCount += needed;
 
     return {
       ...(source || {}),
       count: observedCount,
       observedCount,
-      baselineCount,
-      baselineTarget: COMMUNITY_TARGET,
-      smoothed: baselineCount > 0,
+      baselineCount: needed,
+      baselineTarget: targetCount,
+      smoothed: needed > 0,
       bins,
     };
   };
@@ -135,22 +146,24 @@
       const upper = Number(item.upper) || lower;
       const count = Math.max(0, Number(item.count) || 0);
       const height = count > 0 ? Math.max(7, count / maximum * 100) : 0;
+      const contains = (rank) => rank > 0 && rank >= lower && rank <= upper;
       const classes = [
-        actual >= lower && actual <= upper ? "actual" : "",
-        firstGuess >= lower && firstGuess <= upper ? "yours" : "",
+        contains(actual) ? "actual" : "",
+        contains(firstGuess) ? "yours" : "",
       ].filter(Boolean).join(" ");
       const title = `${formatRank(lower)}–${formatRank(upper)} · ${count} ${count === 1 ? "guess" : "guesses"}`;
       return `<span class="community-bar ${classes}" title="${escapeHTML(title)}"><i style="height:${height.toFixed(2)}%"></i></span>`;
     }).join("");
     const displayed = bins.reduce((sum, item) => sum + Math.max(0, Number(item.count) || 0), 0);
     const countLabel = `${displayed.toLocaleString()} ${displayed === 1 ? "guess" : "guesses"}`;
+    const axis = bins.map((item) => `<span>${escapeHTML(item.label)}</span>`).join("");
 
-    return `<section class="community-distribution" data-community-distribution>
+    return `<section class="community-distribution" data-community-distribution style="--community-bin-count:${bins.length}">
       <div class="community-distribution-head"><span>community distribution</span><small>${countLabel}</small></div>
       <div class="community-chart" aria-label="Distribution of first guesses from the community">
         <div class="community-bars">${bars}</div>
       </div>
-      <div class="community-axis"><span>${formatRank(1)}</span><span>${formatRank(rankPopulation)}</span></div>
+      <div class="community-axis">${axis}</div>
       <p><i></i> actual range <b></b> your first-guess range</p>
     </section>`;
   };
