@@ -55,28 +55,37 @@ def _finite_float(value: Any) -> float | None:
 def _social_copy(row: dict[str, Any]) -> tuple[str, str]:
     player = _clean_text(row.get("player"), "Unknown player")
     artist = _clean_text(row.get("artist"))
-    map_title = _clean_text(row.get("title"), "Unknown map")
+    song = _clean_text(row.get("title"), "Unknown map")
     version = _clean_text(row.get("version"))
-    map_name = " – ".join(part for part in (artist, map_title) if part) or "Unknown map"
+    star = _finite_float(row.get("star"))
+    accuracy = _finite_float(row.get("accuracy_percent"))
+    mods = _clean_text(row.get("mods"), "NM").replace(",", "")
+
+    title_parts = [f"{player} - {song}"]
+    if artist:
+        title_parts.append(artist)
+    if version:
+        title_parts.append(f"[{version}]")
+    if star is not None:
+        title_parts.append(f"{star:.2f}★")
+    if accuracy is not None:
+        title_parts.append(f"{accuracy:.2f}%")
+    if mods:
+        title_parts.append(mods)
+    title = " ".join(title_parts)
+
+    map_name = " – ".join(part for part in (artist, song) if part) or "Unknown map"
     if version:
         map_name = f"{map_name} [{version}]"
-
-    details: list[str] = [map_name]
-    star = _finite_float(row.get("star"))
+    description_parts = [map_name]
     if star is not None:
-        details.append(f"{star:.2f}★")
-
-    mods = _clean_text(row.get("mods"), "NM").replace(",", "")
-    if mods:
-        details.append(mods)
-
-    accuracy = _finite_float(row.get("accuracy_percent"))
+        description_parts.append(f"{star:.2f}★")
     if accuracy is not None:
-        details.append(f"{accuracy:.2f}% accuracy")
-
-    description = " · ".join(details)
-    description += " · Can you guess their rank?"
-    return player[:120], description[:300]
+        description_parts.append(f"{accuracy:.2f}% accuracy")
+    if mods:
+        description_parts.append(mods)
+    description_parts.append("Can you guess their rank?")
+    return title, " · ".join(description_parts)
 
 
 def _replay_social_meta(
