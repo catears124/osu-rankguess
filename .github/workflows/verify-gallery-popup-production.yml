@@ -1,9 +1,9 @@
 name: verify gallery popup production
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/verify-gallery-popup-production
+      - main
 
 permissions:
   contents: read
