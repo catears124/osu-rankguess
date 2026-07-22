@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import math
 import re
 from pathlib import Path
@@ -60,7 +61,7 @@ def _social_copy(row: dict[str, Any]) -> tuple[str, str]:
     if version:
         map_name = f"{map_name} [{version}]"
 
-    details: list[str] = []
+    details: list[str] = [map_name]
     star = _finite_float(row.get("star"))
     if star is not None:
         details.append(f"{star:.2f}★")
@@ -73,12 +74,9 @@ def _social_copy(row: dict[str, Any]) -> tuple[str, str]:
     if accuracy is not None:
         details.append(f"{accuracy:.2f}% accuracy")
 
-    title = f"{player} on {map_name} | osu!rankguess"
-    description = f"Watch {player} play {map_name}"
-    if details:
-        description += f" · {' · '.join(details)}"
-    description += ". Can you guess their rank?"
-    return title[:180], description[:300]
+    description = " · ".join(details)
+    description += " · Can you guess their rank?"
+    return player[:120], description[:300]
 
 
 def _replay_social_meta(
@@ -125,15 +123,49 @@ def _replay_social_meta(
     return title, description, canonical, video, thumbnail, replay_meta
 
 
-def _standalone_gallery_document(
+def _index_candidates() -> list[Path]:
+    module_path = Path(__file__).resolve()
+    cwd = Path.cwd().resolve()
+    roots = [module_path.parent, *module_path.parents, cwd, *cwd.parents]
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        candidate = root / "public" / "index.html"
+        if candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+    if _INDEX_PATH not in seen:
+        candidates.insert(0, _INDEX_PATH)
+    return candidates
+
+
+def _read_gallery_app_document() -> str:
+    failures: list[str] = []
+    for candidate in _index_candidates():
+        try:
+            return candidate.read_text(encoding="utf-8")
+        except OSError as error:
+            failures.append(f"{candidate}: {error}")
+    raise FileNotFoundError("Could not locate public/index.html; " + " | ".join(failures))
+
+
+def _gallery_handoff_document(
     *,
     title: str,
     description: str,
-    video: str,
-    thumbnail: str,
     replay_meta: str,
+    public_id: str | None,
 ) -> str:
+    # Social crawlers do not run JavaScript and keep the metadata above. Browsers
+    # immediately enter the real SPA, which then canonicalizes the URL back to
+    # /gallery and opens the requested replay in the normal gallery dialog.
+    target = (
+        f"/daily?replay={quote(public_id, safe='')}"
+        if public_id
+        else "/daily#gallery"
+    )
     esc = lambda value: html.escape(str(value or ""), quote=True)
+    target_json = json.dumps(target, ensure_ascii=False).replace("<", "\\u003c")
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -141,19 +173,15 @@ def _standalone_gallery_document(
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#050506" />
   <title>{esc(title)}</title>{replay_meta}
+  <script>location.replace({target_json});</script>
   <style>
-    *{{box-sizing:border-box}}body{{margin:0;background:#050506;color:#fff;font-family:Inter,ui-sans-serif,system-ui,sans-serif}}
-    main{{width:min(1100px,100%);margin:auto;padding:24px}}a{{color:#ff8abb}}video{{display:block;width:100%;max-height:76vh;background:#000;border-radius:14px}}
-    h1{{margin:20px 0 8px;font-size:clamp(22px,4vw,42px)}}p{{margin:0;color:#b8b8c4;font-size:16px;line-height:1.5}}
+    html,body{{margin:0;min-height:100%;background:#050506;color:#fff;font-family:Inter,ui-sans-serif,system-ui,sans-serif}}
+    body{{display:grid;place-items:center}}a{{color:#ff8abb}}
   </style>
 </head>
 <body>
-  <main>
-    <video src="{esc(video)}" poster="{esc(thumbnail)}" controls autoplay playsinline preload="metadata"></video>
-    <h1>{esc(title)}</h1>
-    <p>{esc(description)}</p>
-    <p style="margin-top:18px"><a href="/gallery">browse the gallery</a></p>
-  </main>
+  <noscript><p><a href="{esc(target)}">Open this replay in the gallery</a></p></noscript>
+  <p aria-hidden="true">Opening replay…</p>
 </body>
 </html>"""
 
@@ -164,26 +192,28 @@ def _gallery_document(
     origin: str,
     public_id: str | None,
 ) -> str:
-    if row is None or public_id is None:
-        return _INDEX_PATH.read_text(encoding="utf-8")
+    title = "osu! Replay Rank Prediction Gallery | osu!rankguess"
+    description = "Browse osu! replay clips and compare actual ranks with model predictions."
+    replay_meta = ""
+    if row is not None and public_id is not None:
+        title, description, _canonical, _video, _thumbnail, replay_meta = _replay_social_meta(
+            row,
+            origin=origin,
+            public_id=public_id,
+        )
 
-    title, description, _canonical, video, thumbnail, replay_meta = _replay_social_meta(
-        row,
-        origin=origin,
-        public_id=public_id,
-    )
     try:
-        document = _INDEX_PATH.read_text(encoding="utf-8")
+        document = _read_gallery_app_document()
     except OSError:
-        # The share URL must remain usable even if a deployment omits static
-        # assets from the Python function bundle.
-        return _standalone_gallery_document(
+        return _gallery_handoff_document(
             title=title,
             description=description,
-            video=video,
-            thumbnail=thumbnail,
             replay_meta=replay_meta,
+            public_id=public_id,
         )
+
+    if row is None or public_id is None:
+        return document
 
     esc = lambda value: html.escape(str(value or ""), quote=True)
     document = _SOCIAL_META.sub("", document)
