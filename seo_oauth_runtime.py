@@ -34,6 +34,45 @@ def _gallery_video_url(origin: str, public_id: str) -> str:
     return f"{origin}/gallery/video.mp4?replay={quote(public_id, safe='')}"
 
 
+def _clean_text(value: Any, fallback: str = "") -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text or fallback
+
+
+def _social_copy(row: dict[str, Any]) -> tuple[str, str]:
+    player = _clean_text(row.get("player"), "Unknown player")
+    artist = _clean_text(row.get("artist"))
+    map_title = _clean_text(row.get("title"), "Unknown map")
+    version = _clean_text(row.get("version"))
+    map_name = " – ".join(part for part in (artist, map_title) if part)
+    if version:
+        map_name = f"{map_name} [{version}]"
+
+    details: list[str] = []
+    try:
+        star = float(row.get("star"))
+        details.append(f"{star:.2f}★")
+    except (TypeError, ValueError):
+        pass
+
+    mods = _clean_text(row.get("mods"), "NM").replace(",", "")
+    if mods:
+        details.append(mods)
+
+    try:
+        accuracy = float(row.get("accuracy_percent"))
+        details.append(f"{accuracy:.2f}% accuracy")
+    except (TypeError, ValueError):
+        pass
+
+    title = f"{player} on {map_name} | osu!rankguess"
+    description = f"Watch {player} play {map_name}"
+    if details:
+        description += f" · {' · '.join(details)}"
+    description += ". Can you guess their rank?"
+    return title[:180], description[:300]
+
+
 def _gallery_document(
     row: dict[str, Any] | None,
     *,
@@ -50,8 +89,7 @@ def _gallery_document(
         origin,
         row.get("thumbnail_url") or f"/api/gallery/{public_id}/thumbnail",
     )
-    title = "osu!rankguess replay"
-    description = "Can you guess this osu! player's rank?"
+    title, description = _social_copy(row)
     esc = lambda value: html.escape(str(value or ""), quote=True)
 
     replay_meta = f"""
@@ -65,6 +103,7 @@ def _gallery_document(
   <meta property="og:url" content="{esc(canonical)}" />
   <meta property="og:image" content="{esc(thumbnail)}" />
   <meta property="og:image:secure_url" content="{esc(thumbnail)}" />
+  <meta property="og:image:alt" content="Thumbnail for {esc(title)}" />
   <meta property="og:video" content="{esc(video)}" />
   <meta property="og:video:url" content="{esc(video)}" />
   <meta property="og:video:secure_url" content="{esc(video)}" />
