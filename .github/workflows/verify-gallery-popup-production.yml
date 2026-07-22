@@ -1,0 +1,62 @@
+name: verify gallery popup production
+
+on:
+  push:
+    branches:
+      - agent/verify-gallery-popup-production
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Verify Discord metadata and SPA document
+        shell: bash
+        run: |
+          set -euo pipefail
+          page='https://www.osurankguess.com/gallery?replay=97a8d21c13676028454fbe45'
+
+          curl --fail-with-body --show-error --silent --location \
+            --user-agent 'Discordbot/2.0' \
+            --output /tmp/discord.html \
+            "$page"
+          grep -F '<meta property="og:title" content="M_1kS"' /tmp/discord.html
+          grep -F '<meta property="og:description" content="TRUE – Soundscape [Melody] · 6.76★ · NM · 97.80% accuracy · Can you guess their rank?"' /tmp/discord.html
+          grep -F '<meta property="og:video"' /tmp/discord.html
+
+          curl --fail-with-body --show-error --silent --location \
+            --user-agent 'Mozilla/5.0' \
+            --output /tmp/browser.html \
+            "$page"
+          grep -F 'id="galleryDialog"' /tmp/browser.html
+          grep -F '/gallery-infinite.js' /tmp/browser.html
+          if grep -Fq 'Opening replay…' /tmp/browser.html; then
+            echo 'received handoff fallback instead of the gallery SPA' >&2
+            exit 1
+          fi
+
+      - name: Install browser
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Verify popup behavior
+        run: |
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+
+          url = "https://www.osurankguess.com/gallery?replay=97a8d21c13676028454fbe45"
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page(viewport={"width": 1440, "height": 1000})
+              page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+              page.wait_for_selector("#galleryDialog[open]", timeout=60_000)
+              assert page.locator("body").get_attribute("data-view") == "gallery"
+              assert page.locator("#galleryDialogBody video").count() == 1
+              assert "mystery replay" in page.locator("#galleryDialogBody").inner_text().lower()
+              assert page.url.startswith(url)
+              browser.close()
+          PY
