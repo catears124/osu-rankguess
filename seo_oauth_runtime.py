@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html
+import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -31,29 +33,75 @@ def _gallery_replay_url(origin: str, public_id: str) -> str:
 
 
 def _gallery_video_url(origin: str, public_id: str) -> str:
-    return f"{origin}/gallery/video.mp4?replay={quote(public_id, safe='')}"
+    # Keep Discord's media request on an explicit function route. Paths ending in
+    # .mp4 can be treated as static assets by deployment routing before FastAPI
+    # sees them.
+    return f"{origin}/api/replay-video?public_id={quote(public_id, safe='')}"
 
 
-def _gallery_document(
-    row: dict[str, Any] | None,
+def _clean_text(value: Any, fallback: str = "") -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text or fallback
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _social_copy(row: dict[str, Any]) -> tuple[str, str]:
+    player = _clean_text(row.get("player"), "Unknown player")
+    artist = _clean_text(row.get("artist"))
+    song = _clean_text(row.get("title"), "Unknown map")
+    version = _clean_text(row.get("version"))
+    star = _finite_float(row.get("star"))
+    accuracy = _finite_float(row.get("accuracy_percent"))
+    mods = _clean_text(row.get("mods"), "NM").replace(",", "")
+
+    title_parts = [f"{player} - {song}"]
+    if artist:
+        title_parts.append(artist)
+    if version:
+        title_parts.append(f"[{version}]")
+    if star is not None:
+        title_parts.append(f"{star:.2f}★")
+    if accuracy is not None:
+        title_parts.append(f"{accuracy:.2f}%")
+    if mods:
+        title_parts.append(mods)
+    title = " ".join(title_parts)
+
+    map_name = " – ".join(part for part in (artist, song) if part) or "Unknown map"
+    if version:
+        map_name = f"{map_name} [{version}]"
+    description_parts = [map_name]
+    if star is not None:
+        description_parts.append(f"{star:.2f}★")
+    if accuracy is not None:
+        description_parts.append(f"{accuracy:.2f}% accuracy")
+    if mods:
+        description_parts.append(mods)
+    description_parts.append("Can you guess their rank?")
+    return title, " · ".join(description_parts)
+
+
+def _replay_social_meta(
+    row: dict[str, Any],
     *,
     origin: str,
-    public_id: str | None,
-) -> str:
-    document = _INDEX_PATH.read_text(encoding="utf-8")
-    if row is None or public_id is None:
-        return document
-
+    public_id: str,
+) -> tuple[str, str, str, str, str, str]:
     canonical = _gallery_replay_url(origin, public_id)
     video = _gallery_video_url(origin, public_id)
     thumbnail = _replay_page._absolute(  # noqa: SLF001
         origin,
         row.get("thumbnail_url") or f"/api/gallery/{public_id}/thumbnail",
     )
-    title = "osu!rankguess replay"
-    description = "Can you guess this osu! player's rank?"
+    title, description = _social_copy(row)
     esc = lambda value: html.escape(str(value or ""), quote=True)
-
     replay_meta = f"""
   <link rel="canonical" href="{esc(canonical)}" />
   <link rel="alternate" type="video/mp4" href="{esc(video)}" />
@@ -65,6 +113,7 @@ def _gallery_document(
   <meta property="og:url" content="{esc(canonical)}" />
   <meta property="og:image" content="{esc(thumbnail)}" />
   <meta property="og:image:secure_url" content="{esc(thumbnail)}" />
+  <meta property="og:image:alt" content="Thumbnail for {esc(title)}" />
   <meta property="og:video" content="{esc(video)}" />
   <meta property="og:video:url" content="{esc(video)}" />
   <meta property="og:video:secure_url" content="{esc(video)}" />
@@ -80,7 +129,102 @@ def _gallery_document(
   <meta name="twitter:player:height" content="540" />
   <meta name="twitter:player:stream" content="{esc(video)}" />
   <meta name="twitter:player:stream:content_type" content="video/mp4" />"""
+    return title, description, canonical, video, thumbnail, replay_meta
 
+
+def _index_candidates() -> list[Path]:
+    module_path = Path(__file__).resolve()
+    cwd = Path.cwd().resolve()
+    roots = [module_path.parent, *module_path.parents, cwd, *cwd.parents]
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        candidate = root / "public" / "index.html"
+        if candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+    if _INDEX_PATH not in seen:
+        candidates.insert(0, _INDEX_PATH)
+    return candidates
+
+
+def _read_gallery_app_document() -> str:
+    failures: list[str] = []
+    for candidate in _index_candidates():
+        try:
+            return candidate.read_text(encoding="utf-8")
+        except OSError as error:
+            failures.append(f"{candidate}: {error}")
+    raise FileNotFoundError("Could not locate public/index.html; " + " | ".join(failures))
+
+
+def _gallery_handoff_document(
+    *,
+    title: str,
+    description: str,
+    replay_meta: str,
+    public_id: str | None,
+) -> str:
+    # Social crawlers do not run JavaScript and keep the metadata above. Browsers
+    # immediately enter the real SPA, which then canonicalizes the URL back to
+    # /gallery and opens the requested replay in the normal gallery dialog.
+    target = (
+        f"/daily?replay={quote(public_id, safe='')}"
+        if public_id
+        else "/daily#gallery"
+    )
+    esc = lambda value: html.escape(str(value or ""), quote=True)
+    target_json = json.dumps(target, ensure_ascii=False).replace("<", "\\u003c")
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#050506" />
+  <title>{esc(title)}</title>{replay_meta}
+  <script>location.replace({target_json});</script>
+  <style>
+    html,body{{margin:0;min-height:100%;background:#050506;color:#fff;font-family:Inter,ui-sans-serif,system-ui,sans-serif}}
+    body{{display:grid;place-items:center}}a{{color:#ff8abb}}
+  </style>
+</head>
+<body>
+  <noscript><p><a href="{esc(target)}">Open this replay in the gallery</a></p></noscript>
+  <p aria-hidden="true">Opening replay…</p>
+</body>
+</html>"""
+
+
+def _gallery_document(
+    row: dict[str, Any] | None,
+    *,
+    origin: str,
+    public_id: str | None,
+) -> str:
+    title = "osu! Replay Rank Prediction Gallery | osu!rankguess"
+    description = "Browse osu! replay clips and compare actual ranks with model predictions."
+    replay_meta = ""
+    if row is not None and public_id is not None:
+        title, description, _canonical, _video, _thumbnail, replay_meta = _replay_social_meta(
+            row,
+            origin=origin,
+            public_id=public_id,
+        )
+
+    try:
+        document = _read_gallery_app_document()
+    except OSError:
+        return _gallery_handoff_document(
+            title=title,
+            description=description,
+            replay_meta=replay_meta,
+            public_id=public_id,
+        )
+
+    if row is None or public_id is None:
+        return document
+
+    esc = lambda value: html.escape(str(value or ""), quote=True)
     document = _SOCIAL_META.sub("", document)
     document = _TITLE.sub(f"<title>{esc(title)}</title>", document, count=1)
     return document.replace("</head>", f"{replay_meta}\n</head>", 1)
@@ -157,7 +301,7 @@ def register_routes(app: Any) -> None:
     ) -> Response:
         return await _replay_video_response(replay, request)
 
-    # Stable API aliases remain available for diagnostics.
+    # Stable API aliases remain available for diagnostics and social crawlers.
     @app.get(
         "/api/replay-page",
         response_class=HTMLResponse,
