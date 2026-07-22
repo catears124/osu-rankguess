@@ -45,7 +45,9 @@
     const previousGalleryCard = galleryCard;
     galleryCard = function popupGalleryCard(item) {
       return previousGalleryCard(item)
-        .replace(/\s*<button class="gallery-share"[^>]*>[\s\S]*?<\/button>/, "");
+        .replace(/\s*<button class="gallery-share"[^>]*>[\s\S]*?<\/button>/, "")
+        .replace("<span>watch</span>", "")
+        .replace("watch first, then reveal when ready", "reveal when ready");
     };
   }
 
