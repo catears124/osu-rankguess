@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import html
+import re
+from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import Query
 from starlette.requests import Request
@@ -9,6 +13,77 @@ from starlette.responses import HTMLResponse, Response
 from runtime import replay_page as _replay_page
 from runtime.oauth import *
 from runtime.oauth import register_routes as _register_oauth_routes
+
+
+_INDEX_PATH = Path(__file__).resolve().parent / "public" / "index.html"
+_SOCIAL_META = re.compile(
+    r"\s*(?:"
+    r"<link\s+rel=[\"']canonical[\"'][^>]*>"
+    r"|<meta\s+(?:name|property)=[\"'](?:description|og:[^\"']+|twitter:[^\"']+)[\"'][^>]*>"
+    r")",
+    re.IGNORECASE,
+)
+_TITLE = re.compile(r"<title>[\s\S]*?</title>", re.IGNORECASE)
+
+
+def _gallery_replay_url(origin: str, public_id: str) -> str:
+    return f"{origin}/gallery?replay={quote(public_id, safe='')}"
+
+
+def _gallery_video_url(origin: str, public_id: str) -> str:
+    return f"{origin}/gallery/video.mp4?replay={quote(public_id, safe='')}"
+
+
+def _gallery_document(
+    row: dict[str, Any] | None,
+    *,
+    origin: str,
+    public_id: str | None,
+) -> str:
+    document = _INDEX_PATH.read_text(encoding="utf-8")
+    if row is None or public_id is None:
+        return document
+
+    canonical = _gallery_replay_url(origin, public_id)
+    video = _gallery_video_url(origin, public_id)
+    thumbnail = _replay_page._absolute(  # noqa: SLF001
+        origin,
+        row.get("thumbnail_url") or f"/api/gallery/{public_id}/thumbnail",
+    )
+    title = "osu!rankguess replay"
+    description = "Can you guess this osu! player's rank?"
+    esc = lambda value: html.escape(str(value or ""), quote=True)
+
+    replay_meta = f"""
+  <link rel="canonical" href="{esc(canonical)}" />
+  <link rel="alternate" type="video/mp4" href="{esc(video)}" />
+  <meta name="description" content="{esc(description)}" />
+  <meta property="og:type" content="video.other" />
+  <meta property="og:site_name" content="osu!rankguess" />
+  <meta property="og:title" content="{esc(title)}" />
+  <meta property="og:description" content="{esc(description)}" />
+  <meta property="og:url" content="{esc(canonical)}" />
+  <meta property="og:image" content="{esc(thumbnail)}" />
+  <meta property="og:image:secure_url" content="{esc(thumbnail)}" />
+  <meta property="og:video" content="{esc(video)}" />
+  <meta property="og:video:url" content="{esc(video)}" />
+  <meta property="og:video:secure_url" content="{esc(video)}" />
+  <meta property="og:video:type" content="video/mp4" />
+  <meta property="og:video:width" content="960" />
+  <meta property="og:video:height" content="540" />
+  <meta name="twitter:card" content="player" />
+  <meta name="twitter:title" content="{esc(title)}" />
+  <meta name="twitter:description" content="{esc(description)}" />
+  <meta name="twitter:image" content="{esc(thumbnail)}" />
+  <meta name="twitter:player" content="{esc(canonical)}" />
+  <meta name="twitter:player:width" content="960" />
+  <meta name="twitter:player:height" content="540" />
+  <meta name="twitter:player:stream" content="{esc(video)}" />
+  <meta name="twitter:player:stream:content_type" content="video/mp4" />"""
+
+    document = _SOCIAL_META.sub("", document)
+    document = _TITLE.sub(f"<title>{esc(title)}</title>", document, count=1)
+    return document.replace("</head>", f"{replay_meta}\n</head>", 1)
 
 
 async def _replay_page_response(public_id: str, request: Request) -> HTMLResponse:
@@ -36,29 +111,53 @@ async def _replay_video_response(public_id: str, request: Request) -> Response:
 
 
 def register_routes(app: Any) -> None:
-    """Register OAuth and canonical replay routes on the actual FastAPI app."""
+    """Register OAuth and canonical gallery replay routes on the FastAPI app."""
     _register_oauth_routes(app)
     if getattr(app.state, "rankguess_explicit_replay_routes", False):
         return
     app.state.rankguess_explicit_replay_routes = True
 
     @app.get(
-        "/replay/{public_id}",
+        "/gallery",
         response_class=HTMLResponse,
         include_in_schema=False,
     )
-    async def canonical_replay_page(public_id: str, request: Request) -> HTMLResponse:
-        return await _replay_page_response(public_id, request)
+    async def gallery_page(
+        request: Request,
+        replay: str | None = Query(default=None, min_length=6, max_length=80),
+    ) -> HTMLResponse:
+        row = None
+        if replay:
+            row = await _replay_page._published_submission(replay)  # noqa: SLF001
+        body = _gallery_document(
+            row,
+            origin=_replay_page._origin(request),  # noqa: SLF001
+            public_id=replay,
+        )
+        return HTMLResponse(
+            body,
+            headers={
+                "Cache-Control": (
+                    "public, max-age=60, s-maxage=300, stale-while-revalidate=3600"
+                    if replay
+                    else "no-store, max-age=0"
+                ),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @app.api_route(
-        "/replay/{public_id}/video.mp4",
+        "/gallery/video.mp4",
         methods=["GET", "HEAD"],
         include_in_schema=False,
     )
-    async def canonical_replay_video(public_id: str, request: Request) -> Response:
-        return await _replay_video_response(public_id, request)
+    async def gallery_replay_video(
+        request: Request,
+        replay: str = Query(..., min_length=6, max_length=80),
+    ) -> Response:
+        return await _replay_video_response(replay, request)
 
-    # Stable API aliases remain available for compatibility and direct diagnostics.
+    # Stable API aliases remain available for diagnostics.
     @app.get(
         "/api/replay-page",
         response_class=HTMLResponse,
@@ -83,8 +182,8 @@ def register_routes(app: Any) -> None:
 
     paths = {getattr(route, "path", None) for route in app.routes}
     required = {
-        "/replay/{public_id}",
-        "/replay/{public_id}/video.mp4",
+        "/gallery",
+        "/gallery/video.mp4",
         "/api/replay-page",
         "/api/replay-video",
     }
