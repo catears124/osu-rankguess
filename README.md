@@ -25,7 +25,7 @@ Raw uploaded replay files are parsed during the request and are not stored in Po
 
 The model was developed from [osu!3k](https://github.com/catears124/osu-3k), a dataset I collected for learning player skill from osu! gameplay.
 
-The final dataset contains 2,999 osu!standard plays from 1,757 unique players. Each example includes the replay, a rendered gameplay video, map and score metadata, and the player's global rank at collection time. The dataset was built to support player-disjoint evaluation, so the model is tested on players it did not see during training rather than on additional plays from the same accounts.
+The final dataset contains 3,000 osu!standard plays from 1,767 unique players, and 2,277 beatmaps. Each example includes the replay, a rendered gameplay video, map and score metadata, and the player's global rank at collection time. The dataset was built to support player-disjoint evaluation, so the model is tested on players it did not see during training rather than on additional plays from the same accounts.
 
 Useful fields include:
 
