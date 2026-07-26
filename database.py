@@ -33,6 +33,9 @@ _community.Request = _Request
 _community.JSONResponse = _JSONResponse
 _community.install()
 
+from runtime import community_live as _community_live
+_community_live.install()
+
 from runtime import cron as _cron
 sys.modules.setdefault("cron_runtime", _cron)
 _cron.Request = _Request
