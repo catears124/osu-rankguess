@@ -9,7 +9,7 @@ import os
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from fastapi import HTTPException
@@ -139,10 +139,24 @@ def register_routes(app: Any) -> None:
         if not _configured():
             raise HTTPException(status_code=503, detail="osu! OAuth is not configured")
 
+        redirect_uri = _redirect_uri(request)
+        configured_uri = (os.getenv("OSU_REDIRECT_URI") or "").strip()
+        if configured_uri:
+            callback = urlsplit(configured_uri)
+            forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
+            request_host = forwarded_host or request.headers.get("host") or request.url.netloc
+            if callback.scheme and callback.netloc and request_host.lower() != callback.netloc.lower():
+                # Set the OAuth state cookie on the same host that will receive
+                # the callback; otherwise www/apex aliases lose the state cookie.
+                return RedirectResponse(
+                    url=f"{callback.scheme}://{callback.netloc}/api/auth/osu",
+                    status_code=302,
+                )
+
         state = secrets.token_urlsafe(32)
         params = {
             "client_id": os.environ["OSU_CLIENT_ID"],
-            "redirect_uri": _redirect_uri(request),
+            "redirect_uri": redirect_uri,
             "response_type": "code",
             "scope": "public identify",
             "state": state,
