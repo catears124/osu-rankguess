@@ -79,9 +79,14 @@ def _configured() -> bool:
 
 
 def _redirect_uri(request: Request) -> str:
-    configured = (os.getenv("OSU_OAUTH_REDIRECT_URI") or "").strip()
-    if configured:
-        return configured
+    # OAuth state and session cookies are host-scoped. Always return to the
+    # same public origin that initiated sign-in instead of a fixed deployment.
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip()
+    host = forwarded_host or request.headers.get("host") or request.url.netloc
+    scheme = forwarded_proto or request.url.scheme or "https"
+    if host:
+        return f"{scheme}://{host}/api/auth/osu/callback"
     return str(request.url_for("osu_oauth_callback"))
 
 
