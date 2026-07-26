@@ -17,10 +17,16 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse
 
 _INSTALLED = False
+_CANONICAL_REDIRECT_URI = "https://osurankguess.com/api/auth/osu/callback"
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _AUTHENTICATED_UPLOAD_PATHS = frozenset({
     "/api/replay/cache",
     "/api/ordr/render",
 })
+
+
+def _env(name: str) -> str:
+    return (os.getenv(name) or "").strip()
 
 
 def _b64encode(value: bytes) -> str:
@@ -75,26 +81,41 @@ def authenticated_user(request: Request) -> dict[str, Any] | None:
 
 
 def _configured() -> bool:
-    return bool(os.getenv("OSU_CLIENT_ID") and os.getenv("OSU_CLIENT_SECRET"))
+    return bool(_env("OSU_CLIENT_ID") and _env("OSU_CLIENT_SECRET"))
+
+
+def _request_host(request: Request) -> str:
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
+    return forwarded_host or request.headers.get("host") or request.url.netloc
 
 
 def _redirect_uri(request: Request) -> str:
-    # OAuth providers require an exact callback match. Prefer one explicit,
-    # deployment-scoped URI so aliases such as www and Vercel preview hosts
-    # cannot silently generate a different authorization request.
-    configured_uri = (os.getenv("OSU_REDIRECT_URI") or "").strip()
+    # An explicit deployment value wins, but production is still safe when a
+    # Vercel environment scope is missing or a stale deployment is rebuilt.
+    configured_uri = _env("OSU_REDIRECT_URI")
     if configured_uri:
         return configured_uri
 
-    # Local development and legacy deployments may still derive the callback
-    # from the request origin when OSU_REDIRECT_URI is intentionally unset.
-    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
-    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip()
-    host = forwarded_host or request.headers.get("host") or request.url.netloc
-    scheme = forwarded_proto or request.url.scheme or "https"
-    if host:
+    host = _request_host(request)
+    hostname = (urlsplit(f"//{host}").hostname or "").lower()
+    if hostname in _LOCAL_HOSTS:
+        forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip()
+        scheme = forwarded_proto or request.url.scheme or "http"
         return f"{scheme}://{host}/api/auth/osu/callback"
-    return str(request.url_for("osu_oauth_callback"))
+
+    # osu! requires an exact callback match. Never let www, preview deployments,
+    # or proxy headers silently alter the production authorization request.
+    return _CANONICAL_REDIRECT_URI
+
+
+def _upstream_error(response: httpx.Response) -> dict[str, Any]:
+    try:
+        value = response.json()
+        if isinstance(value, dict):
+            return value
+    except Exception:
+        pass
+    return {"message": response.text[:500] or "Unknown upstream error"}
 
 
 def register_routes(app: Any) -> None:
@@ -130,6 +151,10 @@ def register_routes(app: Any) -> None:
                 "configured": _configured(),
                 "authenticated": user is not None,
                 "user": user,
+                "clientId": _env("OSU_CLIENT_ID") or None,
+                "redirectURI": _redirect_uri(request),
+                "redirectURIFromEnvironment": bool(_env("OSU_REDIRECT_URI")),
+                "requestHost": _request_host(request),
                 "replayUploadRequiresAuthentication": True,
             }
         )
@@ -140,22 +165,19 @@ def register_routes(app: Any) -> None:
             raise HTTPException(status_code=503, detail="osu! OAuth is not configured")
 
         redirect_uri = _redirect_uri(request)
-        configured_uri = (os.getenv("OSU_REDIRECT_URI") or "").strip()
-        if configured_uri:
-            callback = urlsplit(configured_uri)
-            forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
-            request_host = forwarded_host or request.headers.get("host") or request.url.netloc
-            if callback.scheme and callback.netloc and request_host.lower() != callback.netloc.lower():
-                # Set the OAuth state cookie on the same host that will receive
-                # the callback; otherwise www/apex aliases lose the state cookie.
-                return RedirectResponse(
-                    url=f"{callback.scheme}://{callback.netloc}/api/auth/osu",
-                    status_code=302,
-                )
+        callback = urlsplit(redirect_uri)
+        request_host = _request_host(request)
+        if callback.scheme and callback.netloc and request_host.lower() != callback.netloc.lower():
+            # Set the OAuth state cookie on the same host that will receive the
+            # callback; otherwise www/apex aliases lose the state cookie.
+            return RedirectResponse(
+                url=f"{callback.scheme}://{callback.netloc}/api/auth/osu",
+                status_code=302,
+            )
 
         state = secrets.token_urlsafe(32)
         params = {
-            "client_id": os.environ["OSU_CLIENT_ID"],
+            "client_id": _env("OSU_CLIENT_ID"),
             "redirect_uri": redirect_uri,
             "response_type": "code",
             "scope": "public identify",
@@ -183,8 +205,8 @@ def register_routes(app: Any) -> None:
             raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
         token_data = {
-            "client_id": os.environ.get("OSU_CLIENT_ID", ""),
-            "client_secret": os.environ.get("OSU_CLIENT_SECRET", ""),
+            "client_id": _env("OSU_CLIENT_ID"),
+            "client_secret": _env("OSU_CLIENT_SECRET"),
             "code": code,
             "grant_type": "authorization_code",
             "redirect_uri": _redirect_uri(request),
@@ -197,7 +219,14 @@ def register_routes(app: Any) -> None:
                 headers={"Accept": "application/json"},
             )
             if token_response.status_code != 200:
-                raise HTTPException(status_code=502, detail="osu! token exchange failed")
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": "osu! token exchange failed",
+                        "upstreamStatus": token_response.status_code,
+                        "upstream": _upstream_error(token_response),
+                    },
+                )
 
             access_token = str(token_response.json().get("access_token") or "")
             me_response = await client.get(
@@ -208,7 +237,14 @@ def register_routes(app: Any) -> None:
                 },
             )
             if me_response.status_code != 200:
-                raise HTTPException(status_code=502, detail="osu! profile lookup failed")
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": "osu! profile lookup failed",
+                        "upstreamStatus": me_response.status_code,
+                        "upstream": _upstream_error(me_response),
+                    },
+                )
             profile = me_response.json()
 
         user = {
