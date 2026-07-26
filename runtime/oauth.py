@@ -79,8 +79,15 @@ def _configured() -> bool:
 
 
 def _redirect_uri(request: Request) -> str:
-    # OAuth state and session cookies are host-scoped. Always return to the
-    # same public origin that initiated sign-in instead of a fixed deployment.
+    # OAuth providers require an exact callback match. Prefer one explicit,
+    # deployment-scoped URI so aliases such as www and Vercel preview hosts
+    # cannot silently generate a different authorization request.
+    configured_uri = (os.getenv("OSU_REDIRECT_URI") or "").strip()
+    if configured_uri:
+        return configured_uri
+
+    # Local development and legacy deployments may still derive the callback
+    # from the request origin when OSU_REDIRECT_URI is intentionally unset.
     forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
     forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip()
     host = forwarded_host or request.headers.get("host") or request.url.netloc
